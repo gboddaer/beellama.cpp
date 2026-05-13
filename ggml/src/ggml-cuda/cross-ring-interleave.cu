@@ -178,7 +178,7 @@ extern "C" bool dflash_cross_ring_gpu_write_d2d(
         cudaGetLastError();
         return false;
     }
-#if CUDART_VERSION >= 10000
+#if CUDART_VERSION >= 10000 || defined(GGML_USE_HIP)
     if (attr.type != cudaMemoryTypeDevice || attr.device != ring->device) {
         return false;
     }
@@ -253,7 +253,7 @@ extern "C" bool dflash_rebuild_conv_state(
         cudaGetLastError();
         return false;
     }
-#if CUDART_VERSION >= 10000
+#if CUDART_VERSION >= 10000 || defined(GGML_USE_HIP)
     if (r_attr.type != cudaMemoryTypeDevice || qkv_attr.type != cudaMemoryTypeDevice ||
             r_attr.device != qkv_attr.device) {
         return false;
@@ -288,7 +288,7 @@ extern "C" bool dflash_cuda_copy_d2d(void * dst, const void * src, size_t size) 
         cudaGetLastError();
         return false;
     }
-#if CUDART_VERSION >= 10000
+#if CUDART_VERSION >= 10000 || defined(GGML_USE_HIP)
     if (dst_attr.type != cudaMemoryTypeDevice || src_attr.type != cudaMemoryTypeDevice ||
             dst_attr.device != src_attr.device) {
         return false;
@@ -315,7 +315,7 @@ extern "C" bool dflash_cuda_prepare_ptr(const void * ptr) {
         cudaGetLastError();
         return false;
     }
-#if CUDART_VERSION >= 10000
+#if CUDART_VERSION >= 10000 || defined(GGML_USE_HIP)
     if (attr.type != cudaMemoryTypeDevice) {
         return false;
     }
@@ -345,7 +345,7 @@ extern "C" bool dflash_cuda_synchronize_ptr(const void * ptr) {
         cudaGetLastError();
         return false;
     }
-#if CUDART_VERSION >= 10000
+#if CUDART_VERSION >= 10000 || defined(GGML_USE_HIP)
     if (attr.type != cudaMemoryTypeDevice) {
         return false;
     }
@@ -418,7 +418,7 @@ extern "C" void dflash_cross_ring_gpu_set_tensor(
         cudaGetLastError();
     }
 
-#if CUDART_VERSION >= 10000
+#if CUDART_VERSION >= 10000 || defined(GGML_USE_HIP)
     const bool dst_is_device = dst_err == cudaSuccess && dst_attr.type == cudaMemoryTypeDevice;
     const bool src_is_device = src_err == cudaSuccess && src_attr.type == cudaMemoryTypeDevice;
 #else
@@ -456,7 +456,7 @@ extern "C" bool dflash_kv_cache_write_d2d(
         cudaGetLastError();
         return false;
     }
-#if CUDART_VERSION >= 10000
+#if CUDART_VERSION >= 10000 || defined(GGML_USE_HIP)
     if (ring_attr.type != cudaMemoryTypeDevice || src_attr.type != cudaMemoryTypeDevice ||
             ring_attr.device != src_attr.device) {
         return false;
@@ -528,7 +528,7 @@ extern "C" bool dflash_kv_cache_append_d2d(
         cudaGetLastError();
         return false;
     }
-#if CUDART_VERSION >= 10000
+#if CUDART_VERSION >= 10000 || defined(GGML_USE_HIP)
     if (cache_attr.type != cudaMemoryTypeDevice || src_attr.type != cudaMemoryTypeDevice ||
             cache_attr.device != src_attr.device) {
         return false;
@@ -649,7 +649,7 @@ extern "C" bool dflash_kv_cache_interleave(
         cudaGetLastError();
         return false;
     }
-#if CUDART_VERSION >= 10000
+#if CUDART_VERSION >= 10000 || defined(GGML_USE_HIP)
     if (ring_attr.type != cudaMemoryTypeDevice || stage_attr.type != cudaMemoryTypeDevice ||
             ring_attr.device != stage_attr.device) {
         return false;

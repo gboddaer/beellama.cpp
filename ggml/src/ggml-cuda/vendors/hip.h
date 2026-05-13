@@ -99,6 +99,11 @@
 #define cudaMemGetInfo hipMemGetInfo
 #define cudaOccupancyMaxPotentialBlockSize hipOccupancyMaxPotentialBlockSize
 #define cudaSetDevice hipSetDevice
+#define cudaPointerAttributes hipPointerAttribute_t
+#define cudaPointerGetAttributes hipPointerGetAttributes
+#define cudaMemoryTypeDevice hipMemoryTypeDevice
+#define cudaMemoryTypeHost hipMemoryTypeHost
+#define cudaMemoryTypeManaged hipMemoryTypeManaged
 #define cuDeviceGet hipDeviceGet
 #define CUdevice hipDevice_t
 #define CUdeviceptr hipDeviceptr_t

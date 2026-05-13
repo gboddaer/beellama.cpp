@@ -3147,7 +3147,7 @@ static void ggml_cuda_log_nonlocal_src_buffer(
         cudaError_t err = cudaPointerGetAttributes(&attr, data);
         if (err == cudaSuccess) {
             ptr_device = attr.device;
-#if CUDART_VERSION >= 10000
+#if CUDART_VERSION >= 10000 || defined(GGML_USE_HIP)
             switch (attr.type) {
 #else
             switch (attr.memoryType) {
