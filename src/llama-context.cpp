@@ -1880,8 +1880,12 @@ void llama_context::tape_replay(llama_seq_id seq_id, int n_accepted) {
 
     const bool multi_gpu_target = model.n_devices() > 1;
     if (multi_gpu_target) {
+        if (tape_replay_gdn_direct_from_cpu_tape(mem_recurrent, cell_idx, n_accepted)) {
+            tape_replay_conv(mem_recurrent, cell_idx, n_accepted, seq_id);
+            return;
+        }
         if (!dflash_capture->multi_gpu_replay_fallback_logged) {
-            LLAMA_LOG_INFO("%s: multi-GPU target detected (%zu devices); using CPU DFlash recurrent replay\n",
+            LLAMA_LOG_WARN("%s: multi-GPU target detected (%zu devices); exact CUDA DFlash replay unavailable, using CPU recurrent replay fallback\n",
                     __func__, model.n_devices());
             dflash_capture->multi_gpu_replay_fallback_logged = true;
         }
@@ -2099,9 +2103,6 @@ bool llama_context::tape_replay_gdn_direct_gpu(llama_memory_recurrent * mem_recu
     if (!dflash_capture || !mem_recurrent || n_accepted <= 0) {
         return false;
     }
-    if (model.n_devices() > 1) {
-        return false;
-    }
 
     ggml_backend_reg_t cuda_reg = ggml_backend_reg_by_name("CUDA");
     if (!cuda_reg) {
@@ -2184,21 +2185,212 @@ bool llama_context::tape_replay_gdn_direct_gpu(llama_memory_recurrent * mem_recu
         });
     }
 
-    if (launches.empty() || !fn_prepare(launches[0].state)) {
+    if (launches.empty()) {
         return false;
+    }
+    for (const auto & launch : launches) {
+        if (!fn_prepare(launch.state)) {
+            return false;
+        }
     }
 
     const int64_t t_start_us = dflash_capture->profile ? ggml_time_us() : 0;
+    dflash_capture->replay_sync_ptrs.clear();
     for (const auto & launch : launches) {
-        if (!fn_replay(launch.state, launch.k, launch.v, launch.gate, launch.beta,
+        if (!fn_prepare(launch.state) ||
+                !fn_replay(launch.state, launch.k, launch.v, launch.gate, launch.beta,
                     n_accepted, launch.S, launch.H_k, launch.H_v)) {
             GGML_ABORT("DFlash direct GPU GDN replay launch failed after validation\n");
         }
+        dflash_capture->replay_sync_ptrs.push_back(launch.state);
     }
     if (dflash_capture->profile) {
         dflash_capture->profile_conv_gpu_us += ggml_time_us() - t_start_us;
     }
     dflash_capture->replay_sync_ptr = launches.back().state;
+    return true;
+}
+
+bool llama_context::tape_replay_gdn_direct_from_cpu_tape(llama_memory_recurrent * mem_recurrent, int32_t cell_idx, int n_accepted) {
+    if (!dflash_capture || !mem_recurrent || n_accepted <= 0) {
+        return false;
+    }
+
+    ggml_backend_reg_t cuda_reg = ggml_backend_reg_by_name("CUDA");
+    if (!cuda_reg) {
+        return false;
+    }
+    using prepare_ptr_fn_t = bool (*)(const void *);
+    using replay_fn_t = bool (*)(void *, const void *, const void *, const void *, const void *, int, int, int, int);
+    using sync_ptr_fn_t = bool (*)(const void *);
+    auto fn_prepare = (prepare_ptr_fn_t) ggml_backend_reg_get_proc_address(cuda_reg, "dflash_cuda_prepare_ptr");
+    auto fn_replay = (replay_fn_t) ggml_backend_reg_get_proc_address(cuda_reg, "dflash_replay_gdn_state_no_check");
+    auto fn_sync = (sync_ptr_fn_t) ggml_backend_reg_get_proc_address(cuda_reg, "dflash_cuda_synchronize_ptr");
+    if (!fn_prepare || !fn_replay || !fn_sync) {
+        return false;
+    }
+
+    const auto & rec_ids = dflash_capture->recurrent_layer_ids;
+    auto & tape_layers = dflash_capture->tape_layers;
+    if (rec_ids.empty() || tape_layers.empty()) {
+        return false;
+    }
+
+    const uint32_t n_embd_s = model.hparams.n_embd_s();
+    struct replay_upload {
+        ggml_context * ctx = nullptr;
+        ggml_backend_buffer_t buf = nullptr;
+        void * state = nullptr;
+        ggml_tensor * k = nullptr;
+        ggml_tensor * v = nullptr;
+        ggml_tensor * gate = nullptr;
+        ggml_tensor * beta = nullptr;
+        int S = 0;
+        int H_k = 0;
+        int H_v = 0;
+    };
+    std::vector<replay_upload> uploads;
+    uploads.reserve(rec_ids.size());
+
+    auto cleanup = [&]() {
+        for (auto & upload : uploads) {
+            if (upload.buf) {
+                ggml_backend_buffer_free(upload.buf);
+                upload.buf = nullptr;
+            }
+            if (upload.ctx) {
+                ggml_free(upload.ctx);
+                upload.ctx = nullptr;
+            }
+        }
+    };
+
+    auto is_cuda_tensor = [](const ggml_tensor * t) {
+        if (!t || !t->data || !t->buffer || ggml_backend_buffer_is_host(t->buffer)) {
+            return false;
+        }
+        const char * name = ggml_backend_buffer_name(t->buffer);
+        return name && std::strncmp(name, "CUDA", 4) == 0;
+    };
+
+    for (size_t li = 0; li < rec_ids.size(); ++li) {
+        if (li >= tape_layers.size()) {
+            cleanup();
+            return false;
+        }
+
+        const int il = rec_ids[li];
+        const auto & tape = tape_layers[li];
+        if (tape.n_tokens <= 0 || n_accepted > tape.n_tokens) {
+            cleanup();
+            return false;
+        }
+
+        const int64_t S_i64 = tape.S_k;
+        const int64_t H_k_i64 = tape.H_k;
+        const int64_t H_v_i64 = tape.H_v;
+        if (S_i64 <= 0 || H_k_i64 <= 0 || H_v_i64 <= 0 ||
+                S_i64 > std::numeric_limits<int>::max() ||
+                H_k_i64 > std::numeric_limits<int>::max() ||
+                H_v_i64 > std::numeric_limits<int>::max()) {
+            cleanup();
+            return false;
+        }
+        if (!(S_i64 == 16 || S_i64 == 32 || S_i64 == 64 || S_i64 == 128)) {
+            cleanup();
+            return false;
+        }
+        if ((size_t) S_i64 * (size_t) S_i64 * (size_t) H_v_i64 != (size_t) n_embd_s) {
+            cleanup();
+            return false;
+        }
+
+        const size_t k_elems = (size_t) S_i64 * (size_t) H_k_i64 * (size_t) n_accepted;
+        const size_t v_elems = (size_t) S_i64 * (size_t) H_v_i64 * (size_t) n_accepted;
+        const size_t gb_elems = (size_t) H_v_i64 * (size_t) n_accepted;
+        if (tape.k.size() < k_elems || tape.v.size() < v_elems ||
+                tape.gate.size() < gb_elems || tape.beta.size() < gb_elems) {
+            cleanup();
+            return false;
+        }
+
+        ggml_tensor * s_tensor = mem_recurrent->s_l[il];
+        if (!is_cuda_tensor(s_tensor)) {
+            cleanup();
+            return false;
+        }
+
+        const size_t ctx_mem = ggml_tensor_overhead() * 4;
+        struct ggml_init_params ctx_params = { ctx_mem, nullptr, true };
+        ggml_context * ctx = ggml_init(ctx_params);
+        if (!ctx) {
+            cleanup();
+            return false;
+        }
+
+        replay_upload upload;
+        upload.ctx = ctx;
+        upload.k = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, (int64_t) k_elems);
+        upload.v = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, (int64_t) v_elems);
+        upload.gate = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, (int64_t) gb_elems);
+        upload.beta = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, (int64_t) gb_elems);
+        if (!upload.k || !upload.v || !upload.gate || !upload.beta) {
+            uploads.push_back(upload);
+            cleanup();
+            return false;
+        }
+
+        ggml_backend_buffer_type_t buft = ggml_backend_buffer_get_type(s_tensor->buffer);
+        upload.buf = ggml_backend_alloc_ctx_tensors_from_buft(ctx, buft);
+        if (!upload.buf) {
+            uploads.push_back(upload);
+            cleanup();
+            return false;
+        }
+
+        ggml_backend_tensor_set(upload.k, tape.k.data(), 0, k_elems * sizeof(float));
+        ggml_backend_tensor_set(upload.v, tape.v.data(), 0, v_elems * sizeof(float));
+        ggml_backend_tensor_set(upload.gate, tape.gate.data(), 0, gb_elems * sizeof(float));
+        ggml_backend_tensor_set(upload.beta, tape.beta.data(), 0, gb_elems * sizeof(float));
+
+        const size_t s_offset = (size_t) cell_idx * n_embd_s * ggml_element_size(s_tensor);
+        upload.state = (char *) s_tensor->data + s_offset;
+        upload.S = (int) S_i64;
+        upload.H_k = (int) H_k_i64;
+        upload.H_v = (int) H_v_i64;
+        uploads.push_back(upload);
+    }
+
+    if (uploads.empty()) {
+        cleanup();
+        return false;
+    }
+
+    for (const auto & upload : uploads) {
+        if (!fn_prepare(upload.state)) {
+            cleanup();
+            return false;
+        }
+    }
+
+    for (const auto & upload : uploads) {
+        if (!fn_prepare(upload.state) ||
+                !fn_replay(upload.state, upload.k->data, upload.v->data, upload.gate->data, upload.beta->data,
+                    n_accepted, upload.S, upload.H_k, upload.H_v)) {
+            cleanup();
+            GGML_ABORT("DFlash direct CPU-tape GDN replay launch failed after validation\n");
+        }
+    }
+
+    bool synced = true;
+    for (const auto & upload : uploads) {
+        synced = fn_sync(upload.state) && synced;
+    }
+    cleanup();
+    if (!synced) {
+        GGML_ABORT("DFlash direct CPU-tape GDN replay sync failed after launch\n");
+    }
+
     return true;
 }
 
@@ -2292,6 +2484,187 @@ bool llama_context::tape_replay_conv_gpu(llama_memory_recurrent * mem_recurrent,
     return true;
 }
 
+bool llama_context::tape_replay_conv_gpu_from_cpu_tape(llama_memory_recurrent * mem_recurrent, int32_t cell_idx, int n_accepted, llama_seq_id seq_id) {
+    if (!dflash_capture || !mem_recurrent || n_accepted <= 0) {
+        return false;
+    }
+
+    ggml_backend_reg_t cuda_reg = ggml_backend_reg_by_name("CUDA");
+    if (!cuda_reg) {
+        return false;
+    }
+    using prepare_ptr_fn_t = bool (*)(const void *);
+    using rebuild_fn_t = bool (*)(void *, const void *, int, int, int);
+    using sync_ptr_fn_t = bool (*)(const void *);
+    auto fn_prepare = (prepare_ptr_fn_t) ggml_backend_reg_get_proc_address(cuda_reg, "dflash_cuda_prepare_ptr");
+    auto fn_rebuild = (rebuild_fn_t) ggml_backend_reg_get_proc_address(cuda_reg, "dflash_rebuild_conv_state");
+    auto fn_sync = (sync_ptr_fn_t) ggml_backend_reg_get_proc_address(cuda_reg, "dflash_cuda_synchronize_ptr");
+    if (!fn_prepare || !fn_rebuild || !fn_sync) {
+        return false;
+    }
+
+    const auto & rec_ids = dflash_capture->recurrent_layer_ids;
+    auto & tape_layers = dflash_capture->tape_layers;
+    if (rec_ids.empty() || tape_layers.empty()) {
+        return false;
+    }
+
+    const uint32_t n_embd_r = model.hparams.n_embd_r();
+    struct conv_upload {
+        ggml_context * ctx = nullptr;
+        ggml_backend_buffer_t buf = nullptr;
+        void * r_state = nullptr;
+        ggml_tensor * qkv = nullptr;
+        int conv_ch = 0;
+        int conv_window = 0;
+    };
+    std::vector<conv_upload> uploads;
+    uploads.reserve(rec_ids.size());
+
+    auto cleanup = [&]() {
+        for (auto & upload : uploads) {
+            if (upload.buf) {
+                ggml_backend_buffer_free(upload.buf);
+                upload.buf = nullptr;
+            }
+            if (upload.ctx) {
+                ggml_free(upload.ctx);
+                upload.ctx = nullptr;
+            }
+        }
+    };
+
+    auto is_cuda_tensor = [](const ggml_tensor * t) {
+        if (!t || !t->data || !t->buffer || ggml_backend_buffer_is_host(t->buffer)) {
+            return false;
+        }
+        const char * name = ggml_backend_buffer_name(t->buffer);
+        return name && std::strncmp(name, "CUDA", 4) == 0;
+    };
+
+    for (size_t li = 0; li < rec_ids.size(); ++li) {
+        if (li >= tape_layers.size()) {
+            cleanup();
+            return false;
+        }
+
+        const int il = rec_ids[li];
+        ggml_tensor * r_tensor = mem_recurrent->r_l[il];
+        if (!r_tensor) {
+            continue;
+        }
+        if (!is_cuda_tensor(r_tensor)) {
+            cleanup();
+            return false;
+        }
+
+        const auto & tape = tape_layers[li];
+        if (tape.n_tokens <= 0 || n_accepted > tape.n_tokens || tape.qkv_mixed.empty()) {
+            cleanup();
+            return false;
+        }
+
+        size_t qkv_seq_offset = 0;
+        if (tape.n_seqs > 1) {
+            bool found = false;
+            for (int s = 0; s < tape.n_seqs; ++s) {
+                if (tape.seq_ids[s] == seq_id) {
+                    found = true;
+                    break;
+                }
+                qkv_seq_offset += (size_t) tape.n_tokens * (size_t) tape.conv_channels;
+            }
+            if (!found) {
+                cleanup();
+                return false;
+            }
+        }
+
+        const int64_t conv_ch_i64 = tape.conv_channels;
+        if (conv_ch_i64 <= 0 || n_embd_r % conv_ch_i64 != 0 ||
+                conv_ch_i64 > std::numeric_limits<int>::max()) {
+            cleanup();
+            return false;
+        }
+
+        const int64_t conv_window_i64 = n_embd_r / conv_ch_i64;
+        if (conv_window_i64 <= 0 || conv_window_i64 > std::numeric_limits<int>::max()) {
+            cleanup();
+            return false;
+        }
+
+        const size_t qkv_elems = (size_t) n_accepted * (size_t) conv_ch_i64;
+        if (tape.qkv_mixed.size() < qkv_seq_offset + qkv_elems) {
+            cleanup();
+            return false;
+        }
+
+        const size_t ctx_mem = ggml_tensor_overhead();
+        struct ggml_init_params ctx_params = { ctx_mem, nullptr, true };
+        ggml_context * ctx = ggml_init(ctx_params);
+        if (!ctx) {
+            cleanup();
+            return false;
+        }
+
+        conv_upload upload;
+        upload.ctx = ctx;
+        upload.qkv = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, (int64_t) qkv_elems);
+        if (!upload.qkv) {
+            uploads.push_back(upload);
+            cleanup();
+            return false;
+        }
+
+        ggml_backend_buffer_type_t buft = ggml_backend_buffer_get_type(r_tensor->buffer);
+        upload.buf = ggml_backend_alloc_ctx_tensors_from_buft(ctx, buft);
+        if (!upload.buf) {
+            uploads.push_back(upload);
+            cleanup();
+            return false;
+        }
+
+        ggml_backend_tensor_set(upload.qkv, tape.qkv_mixed.data() + qkv_seq_offset, 0, qkv_elems * sizeof(float));
+
+        const size_t r_offset = (size_t) cell_idx * n_embd_r * ggml_element_size(r_tensor);
+        upload.r_state = (char *) r_tensor->data + r_offset;
+        upload.conv_ch = (int) conv_ch_i64;
+        upload.conv_window = (int) conv_window_i64;
+        uploads.push_back(upload);
+    }
+
+    if (uploads.empty()) {
+        cleanup();
+        return false;
+    }
+
+    for (const auto & upload : uploads) {
+        if (!fn_prepare(upload.r_state)) {
+            cleanup();
+            return false;
+        }
+    }
+
+    for (const auto & upload : uploads) {
+        if (!fn_rebuild(upload.r_state, upload.qkv->data, n_accepted, upload.conv_ch, upload.conv_window)) {
+            cleanup();
+            GGML_ABORT("DFlash direct CPU-tape conv replay launch failed after validation\n");
+        }
+    }
+
+    bool synced = true;
+    for (const auto & upload : uploads) {
+        synced = fn_sync(upload.r_state) && synced;
+    }
+    cleanup();
+    if (!synced) {
+        GGML_ABORT("DFlash direct CPU-tape conv replay sync failed after launch\n");
+    }
+
+    mem_recurrent->cells[cell_idx].pos += n_accepted;
+    return true;
+}
+
 void llama_context::tape_replay_conv(llama_memory_recurrent * mem_recurrent, int32_t cell_idx, int n_accepted, llama_seq_id seq_id) {
     const auto & hparams = model.hparams;
     const auto & rec_ids = dflash_capture->recurrent_layer_ids;
@@ -2299,6 +2672,9 @@ void llama_context::tape_replay_conv(llama_memory_recurrent * mem_recurrent, int
     const uint32_t n_embd_r = hparams.n_embd_r();
 
     if (model.n_devices() <= 1 && tape_replay_conv_gpu(mem_recurrent, cell_idx, n_accepted)) {
+        return;
+    }
+    if (model.n_devices() > 1 && tape_replay_conv_gpu_from_cpu_tape(mem_recurrent, cell_idx, n_accepted, seq_id)) {
         return;
     }
 
@@ -2464,14 +2840,25 @@ void llama_context::tape_replay_sync() {
         if (dflash_capture->profile) {
             dflash_capture->profile_replay_wait_us += ggml_time_us() - t_start_us;
         }
-    } else if (dflash_capture->replay_direct_gpu && dflash_capture->replay_sync_ptr) {
+    } else if (dflash_capture->replay_direct_gpu &&
+            (!dflash_capture->replay_sync_ptrs.empty() || dflash_capture->replay_sync_ptr)) {
         const int64_t t_start_us = dflash_capture->profile ? ggml_time_us() : 0;
         ggml_backend_reg_t cuda_reg = ggml_backend_reg_by_name("CUDA");
         using sync_ptr_fn_t = bool (*)(const void *);
         auto fn_sync = cuda_reg
             ? (sync_ptr_fn_t) ggml_backend_reg_get_proc_address(cuda_reg, "dflash_cuda_synchronize_ptr")
             : nullptr;
-        if (!fn_sync || !fn_sync(dflash_capture->replay_sync_ptr)) {
+        bool synced = fn_sync != nullptr;
+        if (fn_sync) {
+            if (!dflash_capture->replay_sync_ptrs.empty()) {
+                for (const void * ptr : dflash_capture->replay_sync_ptrs) {
+                    synced = fn_sync(ptr) && synced;
+                }
+            } else {
+                synced = fn_sync(dflash_capture->replay_sync_ptr);
+            }
+        }
+        if (!synced) {
             LLAMA_LOG_WARN("%s: direct GPU tape replay sync failed\n", __func__);
         }
         if (dflash_capture->profile) {
@@ -2507,6 +2894,7 @@ void llama_context::tape_replay_sync() {
     dflash_capture->replay_pending = false;
     dflash_capture->replay_direct_gpu = false;
     dflash_capture->replay_sync_ptr = nullptr;
+    dflash_capture->replay_sync_ptrs.clear();
 }
 
 // CPU fallback for tape replay (used when no GPU backend available)
@@ -2525,7 +2913,12 @@ void llama_context::tape_replay_cpu(llama_memory_recurrent * mem_recurrent, int3
         const int64_t S = tape.S_k;
         const int64_t H_k = tape.H_k;
         const int64_t H_v = tape.H_v;
-        const int64_t head_ratio = H_v / H_k;
+        if (S <= 0 || H_k <= 0 || H_v <= 0) {
+            continue;
+        }
+        if ((size_t) S * (size_t) S * (size_t) H_v != (size_t) n_embd_s) {
+            continue;
+        }
 
         ggml_tensor * s_tensor = mem_recurrent->s_l[il];
         const size_t s_offset = (size_t)cell_idx * n_embd_s * ggml_element_size(s_tensor);
@@ -2534,8 +2927,8 @@ void llama_context::tape_replay_cpu(llama_memory_recurrent * mem_recurrent, int3
 
         for (int tok = 0; tok < n_accepted; ++tok) {
             for (int64_t hv = 0; hv < H_v; ++hv) {
-                int64_t hk = hv / head_ratio;
-                float g_val = expf(tape.gate[tok * H_v + hv]);
+                const int64_t hk = hv % H_k;
+                float g_val = exp2f(tape.gate[tok * H_v + hv] * 1.442695041f);
                 float b_val = 1.0f / (1.0f + expf(-tape.beta[tok * H_v + hv]));
 
                 float * S_h = state.data() + hv * S * S;

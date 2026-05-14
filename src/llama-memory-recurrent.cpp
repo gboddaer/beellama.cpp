@@ -462,8 +462,7 @@ void llama_memory_recurrent::copy_cell(int32_t i_src, int32_t i_dst) {
         if (fn_prepare && fn_copy && fn_sync) {
             bool any_queued = false;
             bool all_queued = true;
-            const void * sync_ptr = nullptr;
-            const void * first_ptr = nullptr;
+            std::vector<const void *> sync_ptrs;
 
             auto enqueue_copy = [&](ggml_tensor * tensor, uint32_t n_embd) {
                 if (!tensor || !tensor->data) {
@@ -477,18 +476,15 @@ void llama_memory_recurrent::copy_cell(int32_t i_src, int32_t i_dst) {
                 const size_t row_bytes = ggml_row_size(tensor->type, n_embd);
                 const char * src = (const char *) tensor->data + (size_t) i_src * row_bytes;
                 char * dst = (char *) tensor->data + (size_t) i_dst * row_bytes;
-                if (!first_ptr) {
-                    first_ptr = dst;
-                    if (!fn_prepare(first_ptr)) {
-                        return false;
-                    }
+                if (!fn_prepare(dst)) {
+                    return false;
                 }
                 if (!fn_copy(dst, src, row_bytes)) {
                     return false;
                 }
 
                 any_queued = true;
-                sync_ptr = dst;
+                sync_ptrs.push_back(dst);
                 return true;
             };
 
@@ -505,8 +501,11 @@ void llama_memory_recurrent::copy_cell(int32_t i_src, int32_t i_dst) {
             }
 
             if (any_queued) {
-                const bool synced = fn_sync(sync_ptr);
-                if (all_queued && synced) {
+                bool all_synced = true;
+                for (const void * ptr : sync_ptrs) {
+                    all_synced = fn_sync(ptr) && all_synced;
+                }
+                if (all_queued && all_synced) {
                     return;
                 }
             }

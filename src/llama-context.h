@@ -201,6 +201,7 @@ struct dflash_capture_data {
     ggml_backend_event_t replay_event = nullptr;  // P2-11: CUDA event for fine-grained sync
     bool replay_direct_gpu = false;
     const void * replay_sync_ptr = nullptr;
+    std::vector<const void *> replay_sync_ptrs;
     int replay_n_accepted = 0;
     int32_t replay_cell_idx = -1;
     llama_seq_id replay_seq_id = 0;
@@ -510,6 +511,8 @@ public:
     bool tape_replay_conv_gpu(llama_memory_recurrent * mem_recurrent, int32_t cell_idx, int n_accepted);
     bool tape_replay_conv_gpu(llama_memory_recurrent * mem_recurrent, int32_t cell_idx, int n_accepted, bool advance_pos);
     bool tape_replay_gdn_direct_gpu(llama_memory_recurrent * mem_recurrent, int32_t cell_idx, int n_accepted);
+    bool tape_replay_gdn_direct_from_cpu_tape(llama_memory_recurrent * mem_recurrent, int32_t cell_idx, int n_accepted);
+    bool tape_replay_conv_gpu_from_cpu_tape(llama_memory_recurrent * mem_recurrent, int32_t cell_idx, int n_accepted, llama_seq_id seq_id);
     void tape_replay_conv(llama_memory_recurrent * mem_recurrent, int32_t cell_idx, int n_accepted, llama_seq_id seq_id = 0);
     void tape_replay_cpu(llama_memory_recurrent * mem_recurrent, int32_t cell_idx, int n_accepted);
 
