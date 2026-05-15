@@ -1720,6 +1720,28 @@ struct common_speculative_state_dflash : public common_speculative_state {
                 target_n_layer,
                 cross_ctx);
 
+        {
+            const llama_vocab * vocab_tgt = llama_model_get_vocab(model_tgt);
+            const llama_vocab * vocab_dft = llama_model_get_vocab(model_dft_);
+            const int vocab_tgt_n = vocab_tgt ? llama_vocab_n_tokens(vocab_tgt) : 0;
+            const int vocab_dft_n = vocab_dft ? llama_vocab_n_tokens(vocab_dft) : 0;
+
+            int32_t capture_min = capture_layers.empty() ? -1 : capture_layers[0];
+            int32_t capture_max = capture_layers.empty() ? -1 : capture_layers[0];
+            for (int32_t il : capture_layers) {
+                capture_min = std::min(capture_min, il);
+                capture_max = std::max(capture_max, il);
+            }
+
+            LOG_INF("dflash: target/drafter info: target_ctx_train=%d target_vocab=%d drafter_vocab=%d vocab_match=%d capture_min=%d capture_max=%d\n",
+                    llama_model_n_ctx_train(model_tgt),
+                    vocab_tgt_n,
+                    vocab_dft_n,
+                    vocab_tgt_n == vocab_dft_n ? 1 : 0,
+                    capture_min,
+                    capture_max);
+        }
+
         ring_buf.resize(n_target_layers);
         for (int i = 0; i < n_target_layers; ++i) {
             ring_buf[i].resize((size_t)RING_SIZE * n_embd, 0.0f);
