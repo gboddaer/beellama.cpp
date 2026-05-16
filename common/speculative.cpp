@@ -2001,7 +2001,6 @@ struct common_speculative_state_dflash : public common_speculative_state {
                 return 0;
             }
 
-            source = dflash_capture_source::cpu_hidden;
             n_src_layers = llama_get_n_layer_hiddens(ctx_tgt);
             if (n_src_layers == 0) {
                 if (profile) {
@@ -2009,10 +2008,31 @@ struct common_speculative_state_dflash : public common_speculative_state {
                 }
                 return 0;
             }
+
+            float * cpu_hidden0 = llama_get_layer_hidden(ctx_tgt, 0);
             captured = llama_get_layer_hidden_n_tokens(ctx_tgt, 0);
 
+            if (captured <= 0) {
+                if (profile) {
+                    LOG_INF("dflash prefill flush skipped: source=cpu/verify_gpu reason=no-captured-tokens captured=0 n_tokens_arg=%d src_offset=%d\n",
+                            n_tokens, src_offset);
+                }
+                return 0;
+            }
+
+            if (cpu_hidden0) {
+                source = dflash_capture_source::cpu_hidden;
+            } else if (gpu_ring_handle) {
+                source = dflash_capture_source::verify_gpu_hidden;
+            } else {
+                LOG_ERR("dflash prefill flush has GPU hidden capture but no GPU ring and no CPU hidden data: requested=%d seq=%d\n",
+                        n_tokens, seq_id);
+                return 0;
+            }
+
             // CPU hidden path uses the original src_offset which is
-            // outer-batch-relative into the CPU hidden buffer.
+            // outer-batch-relative into the CPU hidden buffer. Verify-GPU hidden
+            // uses the same token indexing but must not force CPU ring tracking.
             offset = n_tokens > 0 ? src_offset : 0;
         }
 
@@ -2049,10 +2069,13 @@ struct common_speculative_state_dflash : public common_speculative_state {
                 source == dflash_capture_source::verify_gpu_hidden  ? "verify_gpu"  :
                                                                        "callback_cpu";
 
-            const bool writes_cpu_ring = source != dflash_capture_source::prefill_gpu_hidden;
+            const bool writes_cpu_ring =
+                source == dflash_capture_source::cpu_hidden;
+
             const char * ring_dst =
-                gpu_ring_handle ? (writes_cpu_ring ? "cpu_ring+gpu_ring" : "gpu_ring")
-                                : "cpu_ring";
+                gpu_ring_handle
+                    ? (writes_cpu_ring ? "cpu_ring+gpu_ring" : "gpu_ring")
+                    : (writes_cpu_ring ? "cpu_ring" : "none");
 
             LOG_INF("dflash prefill flush: capture_source=%s ring_dst=%s captured=%lld offset=%d n_tokens=%d to_write=%d n_src_layers=%d prefill_flushed=%d ring_write_pos=%d ring_filled=%d committed_len=%d\n",
                 capture_source,
@@ -2076,7 +2099,17 @@ struct common_speculative_state_dflash : public common_speculative_state {
             llama_dflash_kv_cache_reset(ctx_dft);
         }
 
-        const int actual_written = ring_write(to_write, offset, true, source);
+        // Only CPU callback hidden data can safely refresh the CPU mirror.
+        // GPU-only prefill/verify sources update gpu_ring_handle but leave
+        // ring_buf stale, so they must not force CPU-ring tracking.
+        const bool force_cpu_ring_for_flush =
+            source == dflash_capture_source::cpu_hidden;
+
+        const int actual_written = ring_write(
+            to_write,
+            offset,
+            force_cpu_ring_for_flush,
+            source);
         committed_len += actual_written;
         update_drafter_kv_cache(actual_written);
         prefill_flushed = true;
@@ -2573,11 +2606,16 @@ private:
         if (n_tokens <= 0) return 0;
 
         const bool use_prefill_gpu = (source == dflash_capture_source::prefill_gpu_hidden);
+        const bool use_verify_gpu  = (source == dflash_capture_source::verify_gpu_hidden);
+        const bool source_has_cpu_hidden = (source == dflash_capture_source::cpu_hidden);
 
-        // The CPU mirror is valid only when this write updates ring_buf for all
-        // written layers. GPU-only prefill/verify writes update gpu_ring_handle
-        // but leave ring_buf stale, so checkpoint serialization must be disabled.
-        const bool cpu_ring_should_track = force_cpu_ring || !gpu_ring_handle;
+        // CPU ring is valid only if this write actually refreshes ring_buf
+        // for all target layers from CPU hidden data. GPU-only prefill/verify
+        // writes update gpu_ring_handle only and must invalidate checkpointable
+        // CPU ring state.
+        const bool cpu_ring_should_track =
+            source_has_cpu_hidden && (force_cpu_ring || !gpu_ring_handle);
+
         if (!cpu_ring_should_track) {
             cpu_ring_valid = false;
         }
@@ -2626,7 +2664,7 @@ private:
         bool gpu_d2d_failed = false;
         int64_t cpu_copy_us = 0;
         int64_t gpu_enqueue_us = 0;
-        bool cpu_ring_written_all = true;
+        bool cpu_ring_written_all = cpu_ring_should_track;
         for (int layer = 0; layer < n_target_layers && layer < n_src_layers; ++layer) {
             float * data = llama_get_layer_hidden(ctx_tgt, layer);
             int64_t embd = llama_get_layer_hidden_n_embd(ctx_tgt, layer);
@@ -2643,7 +2681,7 @@ private:
             // CPU ring write: only when we have CPU data and either forcing CPU
             // ring or no GPU ring is available. In prefill GPU mode, we have no
             // CPU data, so the CPU ring is not kept in sync with this write.
-            if ((force_cpu_ring || !gpu_ring_handle) && data) {
+            if (cpu_ring_should_track && data) {
                 const int64_t t_start = profile ? ggml_time_us() : 0;
                 for (int t = 0; t < actual_written; ++t) {
                     int slot = (ring_write_pos + t) % RING_SIZE;
@@ -2654,7 +2692,7 @@ private:
                 if (profile) {
                     cpu_copy_us += ggml_time_us() - t_start;
                 }
-            } else if (!use_prefill_gpu && (force_cpu_ring || !gpu_ring_handle)) {
+            } else if (cpu_ring_should_track) {
                 cpu_ring_written_all = false;
             }
 
@@ -2714,6 +2752,8 @@ private:
         log_ring_profile("ring_write", n_tokens, actual_written, cpu_copy_us, gpu_enqueue_us, gpu_sync_us);
         if (cpu_ring_should_track) {
             cpu_ring_valid = cpu_ring_written_all;
+        } else {
+            cpu_ring_valid = false;
         }
         ring_write_pos = (ring_write_pos + actual_written) % RING_SIZE;
         ring_filled = std::min(ring_filled + actual_written, RING_SIZE);
@@ -3649,6 +3689,31 @@ bool common_dflash_cpu_ring_valid_after_write_for_test(
 
     if (cpu_ring_should_track) {
         cpu_ring_valid = cpu_ring_written_all;
+    }
+
+    return cpu_ring_valid;
+}
+
+bool common_dflash_cpu_ring_valid_after_source_write_for_test(
+        bool was_valid,
+        int  source,
+        bool force_cpu_ring,
+        bool has_gpu_ring,
+        bool cpu_data_all_layers) {
+    const bool source_has_cpu_hidden = source == 0;
+    const bool cpu_ring_should_track =
+        source_has_cpu_hidden && (force_cpu_ring || !has_gpu_ring);
+
+    bool cpu_ring_valid = was_valid;
+
+    if (!cpu_ring_should_track) {
+        cpu_ring_valid = false;
+    }
+
+    if (cpu_ring_should_track) {
+        cpu_ring_valid = cpu_data_all_layers;
+    } else {
+        cpu_ring_valid = false;
     }
 
     return cpu_ring_valid;
