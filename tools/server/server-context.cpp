@@ -1191,6 +1191,73 @@ struct server_slot : server_adaptive_dm_state {
     }
 };
 
+static bool dflash_slot_in_view(const server_slot & slot, const llama_batch & view) {
+    for (int32_t j = 0; j < view.n_tokens; ++j) {
+        for (int32_t k = 0; k < view.n_seq_id[j]; ++k) {
+            if (view.seq_id[j][k] == slot.id) {
+                return true;
+            }
+        }
+    }
+
+    return false;
+}
+
+static bool dflash_view_has_unexpected_prompt_logits(
+        const llama_batch              & view,
+        const std::vector<server_slot> & slots) {
+    if (!view.logits) {
+        return false;
+    }
+
+    for (const auto & slot : slots) {
+        if (!slot.task || !slot.task->need_sampling()) {
+            continue;
+        }
+        if (slot.state != SLOT_STATE_PROCESSING_PROMPT && slot.state != SLOT_STATE_DONE_PROMPT) {
+            continue;
+        }
+        if (!dflash_slot_in_view(slot, view)) {
+            continue;
+        }
+
+        const int32_t final_prompt_pos = slot.task->n_tokens() - 1;
+        for (int32_t j = 0; j < view.n_tokens; ++j) {
+            if (!view.logits[j]) {
+                continue;
+            }
+
+            bool belongs_to_slot = false;
+            for (int32_t k = 0; k < view.n_seq_id[j]; ++k) {
+                if (view.seq_id[j][k] == slot.id) {
+                    belongs_to_slot = true;
+                    break;
+                }
+            }
+            if (belongs_to_slot && view.pos[j] != final_prompt_pos) {
+                return true;
+            }
+        }
+    }
+
+    return false;
+}
+
+static void dflash_log_reduced_verify_decision(
+        bool        graph_enabled,
+        bool        view_enabled,
+        int32_t     view_start,
+        int32_t     n_tokens,
+        int         top_k,
+        const char * reason) {
+    if (!dflash_server_profile_enabled()) {
+        return;
+    }
+
+    SRV_INF("dflash reduced verifier decision: graph_enabled=%d view_enabled=%d view_start=%d n_tokens=%d top_k=%d reason=%s\n",
+            graph_enabled ? 1 : 0, view_enabled ? 1 : 0, view_start, n_tokens, top_k, reason ? reason : "unknown");
+}
+
 
 static bool dflash_batch_view_is_reduced_verify(
         const std::vector<server_slot> & slots,
@@ -4347,6 +4414,15 @@ private:
             }
         }
         llama_set_dflash_verify_logits(ctx, dflash_verify_graph_enabled, dflash_verify_plan.top_k);
+        if (params_base.speculative.type == COMMON_SPECULATIVE_TYPE_DFLASH) {
+            dflash_log_reduced_verify_decision(
+                    dflash_verify_graph_enabled,
+                    dflash_verify_plan.enabled,
+                    0,
+                    batch.n_tokens,
+                    dflash_verify_plan.top_k,
+                    dflash_verify_plan.reason);
+        }
 
         auto should_flush_dflash_prefill = [&](const server_slot & slot, const llama_batch & view, bool log_decision) -> common_dflash_prefill_span {
             common_dflash_prefill_span no_flush;
@@ -4469,11 +4545,6 @@ private:
                             use_rejection_sampling, ddtree_batch_active, i, n_tokens,
                             dflash_verify_plan.top_k, &dflash_reduce_reason);
             }
-            if (dflash_server_profile_enabled() && params_base.speculative.type == COMMON_SPECULATIVE_TYPE_DFLASH) {
-                SRV_INF("dflash reduced verifier: enabled=%d view_start=%d n_tokens=%d top_k=%d reason=%s\n",
-                        dflash_reduce_this_view ? 1 : 0, i, n_tokens,
-                        dflash_verify_plan.top_k, dflash_reduce_reason);
-            }
             llama_set_dflash_consume_reduced(ctx, dflash_reduce_this_view);
 
             // DFlash: decide whether target hidden capture is needed for this
@@ -4493,24 +4564,16 @@ private:
 
             if (params_base.speculative.type == COMMON_SPECULATIVE_TYPE_DFLASH) {
                 bool dflash_view_has_generating = false;
+                std::vector<server_slot *> dflash_slots_in_view;
                 for (auto & slot : slots) {
                     if (!slot.can_speculate() || !slot.spec) {
                         continue;
                     }
 
-                    bool slot_in_view = false;
-                    for (int32_t j = 0; j < batch_view.n_tokens && !slot_in_view; ++j) {
-                        for (int32_t k = 0; k < batch_view.n_seq_id[j]; ++k) {
-                            if (batch_view.seq_id[j][k] == slot.id) {
-                                slot_in_view = true;
-                                break;
-                            }
-                        }
-                    }
-
-                    if (!slot_in_view) {
+                    if (!dflash_slot_in_view(slot, batch_view)) {
                         continue;
                     }
+                    dflash_slots_in_view.push_back(&slot);
 
                     if (slot.state == SLOT_STATE_GENERATING) {
                         dflash_capture_needed_for_view = true;
@@ -4518,22 +4581,9 @@ private:
                     }
                 }
 
-                for (auto & slot : slots) {
-                    if (!slot.can_speculate() || !slot.spec) {
-                        continue;
-                    }
-
-                    bool slot_in_view = false;
-                    for (int32_t j = 0; j < batch_view.n_tokens && !slot_in_view; ++j) {
-                        for (int32_t k = 0; k < batch_view.n_seq_id[j]; ++k) {
-                            if (batch_view.seq_id[j][k] == slot.id) {
-                                slot_in_view = true;
-                                break;
-                            }
-                        }
-                    }
-
-                    if (!slot_in_view || slot.state == SLOT_STATE_GENERATING) {
+                for (auto * slot_ptr : dflash_slots_in_view) {
+                    auto & slot = *slot_ptr;
+                    if (slot.state == SLOT_STATE_GENERATING) {
                         continue;
                     }
 
@@ -4574,14 +4624,30 @@ private:
                 }
             }
 
+            if (dflash_server_profile_enabled() &&
+                    params_base.speculative.type == COMMON_SPECULATIVE_TYPE_DFLASH &&
+                    dflash_view_has_unexpected_prompt_logits(batch_view, slots)) {
+                SRV_INF("dflash prompt logits diagnostic: view_start=%d n_tokens=%d has unexpected prompt raw logits outside final sampling row\n",
+                        i, n_tokens);
+            }
+
             const int64_t t_verify_start = ggml_time_us();
             const int ret = llama_decode(ctx, batch_view);
-            if (ret == 0 && dflash_reduce_this_view &&
-                    llama_get_logits_argmax(ctx) != nullptr &&
-                    llama_get_logits_argmax_k(ctx) == dflash_verify_plan.top_k) {
-                dflash_reduced_verify_ready = true;
-                dflash_reduced_verify_top_k = dflash_verify_plan.top_k;
-                dflash_reduced_verify_view_start = i;
+            if (ret == 0 && dflash_reduce_this_view) {
+                int32_t * compact_argmax = llama_get_logits_argmax(ctx);
+                const int32_t compact_n = llama_get_logits_argmax_n(ctx);
+                const int compact_k = llama_get_logits_argmax_k(ctx);
+                if (compact_argmax != nullptr &&
+                        compact_n >= n_tokens &&
+                        compact_k == dflash_verify_plan.top_k) {
+                    dflash_reduced_verify_ready = true;
+                    dflash_reduced_verify_top_k = dflash_verify_plan.top_k;
+                    dflash_reduced_verify_view_start = i;
+                } else if (dflash_server_profile_enabled()) {
+                    SRV_INF("dflash compact-output mismatch: view_start=%d n_tokens=%d expected_top_k=%d got_ptr=%d got_n=%d got_k=%d\n",
+                            i, n_tokens, dflash_verify_plan.top_k,
+                            compact_argmax != nullptr ? 1 : 0, compact_n, compact_k);
+                }
             }
             const int64_t t_verify_elapsed = ggml_time_us() - t_verify_start;
             t_verify_total += t_verify_elapsed;

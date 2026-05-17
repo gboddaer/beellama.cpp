@@ -150,6 +150,9 @@ llm_build_qwen35::llm_build_qwen35(const llama_model & model, const llm_graph_pa
     cb(cur, "result_output", -1);
     res->t_logits = cur;
 
+    const bool dflash_compact_verifier_only =
+        cparams.dflash_reduced_consumer_active && cparams.dflash_verify_logits;
+
     if (cparams.dflash_verify_logits) {
         const int topk = std::max(1, std::min(cparams.dflash_verify_topk, 64));
         if (topk > 1) {
@@ -163,7 +166,7 @@ llm_build_qwen35::llm_build_qwen35(const llama_model & model, const llm_graph_pa
         ggml_build_forward_expand(gf, res->t_logits_argmax);
     }
 
-    if (!(cparams.dflash_reduced_consumer_active && cparams.dflash_verify_logits)) {
+    if (!dflash_compact_verifier_only) {
         ggml_build_forward_expand(gf, cur);
     }
 }

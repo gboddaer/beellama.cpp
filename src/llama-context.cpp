@@ -1128,8 +1128,10 @@ static void dflash_clear_prefill_cparams(llama_cparams & cparams) {
 
 static void dflash_profile_reset(dflash_capture_data & cap) {
     cap.profile_decode_us = 0;
+    cap.profile_output_extract_us = 0;
     cap.profile_raw_logits_us = 0;
     cap.profile_raw_logits_bytes = 0;
+    cap.profile_raw_logits_skipped = 0;
     cap.profile_reduced_logits_us = 0;
     cap.profile_reduced_logits_bytes = 0;
     cap.profile_cb_ask = 0;
@@ -1155,20 +1157,28 @@ static void dflash_profile_cb_name(dflash_capture_data & cap, const ggml_tensor 
     cap.profile_cb_names[std::string(phase) + ":" + t->name] += 1;
 }
 
-static void dflash_profile_log(const dflash_capture_data & cap, const char * func) {
+static void dflash_profile_log(const dflash_capture_data & cap, const char * func, int32_t n_vocab) {
     if (!cap.profile) {
         return;
     }
 
+    const uint64_t skipped_bytes_est =
+        cap.profile_raw_logits_skipped * (uint64_t) std::max(0, n_vocab) * sizeof(float);
+
     LLAMA_LOG_INFO(
-        "%s: dflash profile: decode=%.3f ms raw_logits=%.3f ms raw_logits_bytes=%.3f MiB "
+        "%s: dflash profile: decode=%.3f ms output_extract=%.3f ms "
+        "raw_logits=%.3f ms raw_logits_bytes=%.3f MiB raw_logits_skipped=%" PRIu64
+        " raw_logits_skipped_bytes_est=%.3f MiB "
         "reduced_logits=%.3f ms reduced_logits_bytes=%.3f KiB "
         "cb ask=%" PRIu64 " hidden=%" PRIu64 " tape=%" PRIu64 " qkv=%" PRIu64
         " read=%" PRIu64 " hidden=%" PRIu64 " tape=%" PRIu64 " qkv=%" PRIu64 "\n",
         func,
         cap.profile_decode_us / 1000.0,
+        cap.profile_output_extract_us / 1000.0,
         cap.profile_raw_logits_us / 1000.0,
         cap.profile_raw_logits_bytes / (1024.0 * 1024.0),
+        cap.profile_raw_logits_skipped,
+        skipped_bytes_est / (1024.0 * 1024.0),
         cap.profile_reduced_logits_us / 1000.0,
         cap.profile_reduced_logits_bytes / 1024.0,
         cap.profile_cb_ask,
@@ -5461,7 +5471,9 @@ int llama_context::decode(const llama_batch & batch_inp) {
             logits_argmax_prob_buf.resize(n_ids);
             ggml_backend_tensor_get_async(backend_argmax, t_argmax, logits_argmax_prob_buf.data(), ids_bytes, probs_bytes);
             if (dflash_capture && dflash_capture->profile) {
-                dflash_capture->profile_reduced_logits_us += ggml_time_us() - t_start_us;
+                const int64_t elapsed_us = ggml_time_us() - t_start_us;
+                dflash_capture->profile_reduced_logits_us += elapsed_us;
+                dflash_capture->profile_output_extract_us += elapsed_us;
                 dflash_capture->profile_reduced_logits_bytes += ids_bytes + probs_bytes;
             }
             logits_argmax_count = n_outputs;
@@ -5472,7 +5484,12 @@ int llama_context::decode(const llama_batch & batch_inp) {
         // verifier output. Other ubatches may still need raw logits even when
         // the stable verifier graph also emits a tiny top-K tensor.
         const bool dflash_reduced_consumed = t_argmax != nullptr && cparams.dflash_reduced_consumer_active;
-        if (logits.data && t_logits && n_outputs > 0 && !dflash_reduced_consumed && needs_raw_logits(ubatch, sampling.samplers)) {
+        const bool raw_logits_needed =
+            logits.data && t_logits && n_outputs > 0 && needs_raw_logits(ubatch, sampling.samplers);
+        if (dflash_reduced_consumed && raw_logits_needed && dflash_capture && dflash_capture->profile) {
+            dflash_capture->profile_raw_logits_skipped += n_outputs;
+        }
+        if (raw_logits_needed && !dflash_reduced_consumed) {
             ggml_backend_t backend_res = ggml_backend_sched_get_tensor_backend(sched.get(), t_logits);
             GGML_ASSERT(backend_res != nullptr);
             GGML_ASSERT(logits.data != nullptr);
@@ -5486,7 +5503,9 @@ int llama_context::decode(const llama_batch & batch_inp) {
                 const int64_t t_start_us = dflash_capture && dflash_capture->profile ? ggml_time_us() : 0;
                 ggml_backend_tensor_get_async(backend_res, t_logits, logits_out, 0, bytes);
                 if (dflash_capture && dflash_capture->profile) {
-                    dflash_capture->profile_raw_logits_us += ggml_time_us() - t_start_us;
+                    const int64_t elapsed_us = ggml_time_us() - t_start_us;
+                    dflash_capture->profile_raw_logits_us += elapsed_us;
+                    dflash_capture->profile_output_extract_us += elapsed_us;
                     dflash_capture->profile_raw_logits_bytes += bytes;
                 }
             }
@@ -5625,7 +5644,7 @@ int llama_context::decode(const llama_batch & batch_inp) {
     //synchronize();
 
     if (dflash_capture && dflash_capture->profile) {
-        dflash_profile_log(*dflash_capture, __func__);
+        dflash_profile_log(*dflash_capture, __func__, n_vocab);
     }
 
     return 0;

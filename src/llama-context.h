@@ -207,8 +207,10 @@ struct dflash_capture_data {
     bool multi_gpu_capture_fallback_logged = false;
     bool multi_gpu_replay_fallback_logged = false;
     uint64_t profile_decode_us = 0;
+    uint64_t profile_output_extract_us = 0;
     uint64_t profile_raw_logits_us = 0;
     uint64_t profile_raw_logits_bytes = 0;
+    uint64_t profile_raw_logits_skipped = 0;
     uint64_t profile_reduced_logits_us = 0;
     uint64_t profile_reduced_logits_bytes = 0;
     uint64_t profile_cb_ask = 0;
