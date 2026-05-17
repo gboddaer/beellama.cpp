@@ -1182,6 +1182,22 @@ static bool dflash_batch_view_is_reduced_verify(
     return true;
 }
 
+static int dflash_flat_effective_draft_max(llama_context * ctx_dft, int n_draft_max) {
+    if (!ctx_dft || n_draft_max <= 0) {
+        return n_draft_max;
+    }
+
+    const llama_model * model_dft = llama_get_model(ctx_dft);
+    const int block_size = model_dft ? llama_model_dflash_block_size(model_dft) : 0;
+    if (block_size <= 1) {
+        return n_draft_max;
+    }
+
+    // Flat DFlash batches reserve row 0 for the seed token, so a block with N
+    // rows can produce at most N-1 draft tokens.
+    return std::min(n_draft_max, block_size - 1);
+}
+
 
 
 //
@@ -3326,7 +3342,11 @@ private:
             }
 
             // generate draft tokens in speculative decoding mode
-            const int n_draft_max = slot.get_n_draft_max(params_base, true);
+            int n_draft_max = slot.get_n_draft_max(params_base, true);
+            if (params_base.speculative.type == COMMON_SPECULATIVE_TYPE_DFLASH &&
+                    params_base.speculative.branch_budget == 0) {
+                n_draft_max = dflash_flat_effective_draft_max(ctx_dft_shared.get(), n_draft_max);
+            }
 
             // For DFlash: when grammar or reasoning state needs the normal
             // token-by-token sampler, skip drafting instead of crossing parser

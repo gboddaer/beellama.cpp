@@ -447,6 +447,11 @@ int main(int argc, char ** argv) {
     ok &= expect(server_context.find("llama_set_dflash_verify_logits(ctx, dflash_reduce_this_view") == std::string::npos, "server must not toggle reduced verifier graph around each ubatch");
     ok &= expect(server_context.find("llama_set_dflash_verify_logits(ctx, false, 1)") == std::string::npos, "server must not disable reduced verifier graph after each ubatch");
     ok &= expect(server_context.find("llama_set_dflash_consume_reduced(ctx, dflash_reduce_this_view)") != std::string::npos, "server must toggle only the raw-logit consumption flag per ubatch");
+    ok &= expect(server_context.find("dflash_flat_effective_draft_max") != std::string::npos &&
+                 server_context.find("block_size - 1") != std::string::npos,
+        "flat DFlash verifier must cap draft max to the drafter's effective block_size-1 horizon");
+    ok &= expect(server_context.find("n_draft_max = dflash_flat_effective_draft_max(ctx_dft_shared.get(), n_draft_max)") != std::string::npos,
+        "server must avoid padding flat DFlash verifier batches to unreachable draft rows");
     ok &= expect(server_context.find("shrunk recurrent state to %d cells before draft load") != std::string::npos, "server must shrink recurrent backup cells before draft model load");
     ok &= expect(server_context.find("expanded recurrent state to %d cells before speculative GPU buffers") != std::string::npos, "server must expand recurrent backup cells before DFlash slot/GPU buffer init");
     ok &= expect(llama_h.find("llama_context_recurrent_expand") != std::string::npos, "public API must expose context-level recurrent expansion with graph invalidation");
