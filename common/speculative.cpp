@@ -2903,8 +2903,8 @@ private:
             return;
         }
 
-        // DEBUG: log capture buffer vs n_accepted to detect counter mismatch
-        {
+        // Optional diagnostic: log capture buffer vs n_accepted to detect counter mismatch.
+        if (common_dflash_debug_logs_enabled()) {
             int64_t ntok = llama_get_layer_hidden_n_tokens(ctx_tgt, 0);
             int64_t embd = llama_get_layer_hidden_n_embd(ctx_tgt, 0);
             const float * data = llama_get_layer_hidden(ctx_tgt, 0);
