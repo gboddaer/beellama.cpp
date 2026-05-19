@@ -35,6 +35,7 @@ int main(int argc, char ** argv) {
     const std::string mtmd_h = read_file(root + "/tools/mtmd/mtmd.h");
     const std::string clip_h = read_file(root + "/tools/mtmd/clip.h");
     const std::string mtmd_cpp = read_file(root + "/tools/mtmd/mtmd.cpp");
+    const std::string mtmd_image = read_file(root + "/tools/mtmd/mtmd-image.cpp");
     const std::string clip_cpp = read_file(root + "/tools/mtmd/clip.cpp");
     const std::string mtmd_helper = read_file(root + "/tools/mtmd/mtmd-helper.cpp");
     const std::string server_context = read_file(root + "/tools/server/server-context.cpp");
@@ -68,5 +69,8 @@ int main(int argc, char ** argv) {
         "mtmd image decode must fail gracefully when a non-causal chunk exceeds ubatch");
     ok &= expect(mtmd_helper.find("lower --image-max-tokens") != std::string::npos,
         "mtmd image decode error must tell users how to avoid the non-causal ubatch limit");
+    ok &= expect(mtmd_image.find("Min-pixel upscaling can overshoot max_pixels after alignment.") != std::string::npos,
+        "dynamic image resize must re-clamp to max_pixels after min-pixel alignment");
+
     return ok ? 0 : 1;
 }
