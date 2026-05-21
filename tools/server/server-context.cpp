@@ -3716,6 +3716,9 @@ private:
         server_slot * dflash_cycle_slot = nullptr;
         int dflash_cycle_n_draft = 0;
         int dflash_cycle_n_accept = 0;
+        int dflash_cycle_verify_rows = 0;
+        int dflash_cycle_useful_rows = 0;
+        int dflash_cycle_pad_rows = 0;
         bool dflash_cycle_reduced_verify = false;
         int dflash_cycle_reduced_top_k = 0;
         llama_pos dflash_cycle_pos = -1;
@@ -5206,6 +5209,9 @@ private:
                 const bool is_draft_tree = slot.has_draft_tree;
                 const size_t n_draft = is_draft_tree ? (size_t) slot.draft_tree.n_nodes : slot.spec_draft.size();
                 const bool had_dflash_padding = !slot.spec_pad_i_batch.empty();
+                const int dflash_verify_rows = (int) slot.spec_i_batch.size() + (int) slot.spec_pad_i_batch.size();
+                const int dflash_useful_rows = (int) slot.spec_i_batch.size();
+                const int dflash_pad_rows = (int) slot.spec_pad_i_batch.size();
                 const bool profile_dflash_accept = dflash_server_profile_enabled(DFLASH_PROFILE_SUMMARY | DFLASH_PROFILE_COPY) &&
                         params_base.speculative.type == COMMON_SPECULATIVE_TYPE_DFLASH;
                 const int64_t profile_accept_start = profile_dflash_accept ? ggml_time_us() : 0;
@@ -5410,6 +5416,9 @@ private:
                     dflash_cycle_slot = &slot;
                     dflash_cycle_n_draft = (int) n_draft;
                     dflash_cycle_n_accept = n_accepted_draft;
+                    dflash_cycle_verify_rows = dflash_verify_rows;
+                    dflash_cycle_useful_rows = dflash_useful_rows;
+                    dflash_cycle_pad_rows = dflash_pad_rows;
                     dflash_cycle_reduced_verify = dflash_reduced_verify_ready && dflash_verify_plan.enabled;
                     dflash_cycle_reduced_top_k = dflash_reduced_verify_top_k;
                     dflash_cycle_pos = slot.n_pos_before_draft;
@@ -5834,6 +5843,7 @@ private:
                 const int task_id = dflash_cycle_slot->task ? dflash_cycle_slot->task->id : -1;
                 SLT_INF(*dflash_cycle_slot,
                         "dflash cycle: task=%d pos=%d adaptive_n_max=%d n_draft=%d n_accept=%d "
+                        "verify_rows=%d useful_rows=%d pad_rows=%d "
                         "cross_len=%d ring_filled=%d committed=%d "
                         "draft_ms=%.1f verify_ms=%.1f accept_ms=%.1f total_ms=%.1f "
                         "reduced_verify=%d top_k=%d accept_bin=%d ctx_bucket=%d\n",
@@ -5842,6 +5852,9 @@ private:
                         active_n_max,
                         dflash_cycle_n_draft,
                         dflash_cycle_n_accept,
+                        dflash_cycle_verify_rows,
+                        dflash_cycle_useful_rows,
+                        dflash_cycle_pad_rows,
                         ring_stats.cross_len,
                         ring_stats.ring_filled,
                         ring_stats.committed_len,

@@ -53,6 +53,9 @@ int main(int argc, char ** argv) {
     const std::string root = argv[1];
     const std::string context_h = read_file(root + "/src/llama-context.h");
     const std::string context_cpp = read_file(root + "/src/llama-context.cpp");
+    const std::string kv_cache_h = read_file(root + "/src/llama-kv-cache.h");
+    const std::string kv_cache_cpp = read_file(root + "/src/llama-kv-cache.cpp");
+    const std::string kv_cache_iswa_cpp = read_file(root + "/src/llama-kv-cache-iswa.cpp");
     const std::string dflash_profile_h = read_file(root + "/src/dflash-profile.h");
     const std::string cparams_h = read_file(root + "/src/llama-cparams.h");
     const std::string graph_cpp = read_file(root + "/src/llama-graph.cpp");
@@ -217,6 +220,10 @@ int main(int argc, char ** argv) {
         "upstream DFlash metadata keys must be read literally");
     ok &= expect(model_cpp.find("LLM_TENSOR_DFLASH_UPSTREAM_FC") != std::string::npos,
         "upstream DFlash must use upstream fusion tensor names");
+    ok &= expect(model_cpp.find("case LLM_ARCH_DFLASH:\n            {\n                res = nullptr;\n            } break;") != std::string::npos,
+        "upstream DFlash must remain stateless");
+    ok &= expect(model_cpp.find("case LLM_ARCH_DFLASH_DRAFT:\n            {\n                res = nullptr;") == std::string::npos,
+        "Bee DFlash draft must allocate KV memory so full-attention layers can track the accepted suffix");
     ok &= expect(model_cpp.find("arch == LLM_ARCH_DFLASH ? LLM_TENSOR_FFN_NORM : LLM_TENSOR_ATTN_POST_NORM") != std::string::npos,
         "upstream DFlash must use ffn_norm where Bee DFlash uses post_attention_norm");
     ok &= expect(dflash_draft.find("bool can_reuse(const llm_graph_params & params) override") != std::string::npos, "DFlash drafter graph input must opt into graph reuse");
@@ -226,7 +233,34 @@ int main(int argc, char ** argv) {
     ok &= expect(dflash_draft.find("Vcur_ctx_f16") == std::string::npos, "DFlash drafter must not cast V before ggml_concat; CUDA concat requires F32 sources");
     ok &= expect(dflash_draft.find("ggml_tensor * inp_out_ids = n_outputs < n_tokens ? build_inp_out_ids() : nullptr;") != std::string::npos, "DFlash drafter must avoid unused seed-token output rows");
     ok &= expect(dflash_draft.find("inpL = ggml_get_rows(ctx0, inpL, inp_out_ids);") != std::string::npos, "DFlash drafter must gather only requested output rows before lm_head");
-    ok &= expect(dflash_draft.find("const bool need_swa_mask = have_swa && hparams.n_swa > 0 && (int64_t) hparams.n_swa < n_kv_total;") != std::string::npos, "DFlash drafter must skip redundant SWA masks when the cross window is within n_swa");
+    ok &= expect(dflash_draft.find("const bool need_swa_mask = have_swa && hparams.n_swa > 0 && (int64_t) hparams.n_swa < n_kv_total;") != std::string::npos,
+        "DFlash drafter must skip redundant SWA masks when the cross window is within n_swa");
+    ok &= expect(dflash_draft.find("const int32_t ctx_pos_base = q_pos_base - (int32_t) n_real;") != std::string::npos &&
+                 dflash_draft.find("data[i] = (i < n_real) ? (ctx_pos_base + (int32_t) i) : 0;") != std::string::npos &&
+                 dflash_draft.find("data[q] = have_pos ? (int32_t) ubatch->pos[q]") != std::string::npos &&
+                 dflash_draft.find("const int32_t k_pos = ctx_pos_base + (int32_t) k;") != std::string::npos,
+        "single-slot DFlash draft must preserve absolute context/query positions when the cross window slides");
+    ok &= expect(dflash_draft.find("slot_ctx_pos_base[s] = q_pos_base - (int32_t) nc;") != std::string::npos &&
+                 dflash_draft.find("data[off + i] = (i < nc) ? (slot_ctx_pos_base[s] + (int32_t) i) : 0;") != std::string::npos &&
+                 dflash_draft.find("const int32_t k_pos = slot_ctx_pos_base[ks] + kl;") != std::string::npos,
+        "multi-slot DFlash draft must preserve absolute per-slot positions when the cross window slides");
+    ok &= expect(dflash_draft.find("q_pos - k_pos >= window") != std::string::npos &&
+                 dflash_draft.find("q_pos - k_pos < window") != std::string::npos,
+        "DFlash sliding masks must use absolute key/query positions when enforcing the SWA window");
+    ok &= expect(dflash_draft.find("dflash_build_base_attn_input") != std::string::npos &&
+                 dflash_draft.find("static_cast<const llama_kv_cache_iswa_context *>(mctx)->get_base()") != std::string::npos,
+        "DFlash full-attention layers must read accepted-prefix KV from the drafter base cache, not the cross window");
+    ok &= expect(dflash_draft.find("class llm_graph_input_attn_kv_backend final : public llm_graph_input_attn_kv") != std::string::npos &&
+                 dflash_draft.find("mctx->set_input_k_idxs_backend(self_k_idxs, ubatch);") != std::string::npos &&
+                 dflash_draft.find("mctx->set_input_v_idxs_backend(self_v_idxs, ubatch);") != std::string::npos &&
+                 dflash_draft.find("static_cast<const llama_kv_cache_iswa_context *>(params.mctx)->get_base()") != std::string::npos &&
+                 dflash_draft.find("const bool rebind_base_from_iswa = false;") != std::string::npos,
+        "DFlash base-KV draft graphs must upload KV indices directly into GPU input tensors and rebind reused ISWA graphs to the base cache context");
+    ok &= expect(dflash_draft.find("class llm_graph_input_attn_kv_commit_backend final : public llm_graph_input_attn_kv") != std::string::npos &&
+                 dflash_draft.find("kv(mctx ? mctx->get_kv() : nullptr)") != std::string::npos &&
+                 dflash_draft.find("sinfo(mctx ? mctx->current_sinfo() : llama_kv_cache::slot_info())") != std::string::npos &&
+                 dflash_draft.find("dflash_build_commit_attn_input") != std::string::npos,
+        "DFlash full-KV commit graphs must snapshot the resolved base-KV slot mapping instead of chasing a mutable batch-context vector at set_input time");
     ok &= expect(graph_h.find("LLM_GRAPH_TYPE_DFLASH_KV_UPDATE") != std::string::npos, "DFlash K/V cache update must have a distinct graph type");
     ok &= expect(graph_h.find("llama_dflash_kv_cache_view * dflash_kv_cache") != std::string::npos, "DFlash cross data must carry the drafter K/V cache view");
     ok &= expect(graph_h.find("std::vector<ggml_tensor *> k_ring") != std::string::npos, "DFlash K/V cache must use ring-only persistent storage");
@@ -253,23 +287,58 @@ int main(int argc, char ** argv) {
         context_cpp.find("model.n_devices() > 1", kv_cache_update_fn) < kv_cache_update_graph,
         "DFlash K/V cache update must not compute a split drafter graph on one CUDA backend");
     ok &= expect(speculative.find("llama_dflash_kv_cache_update_from_ring(ctx_dft, gpu_ring_handle") != std::string::npos, "DFlash accepted hiddens must update K/V cache from the GPU ring without mutating cross state");
+    ok &= expect(context_h.find("dflash_target_kv_cache_update_gpu") != std::string::npos &&
+                 llama_h.find("llama_dflash_target_kv_cache_update_from_ring") != std::string::npos &&
+                 context_cpp.find("dflash_target_kv_cache_update_gpu") != std::string::npos &&
+                 speculative.find("llama_dflash_target_kv_cache_update_from_ring(") != std::string::npos,
+        "DFlash accepted target hiddens must also refresh the drafter base KV cache for full-attention layers");
+    ok &= expect(context_cpp.find("base_kv->seq_rm(seq_id, start_pos, -1);") != std::string::npos,
+        "DFlash accepted-prefix full-KV commits must replace only the tail suffix instead of overwriting occupied base-KV cells in place");
+    ok &= expect(context_cpp.find("reuse_update_buf &&\n            dflash_kv_cache &&\n            dflash_kv_cache->fn_wait_backend_stream &&\n            dflash_kv_cache->fn_wait_backend_stream(gpu_backend)") != std::string::npos,
+        "DFlash accepted-prefix full-KV commits must stream-order reused GPU scratch before the next commit reuses update_buf");
+    ok &= expect(kv_cache_iswa_cpp.find("return std::max(kv_base->seq_pos_max(seq_id), kv_swa->seq_pos_max(seq_id));") != std::string::npos,
+        "ISWA seq_pos_max must follow the newest accepted suffix even when SWA layers source live context outside kv_swa");
+    ok &= expect(speculative.find("int drafter_prefix_window() const") != std::string::npos &&
+                 speculative.find("trim_drafter_prefix_window();") != std::string::npos &&
+                 speculative.find("llama_memory_seq_rm(mem_dft, seq_id, 0, trim_before);") != std::string::npos,
+        "DFlash drafter KV must slide forward with the accepted suffix instead of staying anchored at position 0");
+    ok &= expect(kv_cache_h.find("set_input_k_idxs_backend") != std::string::npos &&
+                 kv_cache_h.find("set_input_v_idxs_backend") != std::string::npos &&
+                 kv_cache_cpp.find("set_input_k_idxs_backend") != std::string::npos &&
+                 kv_cache_cpp.find("set_input_v_idxs_backend") != std::string::npos,
+        "DFlash manual GPU-only commit graphs must have backend-safe KV index upload helpers");
+    ok &= expect(kv_cache_h.find("llama_kv_cache * get_kv() const;") != std::string::npos &&
+                 kv_cache_h.find("const llama_kv_cache::slot_info & current_sinfo() const;") != std::string::npos &&
+                 kv_cache_cpp.find("llama_kv_cache_context::current_sinfo() const") != std::string::npos,
+        "DFlash commit graphs must expose the resolved KV slot mapping so graph inputs can snapshot it safely");
     ok &= expect(context_cpp.find("dflash_kv_update_gpu") != std::string::npos, "DFlash K/V update must use a temporary input source separate from the main cross state");
     ok &= expect(cuda_cpp.find("dflash_kv_update") != std::string::npos, "DFlash K/V update graph must be excluded from CUDA graph capture");
     ok &= expect(cuda_ring.find("dflash_kv_cache_write_d2d") != std::string::npos, "CUDA backend must provide D2D K/V cache ring writes");
-    ok &= expect(cuda_ring.find("dflash_kv_cache_append_d2d") != std::string::npos, "CUDA backend must provide chronological D2D K/V cache appends");
-    ok &= expect(context_cpp.find("fn_append_d2d") != std::string::npos, "DFlash K/V cache updates must append chronologically instead of exposing wrapped rings to the draft graph");
+    ok &= expect(cuda_ring.find("dflash_kv_cache_write_d2d_no_check") != std::string::npos, "CUDA backend must provide batched no-sync D2D K/V cache ring writes");
+    ok &= expect(context_cpp.find("const bool needs_shift = total > dflash_kv_cache->ring_size;") != std::string::npos &&
+                 context_cpp.find("shift_buf") != std::string::npos &&
+                 context_cpp.find("shift_ptr") != std::string::npos &&
+                 context_cpp.find("fn_copy(cache, dflash_kv_cache->shift_ptr, keep_bytes)") != std::string::npos,
+        "DFlash K/V cache overflow must move the live suffix through a scratch buffer instead of shifting the cache in place");
     ok &= expect(cuda_ring.find("dflash_kv_cache_interleave") != std::string::npos, "CUDA backend must stage ordered DFlash K/V cache windows");
     ok &= expect(cuda_cpp.find("dflash_kv_cache_interleave") != std::string::npos, "CUDA backend registry must expose DFlash K/V cache helpers");
-    ok &= expect(context_h.find("fn_append_d2d_no_check") != std::string::npos, "DFlash K/V cache must track hot-loop append helper");
-    ok &= expect(context_h.find("fn_sync_ptr") != std::string::npos, "DFlash K/V cache no-sync appends must have a batched stream-sync helper");
-    ok &= expect(context_cpp.find("fn_append_d2d_no_check") != std::string::npos, "DFlash K/V cache update must prefer no-sync hot-loop append helper");
-    ok &= expect(context_cpp.find("if (fast_append)") != std::string::npos &&
+    ok &= expect(context_h.find("fn_copy_d2d_no_check") != std::string::npos, "DFlash K/V cache must track hot-loop D2D copy helper for safe overflow compaction");
+    ok &= expect(context_h.find("fn_sync_ptr") != std::string::npos, "DFlash K/V cache no-sync writes must have a batched stream-sync helper");
+    ok &= expect(context_cpp.find("fn_copy_d2d_no_check") != std::string::npos, "DFlash K/V cache update must prefer no-sync hot-loop D2D copies");
+    ok &= expect(context_cpp.find("if (used_async_copy || (!needs_shift && fast_append))") != std::string::npos &&
                  context_cpp.find("dflash_kv_cache->fn_wait_dflash_stream(gpu_backend)") != std::string::npos &&
                  context_cpp.find("dflash_kv_cache->fn_sync_ptr(dflash_kv_cache->k_ring[0]->data)") != std::string::npos,
-        "DFlash K/V cache no-sync appends must synchronize or stream-order before the drafter graph reads cached K/V");
-    ok &= expect(cuda_ring.find("dflash_kv_cache_append_d2d_no_check") != std::string::npos, "CUDA backend must provide no-sync DFlash K/V cache appends");
-    ok &= expect(cuda_reg.find("\"dflash_kv_cache_append_d2d_no_check\"") != std::string::npos, "CUDA backend registry must publish no-sync DFlash K/V cache appends");
-    ok &= expect(speculative.find("common_batch_add(batch_dft, id_last, cross_len, { seq_id }, true);") != std::string::npos, "DFlash flat/tree drafts must preserve seed-token logits for row alignment");
+        "DFlash K/V cache no-sync writes must synchronize or stream-order before the drafter graph reads cached K/V");
+    ok &= expect(cuda_reg.find("\"dflash_kv_cache_write_d2d_no_check\"") != std::string::npos, "CUDA backend registry must publish no-sync DFlash K/V cache ring writes");
+    ok &= expect(speculative.find("const int draft_pos_base = committed_len;") != std::string::npos &&
+                 speculative.find("common_batch_add(batch_dft, id_last, draft_pos_base, { seq_id }, true);") != std::string::npos &&
+                 speculative.find("common_batch_add(batch, id_last_per_spec[rs.spec_idx], rs.draft_pos_base, { rs.seq_id }, true);") != std::string::npos,
+        "DFlash flat/tree/batched drafts must keep absolute target positions for seed-token row alignment");
+    ok &= expect(speculative.find("llama_memory_seq_rm(llama_get_memory(ctx_dft), seq_id, committed_len, -1);") != std::string::npos &&
+                 speculative.find("llama_memory_seq_rm(llama_get_memory(ctx_dft), rs.seq_id, rs.draft_pos_base, -1);") != std::string::npos,
+        "DFlash drafter must trim each slot back to its accepted prefix before the next block draft so stale proposal state cannot survive into the next cycle");
+    ok &= expect(arg_cpp.find("params.speculative.dflash_cross_ctx + params.speculative.draft.n_max") != std::string::npos,
+        "DFlash default -cd must scale with the active cross window instead of staying fixed at 256");
     ok &= expect(speculative.find("float * logits = llama_get_logits_ith(ctx_dft, i);") != std::string::npos, "DFlash flat draft fallback rows must preserve seed-token offset");
     ok &= expect(speculative.find("const int offset = r * batch_len;") != std::string::npos, "DFlash batched draft argmax row offsets must preserve seed-token output rows");
     ok &= expect(speculative.find("graph_reuse=%d") != std::string::npos, "DFlash draft profile must report drafter graph reuse");
