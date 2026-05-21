@@ -1060,8 +1060,11 @@ bool common_params_parse(int argc, char ** argv, common_params & params, llama_e
             const bool cd_passed  = arg_passed({"-cd", "--ctx-size-draft", "--spec-draft-ctx-size"});
 
             if (!cd_passed && params.speculative.draft.n_ctx == 0) {
-                LOG_INF("dflash: setting -cd to 256 (drafter doesn't need the full main ctx; pass -cd N to override)\n");
-                params.speculative.draft.n_ctx = 256;
+                const int32_t draft_ctx_min = std::max<int32_t>(
+                    256, params.speculative.dflash_cross_ctx + params.speculative.draft.n_max);
+                LOG_INF("dflash: setting -cd to %d so the drafter KV window can track the current accepted suffix; pass -cd N to override\n",
+                        draft_ctx_min);
+                params.speculative.draft.n_ctx = draft_ctx_min;
             }
             bool capped = false;
             if (!b_passed && params.n_batch > 256) {
