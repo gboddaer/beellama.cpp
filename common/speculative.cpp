@@ -2490,21 +2490,18 @@ struct common_speculative_impl_dflash : public common_speculative_impl {
     }
 
     void set_prefill_capture_enabled(bool enabled) override {
-        if (target_capture_enabled == enabled) {
-            return;
-        }
-
+        const bool changed = target_capture_enabled != enabled;
         target_capture_enabled = enabled;
 
         if (enabled) {
             llama_set_dflash_capture_active(ctx_tgt, true);
-            if (profile_enabled(DFLASH_PROFILE_PREFILL)) {
+            if (changed && profile_enabled(DFLASH_PROFILE_PREFILL)) {
                 LOG_INF("dflash prefill capture: enabled hidden capture gpu=%d layers=%d\n",
                         gpu_capture_available ? 1 : 0, (int) capture_layers.size());
             }
         } else {
             llama_set_dflash_capture_active(ctx_tgt, false);
-            if (profile_enabled(DFLASH_PROFILE_PREFILL)) {
+            if (changed && profile_enabled(DFLASH_PROFILE_PREFILL)) {
                 LOG_INF("dflash prefill capture: disabled hidden capture for non-suffix prompt chunk\n");
             }
         }

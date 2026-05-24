@@ -1009,6 +1009,18 @@ int main(int argc, char ** argv) {
     ok &= expect(speculative.find("dflash prefill capture: enabled hidden capture") != std::string::npos,
         "DFlash capture re-enable path must be profile-loggable");
 
+    {
+        const size_t fn = speculative.find("void set_prefill_capture_enabled(bool enabled) override");
+        const size_t early_return = fn == std::string::npos ? std::string::npos :
+            speculative.find("if (target_capture_enabled == enabled)", fn);
+        const size_t active_call = fn == std::string::npos ? std::string::npos :
+            speculative.find("llama_set_dflash_capture_active(ctx_tgt", fn);
+        ok &= expect(fn != std::string::npos &&
+                     active_call != std::string::npos &&
+                     (early_return == std::string::npos || early_return > active_call),
+            "DFlash prefill capture must re-apply shared target capture state even when the per-slot cache already matches");
+    }
+
     ok &= expect(server_context.find("dflash_capture_needed_for_view") != std::string::npos,
         "server must decide whether DFlash hidden capture is needed before llama_decode");
 
