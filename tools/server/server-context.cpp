@@ -4430,6 +4430,15 @@ private:
                         slot.n_prompt_tokens_cache = n_past;
                         slot.n_prompt_tokens_processed = 0;
 
+                        // A zero-prefix request cannot reuse the previous request's DFlash ring.
+                        // Clear it before early prompt checkpoints can snapshot stale full-ring state.
+                        if (n_past == 0 &&
+                                slot.prompt.n_tokens() > 0 &&
+                                slot.can_speculate() &&
+                                params_base.speculative.type() == COMMON_SPECULATIVE_TYPE_DFLASH) {
+                            common_speculative_discard_dflash_state(slot.get_spec(), nullptr);
+                        }
+
                         slot.prompt.tokens.keep_first(n_past);
 
                         // send initial 0% progress update if needed

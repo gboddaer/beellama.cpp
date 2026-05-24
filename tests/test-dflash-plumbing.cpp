@@ -72,6 +72,7 @@ int main(int argc, char ** argv) {
     const std::string download_cpp = read_file(root + "/common/download.cpp");
     const std::string arg_cpp = read_file(root + "/common/arg.cpp");
     const std::string common_h = read_file(root + "/common/common.h");
+    const std::string common_cpp = read_file(root + "/common/common.cpp");
     const std::string dflash_draft = read_file(root + "/src/models/dflash_draft.cpp");
     const std::string delta_net_base = read_file(root + "/src/models/delta-net-base.cpp");
     const std::string arch_cpp = read_file(root + "/src/llama-arch.cpp");
@@ -124,6 +125,23 @@ int main(int argc, char ** argv) {
     ok &= expect(dflash_profile_h.find("DFLASH_PROFILE_PREFILL") != std::string::npos &&
                  dflash_profile_h.find("DFLASH_PROFILE_TRACE") != std::string::npos,
         "DFlash profile categories must be centralized in dflash-profile.h");
+    ok &= expect(common_cpp.find("return data_tgt.size() + data_dft.size() + ring_data.size();") != std::string::npos,
+        "prompt checkpoints must account for DFlash ring state bytes when reporting/cache-sizing checkpoint size");
+    ok &= expect(common_cpp.find("ring_data.clear();") != std::string::npos,
+        "prompt checkpoints must clear DFlash ring state with target/draft context state");
+
+    {
+        const size_t zero_reuse_reset = server_context.find("n_past == 0");
+        const size_t stale_ring_reset = server_context.find("common_speculative_discard_dflash_state(slot.get_spec(), nullptr)");
+        const size_t keep_first       = server_context.find("slot.prompt.tokens.keep_first(n_past);");
+
+        ok &= expect(zero_reuse_reset != std::string::npos &&
+                     stale_ring_reset != std::string::npos &&
+                     keep_first       != std::string::npos &&
+                     zero_reuse_reset < stale_ring_reset &&
+                     stale_ring_reset < keep_first,
+            "server must discard stale DFlash ring state before processing a prompt with zero reusable prefix tokens");
+    }
 
     const size_t pretranspose = qwen35moe.find("\"qkv_mixed_pretranspose\"");
     const size_t transpose    = qwen35moe.find("qkv_mixed = ggml_transpose(ctx0, qkv_mixed)");
