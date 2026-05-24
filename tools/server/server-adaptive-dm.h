@@ -430,9 +430,8 @@ struct server_adaptive_dm_state {
     }
 
     bool profit_expects_baseline_sample() const {
-        return !profit_baseline_ready() ||
-            profit_baseline_probe_pending ||
-            adaptive_n_max <= 0;
+        return profit_baseline_probe_pending ||
+            adaptive_n_max == 0;
     }
 
     void profit_mark_baseline_probe() {
@@ -497,15 +496,9 @@ struct server_adaptive_dm_state {
             return 0;
         }
 
-        const bool baseline_ready = profit_baseline_ready();
-        if (!baseline_ready) {
-            profit_current_score = 0.0f;
-            profit_last_recommended_n = 0;
-            return 0;
-        }
-
         if (profit_warmup_cycles > 0 || !profit_has_ready_positive_depth()) {
-            profit_current_score = server_adaptive_dm_score(1.0f, profit_baseline.cycle_ms);
+            profit_current_score = profit_baseline_ready() ?
+                server_adaptive_dm_score(1.0f, profit_baseline.cycle_ms) : 0.0f;
             profit_last_recommended_n = base_n_max;
             return base_n_max;
         }
@@ -513,7 +506,7 @@ struct server_adaptive_dm_state {
         const int current_n = profit_baseline_probe_resume_n > 0
             ? std::clamp<int>(profit_baseline_probe_resume_n, 0, base_n_max)
             : (adaptive_n_max < 0
-                ? 0
+                ? base_n_max
                 : std::clamp<int>(adaptive_n_max, 0, base_n_max));
 
         int candidates[PROFIT_CANDIDATES];
@@ -537,7 +530,10 @@ struct server_adaptive_dm_state {
         float current_score = 0.0f;
         bool current_ready = false;
         float baseline_score = 0.0f;
-        baseline_score = server_adaptive_dm_score(1.0f, profit_baseline.cycle_ms);
+        const bool baseline_ready = profit_baseline_ready();
+        if (baseline_ready) {
+            baseline_score = server_adaptive_dm_score(1.0f, profit_baseline.cycle_ms);
+        }
 
         for (int i = 0; i < n_candidates; ++i) {
             const int n = candidates[i];

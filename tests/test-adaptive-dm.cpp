@@ -219,23 +219,22 @@ int main() {
     state.observe_profit_timing(2, 15.0f, 60.0f, 5.0f, 80.0f);
     {
         const int recommended = state.decide_profit_n_max(8);
-        assert(recommended == 0);
+        assert(recommended > 0);
         state.apply_profit_recommendation(recommended);
     }
     state.observe_profit_timing(0, 0.0f, 30.0f, 0.0f, 30.0f);
     assert(state.decide_profit_n_max(8) == 0);
 
-    // test warmup: seed no-spec baseline before positive-depth warmup/probing
+    // test warmup: fresh profit controllers start with positive-depth DFlash,
+    // and baseline samples are only expected while explicitly off/probing.
     state.reset_profit_state();
     state.dm_profit_min_samples = 2;
     state.dm_off_dwell = 1;
     state.profit_warmup_cycles = 3;
-    state.adaptive_n_max = 8;
-    assert(state.decide_profit_n_max(8) == 0);
-    state.observe_profit_timing(0, 0.0f, 30.0f, 0.0f, 30.0f);
-    assert(state.decide_profit_n_max(8) == 0);
-    state.observe_profit_timing(0, 0.0f, 28.0f, 0.0f, 28.0f);
     assert(state.decide_profit_n_max(8) == 8);
+    assert(!state.profit_expects_baseline_sample());
+    state.adaptive_n_max = 0;
+    assert(state.profit_expects_baseline_sample());
 
     // test reset_request_state preserves profit data but resets request counters
     state.reset_profit_state();
@@ -285,7 +284,7 @@ int main() {
     assert(state.profit_depth[2].samples == 0);
     assert(state.adaptive_n_max == -1);
 
-    // test a bucket transition cannot leave baseline collection invisible
+    // test a bucket transition resets profit stats without forcing cold-start baseline collection
     {
         server_adaptive_dm_state bucket;
         common_params_speculative bucket_spec;
@@ -307,7 +306,8 @@ int main() {
         bucket.reset_profit_if_config_changed(bucket_spec, 16, 9000);
         assert(bucket.adaptive_n_max == -1);
         assert(!bucket.profit_baseline_ready());
-        assert(bucket.profit_expects_baseline_sample());
+        assert(!bucket.profit_expects_baseline_sample());
+        assert(bucket.decide_profit_n_max(16) == 16);
     }
 
     // test cross-depth estimation

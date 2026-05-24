@@ -835,19 +835,6 @@ struct server_slot : server_adaptive_dm_state {
         int n_draft_max = (dm_adaptive && adaptive_n_max >= 0) ? adaptive_n_max : base_n_max;
 
         if (dm_adaptive && dm_controller == COMMON_SPECULATIVE_DM_CONTROLLER_PROFIT) {
-            if (adaptive_n_max < 0) {
-                if (advance_adaptive_probe) {
-                    adaptive_n_max = 0;
-                    const int32_t warmup = dm_profit_warmup > 0 ? dm_profit_warmup : dm_profit_min_samples;
-                    profit_warmup_cycles = warmup;
-                }
-                return 0;
-            }
-
-            if (!profit_baseline_ready()) {
-                return 0;
-            }
-
             if (profit_baseline_probe_pending) {
                 return 0;
             }
@@ -864,6 +851,13 @@ struct server_slot : server_adaptive_dm_state {
                 if (advance_adaptive_probe) {
                     profit_warmup_cycles--;
                 }
+            } else if (adaptive_n_max < 0) {
+                if (advance_adaptive_probe) {
+                    adaptive_n_max = base_n_max;
+                    const int32_t warmup = dm_profit_warmup > 0 ? dm_profit_warmup : dm_profit_min_samples;
+                    profit_warmup_cycles = warmup;
+                }
+                n_draft_max = base_n_max;
             } else if (adaptive_n_max == 0) {
                 const bool probe_now = adaptive_probe_counter + 1 >= dm_probe_interval;
                 if (!probe_now) {
@@ -874,9 +868,9 @@ struct server_slot : server_adaptive_dm_state {
                 }
                 if (advance_adaptive_probe) {
                     adaptive_probe_counter = 0;
-                    adaptive_n_max = probe_n_max;
+                    adaptive_n_max = base_n_max;
                 }
-                n_draft_max = probe_n_max;
+                n_draft_max = base_n_max;
             } else {
                 n_draft_max = adaptive_n_max;
                 if (advance_adaptive_probe) {
