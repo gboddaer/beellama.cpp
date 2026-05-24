@@ -1393,6 +1393,9 @@ int main(int argc, char ** argv) {
                  server_context.find("note_dflash_cycle") != std::string::npos &&
                  server_context.find("dflash_cycle_count > 0 && dflash_server_profile_enabled(DFLASH_PROFILE_SUMMARY)") != std::string::npos,
         "DFlash cycle logs must include profile-gated acceptance histograms by context bucket");
+    ok &= expect(count_occurrences(server_context, "SRV_INF(\"spec cycle") == 1 &&
+                 server_context.find("if (dflash_server_profile_enabled(DFLASH_PROFILE_VERIFY)) {\n                SRV_INF(\"  verify ubatch:") != std::string::npos,
+        "DFlash per-cycle and verify-ubatch timing logs must be opt-in profile logs");
     ok &= expect(speculative.find("target capture layers mix SWA and FULL") != std::string::npos &&
                  speculative.find("target/draft SWA window mismatch") != std::string::npos &&
                  speculative.find("common_dflash_capture_neighborhood_to_string") != std::string::npos &&
