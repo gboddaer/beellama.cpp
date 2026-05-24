@@ -142,6 +142,9 @@ int main(int argc, char ** argv) {
         "active DFlash slot must work without GPU tape and account for hidden-only/prefill-only contexts");
     ok &= expect(context_cpp.find("get_tensor_data(gpu_layer->qkv") != std::string::npos, "conv rebuild must read QKV from GPU tape through placement-safe tensor access");
     ok &= expect(graph_cpp.find("t_logits_argmax = nullptr;") != std::string::npos, "graph reset must clear reduced logits output pointer");
+    ok &= expect(graph_cpp.find("params.cparams.embeddings_pre_norm && t_h_pre_norm != nullptr") != std::string::npos ||
+                 graph_cpp.find("t_h_pre_norm != nullptr && params.cparams.embeddings_pre_norm") != std::string::npos,
+        "pre-norm hidden graph output must be gated by embeddings_pre_norm so DFlash capture does not force an unused graph output");
     ok &= expect(context_cpp.find("logits_argmax_buf.clear();") != std::string::npos, "decode must clear stale reduced logits ids");
     ok &= expect(context_cpp.find("logits_argmax_prob_buf.clear();") != std::string::npos, "decode must clear stale reduced logits probabilities");
     ok &= expect(graph_h.find("cparams.cb_eval              == other.cparams.cb_eval") == std::string::npos,

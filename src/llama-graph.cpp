@@ -890,7 +890,9 @@ void llm_graph_result::set_outputs() {
     if (t_embd_pooled != nullptr) {
         ggml_set_output(t_embd_pooled);
     }
-    if (t_h_pre_norm != nullptr) {
+    // DFlash captures hiddens through graph copies / eval callback; only expose
+    // pre-norm hiddens as graph outputs when a caller allocated that output.
+    if (params.cparams.embeddings_pre_norm && t_h_pre_norm != nullptr) {
         ggml_set_output(t_h_pre_norm);
     }
     for (auto & [seq_id, t] : t_sampled) {
