@@ -244,8 +244,8 @@ jobs:
             manifest:org.opencontainers.image.created=${{ steps.build_date.outputs.date }}
             manifest:org.opencontainers.image.version=${{ needs.create_tag.outputs.source_tag }}
             manifest:org.opencontainers.image.revision=${{ steps.checkout.outputs.commit }}
-            manifest:org.opencontainers.image.title=llama.cpp
-            manifest:org.opencontainers.image.description=LLM inference in C/C++
+            manifest:org.opencontainers.image.title=BeeLlama.cpp
+            manifest:org.opencontainers.image.description=BeeLlama.cpp GGUF inference with DFlash and TurboQuant
             manifest:org.opencontainers.image.url=${{ github.server_url }}/${{ github.repository }}
             manifest:org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
           # using github experimental cache
@@ -281,8 +281,8 @@ jobs:
             manifest:org.opencontainers.image.created=${{ steps.build_date.outputs.date }}
             manifest:org.opencontainers.image.version=${{ needs.create_tag.outputs.source_tag }}
             manifest:org.opencontainers.image.revision=${{ steps.checkout.outputs.commit }}
-            manifest:org.opencontainers.image.title=llama.cpp
-            manifest:org.opencontainers.image.description=LLM inference in C/C++
+            manifest:org.opencontainers.image.title=BeeLlama.cpp
+            manifest:org.opencontainers.image.description=BeeLlama.cpp GGUF inference with DFlash and TurboQuant
             manifest:org.opencontainers.image.url=${{ github.server_url }}/${{ github.repository }}
             manifest:org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
           # using github experimental cache
@@ -318,8 +318,8 @@ jobs:
             manifest:org.opencontainers.image.created=${{ steps.build_date.outputs.date }}
             manifest:org.opencontainers.image.version=${{ needs.create_tag.outputs.source_tag }}
             manifest:org.opencontainers.image.revision=${{ steps.checkout.outputs.commit }}
-            manifest:org.opencontainers.image.title=llama.cpp
-            manifest:org.opencontainers.image.description=LLM inference in C/C++
+            manifest:org.opencontainers.image.title=BeeLlama.cpp
+            manifest:org.opencontainers.image.description=BeeLlama.cpp GGUF inference with DFlash and TurboQuant
             manifest:org.opencontainers.image.url=${{ github.server_url }}/${{ github.repository }}
             manifest:org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
           # using github experimental cache
@@ -479,8 +479,8 @@ jobs:
                   --annotation "index:org.opencontainers.image.created=${BUILD_DATE}"
                   --annotation "index:org.opencontainers.image.version=${SRC_TAG}"
                   --annotation "index:org.opencontainers.image.revision=${COMMIT_SHA}"
-                  --annotation "index:org.opencontainers.image.title=llama.cpp"
-                  --annotation "index:org.opencontainers.image.description=LLM inference in C/C++"
+                  --annotation "index:org.opencontainers.image.title=BeeLlama.cpp"
+                  --annotation "index:org.opencontainers.image.description=BeeLlama.cpp GGUF inference with DFlash and TurboQuant"
                   --annotation "index:org.opencontainers.image.url=${{ github.server_url }}/${{ github.repository }}"
                   --annotation "index:org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}"
               )
