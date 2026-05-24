@@ -1417,11 +1417,6 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
         return BEST_FATTN_KERNEL_NONE;
     }
 
-    // D=512: MMA/TILE templates don't support this head_dim, use VEC unconditionally
-    if (Q->ne[0] == 512) {
-        return BEST_FATTN_KERNEL_VEC;
-    }
-
     // 192 satisfies % 64 == 0 but has no vec instance (DKQ != DV); force it onto the MMA path.
     const bool can_use_vector_kernel = Q->ne[0] <= 256 && Q->ne[0] % 64 == 0 && Q->ne[0] != 192 && K->ne[1] % FATTN_KQ_STRIDE == 0;
 
