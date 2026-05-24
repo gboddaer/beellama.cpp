@@ -10823,8 +10823,12 @@ static void ggml_vk_gated_delta_net(ggml_backend_vk_context * ctx, vk_context& s
     const uint32_t n_tokens = (uint32_t)src_v->ne[2];
     const uint32_t n_seqs   = (uint32_t)src_v->ne[3];
 
-    // state is 3D (S_v*S_v*H, K, n_seqs); K is the snapshot slot count.
-    const uint32_t K = (uint32_t)src_state->ne[1];
+    const bool state_is_4d = src_state->ne[0] == S_v &&
+                             src_state->ne[1] == S_v &&
+                             src_state->ne[2] == H &&
+                             src_state->ne[3] == n_seqs;
+    // state is 3D (S_v*S_v*H, K, n_seqs); 4D state is the old K=1 cache layout.
+    const uint32_t K = state_is_4d ? 1u : (uint32_t)src_state->ne[1];
 
     const uint32_t s_off = S_v * H * n_tokens * n_seqs;
 

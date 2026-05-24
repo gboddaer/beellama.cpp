@@ -2576,6 +2576,7 @@ extern "C" {
     //   K == 1: output carries the final state only.
     //   K  > 1: output carries K snapshot slots; the kernel writes the last min(n_tokens, K)
     //   per-token snapshots into the trailing slots
+    // The K == 1 path also accepts the old 4D recurrent-state layout (S_v, S_v, H, n_seqs).
     GGML_API struct ggml_tensor * ggml_gated_delta_net(
             struct ggml_context * ctx,
             struct ggml_tensor  * q,

@@ -73,6 +73,7 @@ int main(int argc, char ** argv) {
     const std::string arg_cpp = read_file(root + "/common/arg.cpp");
     const std::string common_h = read_file(root + "/common/common.h");
     const std::string dflash_draft = read_file(root + "/src/models/dflash_draft.cpp");
+    const std::string delta_net_base = read_file(root + "/src/models/delta-net-base.cpp");
     const std::string arch_cpp = read_file(root + "/src/llama-arch.cpp");
     const std::string memory_h = read_file(root + "/src/llama-memory.h");
     const std::string memory_hybrid_h = read_file(root + "/src/llama-memory-hybrid.h");
@@ -376,6 +377,9 @@ int main(int argc, char ** argv) {
                  qwen35moe.find("Kcur = ggml_reshape_3d(ctx0, Kcur, n_embd_head, n_head_kv_il, n_tokens);") != std::string::npos &&
                  qwen35moe.find("Vcur = ggml_reshape_3d(ctx0, Vcur, n_embd_head, n_head_kv_il, n_tokens);") != std::string::npos,
         "Qwen3.5-MoE full-attention layers must use per-layer n_head_kv for RYS-compatible KV shapes");
+    ok &= expect(delta_net_base.find("ggml_tensor * result = ggml_gated_delta_net(ctx0, q, k, v, g, b, s);") != std::string::npos &&
+                 delta_net_base.find("ggml_reshape_3d(ctx0, s, S_v * S_v * H_v, 1, n_seqs)") == std::string::npos,
+        "DeltaNet fused K=1 path must pass the existing 4D recurrent state directly instead of adding a per-layer reshape");
     ok &= expect(dflash_profile_h.find("GGML_DFLASH_PROFILE") != std::string::npos, "DFlash profile helper must honor profiling flag");
     ok &= expect(speculative.find("gpu_sync=%.3f ms") != std::string::npos, "DFlash ring profiling must report GPU sync time");
     ok &= expect(speculative.find("kv_cache_update requested=%d update=%d") != std::string::npos, "DFlash accept profiling must report drafter K/V cache update time");

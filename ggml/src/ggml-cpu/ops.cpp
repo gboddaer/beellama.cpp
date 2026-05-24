@@ -10608,11 +10608,14 @@ static void ggml_compute_forward_gated_delta_net_one_chunk(
 
     const bool kda = (neg0 == S_v);
 
-    // state is 3D (S_v*S_v*H, K, n_seqs); K is the snapshot slot count.
-    const int64_t K = src_state->ne[1];
+    const bool state_is_4d =
+        src_state->ne[0] == S_v && src_state->ne[1] == S_v && src_state->ne[2] == H && src_state->ne[3] == n_seqs;
+
+    // 3D state is (S_v*S_v*H, K, n_seqs); 4D state is the old K=1 cache layout.
+    const int64_t K = state_is_4d ? 1 : src_state->ne[1];
     GGML_ASSERT(K >= 1);
     // per-seq stride in floats (slot 0 of seq s lives at state + s * seq_stride)
-    const int64_t state_seq_stride = src_state->nb[2] / sizeof(float);
+    const int64_t state_seq_stride = (state_is_4d ? src_state->nb[3] : src_state->nb[2]) / sizeof(float);
 
     const int64_t per_thread = S_v + (K > 1 ? S_v * S_v : 0);
     const int ith = params->ith;

@@ -6308,11 +6308,14 @@ struct ggml_tensor * ggml_gated_delta_net(
     GGML_ASSERT(g->ne[0] == 1 || g->ne[0] == S_v);
     GGML_ASSERT(beta->ne[0] == 1);
 
-    // state is a 3D tensor (S_v*S_v*H, K, n_seqs). K is the snapshot slot count.
-    GGML_ASSERT(state->ne[0] == S_v * S_v * H);
-    GGML_ASSERT(state->ne[2] == n_seqs);
-    GGML_ASSERT(state->ne[3] == 1);
-    const int64_t K = state->ne[1];
+    const bool state_is_3d = state->ne[0] == S_v * S_v * H && state->ne[2] == n_seqs && state->ne[3] == 1;
+    const bool state_is_4d = state->ne[0] == S_v && state->ne[1] == S_v && state->ne[2] == H && state->ne[3] == n_seqs;
+    GGML_ASSERT(state_is_3d || state_is_4d);
+
+    // 3D state: (S_v*S_v*H, K, n_seqs), where K is the snapshot slot count.
+    // 4D state: old K=1 recurrent cache layout (S_v, S_v, H, n_seqs).
+    const int64_t K = state_is_4d ? 1 : state->ne[1];
+    GGML_ASSERT(K >= 1);
     const int64_t state_rows = K * S_v * n_seqs;
     const int64_t ne[4] = { S_v * H, n_tokens * n_seqs + state_rows, 1, 1 };
     struct ggml_tensor * result = ggml_new_tensor(ctx, GGML_TYPE_F32, 4, ne);

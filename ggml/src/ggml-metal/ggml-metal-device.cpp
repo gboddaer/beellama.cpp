@@ -590,8 +590,12 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_gated_delta_net(
     const int ne20 = op->src[2]->ne[0]; // S_v
     const int ne21 = op->src[2]->ne[1]; // H
     const int ne30 = op->src[3]->ne[0]; // G
-    // state is src[5], 3D (S_v*S_v*H, K, n_seqs); K is the snapshot slot count.
-    const int K = op->src[5]->ne[1];
+    const bool state_is_4d = op->src[5]->ne[0] == ne20 &&
+                             op->src[5]->ne[1] == ne20 &&
+                             op->src[5]->ne[2] == ne21 &&
+                             op->src[5]->ne[3] == op->src[2]->ne[3];
+    // state is 3D (S_v*S_v*H, K, n_seqs); 4D state is the old K=1 cache layout.
+    const int K = state_is_4d ? 1 : op->src[5]->ne[1];
 
     const int nsg = op->src[2]->ne[0]/32;
 
