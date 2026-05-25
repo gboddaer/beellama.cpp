@@ -74,6 +74,24 @@ static bool server_model_is_dflash_drafter(const llama_model * model) {
         llama_model_dflash_n_target_features(model) > 0;
 }
 
+static bool server_backend_dev_is_gpu(ggml_backend_dev_t dev) {
+    return dev && ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_GPU;
+}
+
+static bool server_model_uses_device(const llama_model * model, ggml_backend_dev_t dev) {
+    if (!model || !dev) {
+        return false;
+    }
+
+    const int32_t n_devices = llama_model_n_devices(model);
+    for (int32_t i = 0; i < n_devices; ++i) {
+        if (llama_model_get_device(model, i) == dev) {
+            return true;
+        }
+    }
+    return false;
+}
+
 static bool server_tail_pos_is_in_code_fence(
         const std::string & text,
         size_t              pos) {
@@ -2040,9 +2058,20 @@ private:
             params_dft.cache_type_k = params_spec.cache_type_k;
             params_dft.cache_type_v = params_spec.cache_type_v;
 
-            if (params_base.speculative.type() == COMMON_SPECULATIVE_TYPE_DFLASH && !draft_devices_explicit) {
+            const bool draft_type_is_dflash = params_base.speculative.type() == COMMON_SPECULATIVE_TYPE_DFLASH;
+            ggml_backend_dev_t target_output_dev = llama_model_dev_output(model_tgt);
+            const bool target_output_is_gpu = server_backend_dev_is_gpu(target_output_dev);
+
+            if (draft_type_is_dflash && !draft_devices_explicit) {
                 params_dft.split_mode = LLAMA_SPLIT_MODE_NONE;
-                SRV_INF("%s", "DFlash draft model will use a single device by default; pass --spec-draft-device to override\n");
+                if (target_output_is_gpu) {
+                    params_dft.devices = { target_output_dev, nullptr };
+                    params_dft.main_gpu = 0;
+                    SRV_INF("DFlash draft model will use target output device %s by default; pass --spec-draft-device to override\n",
+                            ggml_backend_dev_name(target_output_dev));
+                } else {
+                    SRV_INF("%s", "DFlash draft model will use a single device by default; pass --spec-draft-device to override\n");
+                }
             }
 
             if (params_spec.cpuparams.n_threads > 0) {
@@ -2062,10 +2091,24 @@ private:
 
             // Auto-detect DFlash from complete drafter metadata.
             bool draft_is_dflash = server_model_is_dflash_drafter(model_dft.get());
-            if (draft_is_dflash && !draft_devices_explicit && llama_model_n_devices(model_dft.get()) > 1) {
+            if (draft_is_dflash && draft_devices_explicit && target_output_is_gpu &&
+                    !server_model_uses_device(model_dft.get(), target_output_dev)) {
+                SRV_ERR("DFlash draft model uses shared target output tensor on device %s, but --spec-draft-device did not include that device; omit --spec-draft-device for automatic placement or include %s\n",
+                        ggml_backend_dev_name(target_output_dev), ggml_backend_dev_name(target_output_dev));
+                return false;
+            }
+            const bool dflash_auto_device_mismatch =
+                    draft_is_dflash && !draft_devices_explicit && target_output_is_gpu &&
+                    !server_model_uses_device(model_dft.get(), target_output_dev);
+            if (draft_is_dflash && !draft_devices_explicit &&
+                    (llama_model_n_devices(model_dft.get()) > 1 || dflash_auto_device_mismatch)) {
                 SRV_INF("%s", "reloading auto-detected DFlash draft model on a single device; pass --spec-draft-device to override\n");
                 model_dft.reset();
                 params_dft.split_mode = LLAMA_SPLIT_MODE_NONE;
+                if (target_output_is_gpu) {
+                    params_dft.devices = { target_output_dev, nullptr };
+                    params_dft.main_gpu = 0;
+                }
                 mparams_dft = common_model_params_to_llama(params_dft);
                 model_dft.reset(llama_model_load_from_file(params_dft.model.path.c_str(), mparams_dft));
                 if (model_dft == nullptr) {

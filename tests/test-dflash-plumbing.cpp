@@ -62,6 +62,7 @@ int main(int argc, char ** argv) {
     const std::string graph_cpp = read_file(root + "/src/llama-graph.cpp");
     const std::string ggml_backend_cpp = read_file(root + "/ggml/src/ggml-backend.cpp");
     const std::string llama_h = read_file(root + "/include/llama.h");
+    const std::string llama_ext_h = read_file(root + "/src/llama-ext.h");
     const std::string sampling_h = read_file(root + "/common/sampling.h");
     const std::string sampling_cpp = read_file(root + "/common/sampling.cpp");
     const std::string server_context = read_file(root + "/tools/server/server-context.cpp");
@@ -1742,6 +1743,15 @@ int main(int argc, char ** argv) {
                  server_context.find("SRV_INF(\"%s\", \"DFlash draft model will use a single device by default") != std::string::npos &&
                  server_context.find("SRV_INF(\"%s\", \"reloading auto-detected DFlash draft model on a single device") != std::string::npos,
         "DFlash draft model loading must default to one device unless --spec-draft-device is explicit");
+    ok &= expect(llama_ext_h.find("llama_model_dev_output") != std::string::npos &&
+                 model_cpp.find("llama_model_dev_output") != std::string::npos &&
+                 server_context.find("ggml_backend_dev_t target_output_dev = llama_model_dev_output(model_tgt);") != std::string::npos &&
+                 server_context.find("params_dft.devices = { target_output_dev, nullptr };") != std::string::npos &&
+                 server_context.find("params_dft.main_gpu = 0;") != std::string::npos &&
+                 server_context.find("const bool dflash_auto_device_mismatch") != std::string::npos &&
+                 server_context.find("llama_model_n_devices(model_dft.get()) > 1 || dflash_auto_device_mismatch") != std::string::npos &&
+                 server_context.find("DFlash draft model uses shared target output tensor on device") != std::string::npos,
+        "DFlash draft auto-placement must include the target output device used by shared tensors");
     ok &= expect(model_cpp.find("!llm_arch_is_dflash_drafter(model->arch)") != std::string::npos,
         "public DFlash hparam accessors must return zero for non-DFlash model architectures");
     ok &= expect(server_context.find("failed to initialize slot speculative decoding context") != std::string::npos,

@@ -2613,6 +2613,10 @@ ggml_backend_dev_t llama_model_get_device(const struct llama_model * model, int 
     return model->devices[i].dev;
 }
 
+ggml_backend_dev_t llama_model_dev_output(const struct llama_model * model) {
+    return model ? model->dev_output() : nullptr;
+}
+
 //
 // llama_model_base
 //

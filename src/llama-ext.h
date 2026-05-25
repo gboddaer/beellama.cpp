@@ -91,6 +91,7 @@ LLAMA_API float llama_model_rope_freq_base_train_swa(const struct llama_model * 
 LLAMA_API float llama_model_rope_freq_scale_train_swa(const struct llama_model * model);
 
 LLAMA_API ggml_backend_dev_t llama_model_get_device(const struct llama_model * model, int i);
+LLAMA_API ggml_backend_dev_t llama_model_dev_output(const struct llama_model * model);
 
 LLAMA_API llama_memory_breakdown llama_get_memory_breakdown(const struct llama_context * ctx);
 
