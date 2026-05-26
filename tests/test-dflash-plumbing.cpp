@@ -48,6 +48,18 @@ static int count_occurrences(const std::string & text, const std::string & needl
     return count;
 }
 
+static std::string slice_between(const std::string & text, const std::string & begin, const std::string & end) {
+    const size_t b = text.find(begin);
+    if (b == std::string::npos) {
+        return "";
+    }
+    const size_t e = text.find(end, b + begin.size());
+    if (e == std::string::npos) {
+        return text.substr(b);
+    }
+    return text.substr(b, e - b);
+}
+
 int main(int argc, char ** argv) {
     bool ok = true;
 
@@ -1091,8 +1103,42 @@ int main(int argc, char ** argv) {
     ok &= expect(speculative.find("if (common_dflash_debug_logs_enabled())") != std::string::npos &&
                  speculative.find("DFLASH_DBG append_target_hiddens") != std::string::npos,
         "DFlash append-target diagnostics must stay behind the debug logging gate");
+    const std::string mtp_impl = slice_between(
+        speculative,
+        "struct common_speculative_impl_draft_mtp : public common_speculative_impl",
+        "struct common_speculative_impl_ngram_simple : public common_speculative_impl");
+    ok &= expect(!mtp_impl.empty(), "MTP speculative implementation must be present");
+    ok &= expect(mtp_impl.find("void align_to_past(llama_seq_id seq_id, llama_pos n_past") != std::string::npos &&
+                 mtp_impl.find("std::memcpy(pending_h[seq_id].data(), verify_h[seq_id].data()") != std::string::npos,
+        "MTP rollback must align both draft memory and pending hidden state to the requested n_past");
+    ok &= expect(mtp_impl.find("truncate ctx_dft to the start of this batch") == std::string::npos &&
+                 mtp_impl.find("Truncate stale draft positions") == std::string::npos,
+        "MTP must not reintroduce blind draft-context truncation without hidden-state alignment");
+    ok &= expect(speculative.find("void common_speculative_accept(common_speculative * spec, uint16_t n_accepted)") != std::string::npos &&
+                 speculative.find("if (n_accepted == 0 || spec == nullptr)") == std::string::npos,
+        "single-slot speculative accept must propagate accept(0), which MTP uses to advance pending target hidden state after rejection");
     ok &= expect(server_context.find("shrunk recurrent state to %d cells before draft load") != std::string::npos, "server must shrink recurrent backup cells before draft model load");
     ok &= expect(server_context.find("expanded recurrent state to %d cells before speculative GPU buffers") != std::string::npos, "server must expand recurrent backup cells before DFlash slot/GPU buffer init");
+    ok &= expect(server_context.find("const bool needs_backup_sequences") != std::string::npos &&
+                 server_context.find("ctx_tgt_seq_rm_type != COMMON_CONTEXT_SEQ_RM_TYPE_RS || use_mtp_spec") != std::string::npos,
+        "server must use explicit Bee backup rollback for MTP target verification instead of bounded recurrent snapshots");
+    ok &= expect(common_h.find("has_type(COMMON_SPECULATIVE_TYPE_DRAFT_MTP) && type() != COMMON_SPECULATIVE_TYPE_DFLASH") != std::string::npos &&
+                 common_h.find("return 0u;") != std::string::npos,
+        "pure upstream MTP must disable bounded recurrent snapshot rows and use Bee explicit backup rollback");
+    ok &= expect(server_context.find("const bool slot_uses_fork_spec") != std::string::npos &&
+                 server_context.find("server_speculative_uses_fork_slot_impls(params_base.speculative)") != std::string::npos,
+        "server must keep fork-only per-slot speculative state separate from upstream MTP shared speculative state");
+    ok &= expect(server_context.find("ctx_dft_seq_rm_type = llama_n_rs_seq(ctx_dft.get()) > 0 ?") != std::string::npos &&
+                 server_context.find("COMMON_CONTEXT_SEQ_RM_TYPE_RS : COMMON_CONTEXT_SEQ_RM_TYPE_PART") != std::string::npos,
+        "MTP draft context must keep bounded recurrent rollback when available instead of faking plain partial seq_rm");
+    ok &= expect(server_context.find("common_context_seq_rm(ctx_dft.get(), slot.id, slot.n_pos_before_draft, -1)") != std::string::npos,
+        "server must roll MTP draft context back at the boundary before target verification");
+    ok &= expect(server_context.find("const llama_pos draft_n_past = use_mtp_spec ? slot.n_pos_before_draft : -1") != std::string::npos &&
+                 server_context.find("common_speculative_get_draft_params(slot.get_spec(), slot.id)") != std::string::npos &&
+                 server_context.find("/* .n_past   = */ draft_n_past") != std::string::npos,
+        "server must seed upstream MTP drafting through the shared upstream dparams path using the actual slot position");
+    ok &= expect(server_context.find("common_speculative_accept(slot.get_spec(), slot.id, n_accepted_draft)") != std::string::npos,
+        "server must accept upstream MTP drafts through the per-sequence shared speculative accept path");
     ok &= expect(llama_h.find("llama_context_recurrent_expand") != std::string::npos, "public API must expose context-level recurrent expansion with graph invalidation");
     ok &= expect(server_context.find("llama_context_recurrent_shrink(ctx_tgt, n_parallel_user)") != std::string::npos, "server recurrent shrink must invalidate the context scheduler graph cache");
     ok &= expect(server_context.find("llama_context_recurrent_expand(ctx_tgt, n_seq_max_full)") != std::string::npos, "server recurrent expansion must invalidate the context scheduler graph cache");

@@ -13,6 +13,7 @@
 - Kept upstream-compatible draft aliases such as `--model-draft`, `--draft-p-split`, and `--draft-p-min`; canonical Bee DFlash controls now use `--spec-*` names.
 - Made DFlash-only args warning/no-op for MTP and other non-DFlash modes, while preserving them long enough for server-side DFlash draft-model auto-detection when a draft model is supplied without an explicit `--spec-type`.
 - Gated adaptive Draft-Max to actual DFlash slots so MTP and other non-DFlash modes do not inherit DFlash adaptive depth behavior.
+- Separated pure upstream MTP from Bee fork speculators after the rebase: MTP now uses upstream shared speculative state and explicit backup rollback, while DFlash/CopySpec/suffix/recycle keep Bee per-slot state and DFlash-specific recurrent handling.
 - Restored `--spec-draft-temp` for sampled DFlash, including greedy `0`, positive sampled/Gumbel drafter temperature, and `auto` mirroring of target temperature.
 - Preserved CopySpec, suffix-tree speculation, recycle speculation, and upstream ngram speculative modes as explicit opt-in backends.
 - Preserved branch-only DDTree verification through `--spec-branch-budget`, restored Qwen DDTree conv and GDN paths, and removed the old public-buun total-node `--tree-budget` CLI spelling.
@@ -32,7 +33,7 @@
 - Preserved Gemma3 full image chunks, Gemma multimodal precision/profiling hooks where still relevant, and flat-DFlash multimodal compatibility while keeping tree and non-DFlash speculation disabled under multimodal where unsupported.
 - Suppressed leading reasoning/thinking syntax in streamed title generation so session titles do not surface stray tags such as closing thinking markers.
 - Preserved the reasoning loop guard, malformed tool-call filtering, request-level speculative overrides, and DFlash/mmproj server guardrails on the newer upstream server.
-- Adopted upstream MTP/cache and server fixes after the v0.3.0 rebase: MTP draft contexts now use draft KV cache types instead of inheriting target `--cache-type-k/v`, draft/MTP fit memory is reserved before target fitting, and prompt checkpoints are placed around the latest user turn with `--checkpoint-min-step`.
+- Adopted upstream MTP/cache and server fixes after the v0.3.0 rebase: MTP draft contexts now use draft KV cache types instead of inheriting target `--cache-type-k/v`, draft/MTP fit memory is reserved before target fitting, MTP draft hidden state is aligned to the verified `n_past` boundary, and prompt checkpoints are placed around the latest user turn with `--checkpoint-min-step`.
 - Brought in upstream server/runtime improvements after v0.2.0, including draft/MTP resource cleanup on sleep, prompt token counts in `/slots`, router and model metadata fixes, API compatibility updates, and newer built-in server tooling.
 - Brought in upstream post-rebase runtime/backend updates including NVFP4 MTP scale tensors, GGUF callback/buffer initialization APIs, CUDA FWHT handling for Hadamard-hinted matmuls, parallel quant LUT initialization, Metal device IDs, cpp-httplib 0.45.1, and UI continue/agentic-loop fixes.
 - Brought in upstream conversion, UI/app, Docker, CI, backend, model, tokenizer, and documentation updates from the newer llama.cpp base while keeping BeeLlama-specific docs and workflow metadata.

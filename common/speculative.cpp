@@ -652,6 +652,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
     // Row 0 corresponds to the sampled token, row N to the Nth accepted draft token.
     std::vector<std::vector<float>> verify_h;
     std::vector<int32_t> verify_h_rows;
+    std::vector<llama_pos> verify_h_pos_beg;
 
     // Per-seq draft length from the last draft() call, used in accept() to
     // roll back ctx_dft's recurrent state past the AR draft's redundant
@@ -719,6 +720,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
 
         verify_h.assign(n_seq, {});
         verify_h_rows.assign(n_seq, 0);
+        verify_h_pos_beg.assign(n_seq, -1);
 
         last_n_drafted.assign(n_seq, 0);
     }
@@ -757,6 +759,32 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                     "Drafts may degrade.\n",
                     __func__, (int) pos_max, N - 1);
         }
+        align_to_past(seq_id, N, "begin");
+    }
+
+    void align_to_past(llama_seq_id seq_id, llama_pos n_past, const char * reason) {
+        if (seq_id < 0 || seq_id >= (llama_seq_id) n_seq || n_past <= 0) {
+            return;
+        }
+
+        auto * ctx_dft = this->params.ctx_dft;
+        auto * mem_dft = llama_get_memory(ctx_dft);
+        const llama_pos pos_max = llama_memory_seq_pos_max(mem_dft, seq_id);
+        if (pos_max >= n_past) {
+            llama_memory_seq_rm(mem_dft, seq_id, n_past, -1);
+        }
+
+        const int32_t n_rows = verify_h_rows[seq_id];
+        const llama_pos pos_beg = verify_h_pos_beg[seq_id];
+        const llama_pos wanted = n_past - 1;
+        const llama_pos idx = wanted - pos_beg;
+        if (pos_beg >= 0 && idx >= 0 && idx < n_rows) {
+            const size_t row_bytes = (size_t) n_embd * sizeof(float);
+            std::memcpy(pending_h[seq_id].data(), verify_h[seq_id].data() + (size_t) idx * n_embd, row_bytes);
+        } else if (pos_max >= n_past) {
+            LOG_WRN("%s: could not align pending_h during %s for seq_id=%d n_past=%d (last verify pos=%d rows=%d)\n",
+                    __func__, reason, (int) seq_id, (int) n_past, (int) pos_beg, n_rows);
+        }
     }
 
     bool process(const llama_batch & batch_in) override {
@@ -790,14 +818,6 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
 
         auto * ctx_tgt = this->params.ctx_tgt;
         auto * ctx_dft = this->params.ctx_dft;
-
-        // truncate ctx_dft to the start of this batch — draft() may have advanced
-        // ctx_dft past these positions, and M-RoPE requires monotonic positions
-        for (llama_seq_id s = 0; s < (llama_seq_id) n_seq; ++s) {
-            if (i_batch_beg[s] >= 0) {
-                llama_memory_seq_rm(llama_get_memory(ctx_dft), s, batch_in.pos[i_batch_beg[s]], -1);
-            }
-        }
 
         const size_t row_bytes = (size_t) n_embd * sizeof(float);
 
@@ -856,6 +876,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
 
             const int32_t n_rows = i_batch_end[seq_id] - i_batch_beg[seq_id] + 1;
             verify_h_rows[seq_id] = n_rows;
+            verify_h_pos_beg[seq_id] = batch_in.pos[i_batch_beg[seq_id]];
             verify_h[seq_id].resize((size_t) n_rows * n_embd);
 
             for (int32_t i = 0; i < n_rows; ++i) {
@@ -894,10 +915,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                 continue;
             }
 
-            // Truncate stale draft positions: process() only cleans sequences
-            // present in the verify batch, so a previous draft() may have
-            // advanced this sequence past dp.n_past.
-            llama_memory_seq_rm(llama_get_memory(ctx_dft), seq_id, dp.n_past, -1);
+            align_to_past(seq_id, dp.n_past, "draft");
 
             n_drafting++;
             drafting[seq_id] = true;
@@ -4625,7 +4643,7 @@ common_speculative_tree common_speculative_draft_tree(
 }
 
 void common_speculative_accept(common_speculative * spec, uint16_t n_accepted) {
-    if (n_accepted == 0 || spec == nullptr) {
+    if (spec == nullptr) {
         return;
     }
 

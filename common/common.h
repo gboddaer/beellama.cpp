@@ -492,6 +492,9 @@ struct common_params_speculative {
     }
 
     uint32_t need_n_rs_seq() const {
+        if (has_type(COMMON_SPECULATIVE_TYPE_DRAFT_MTP) && type() != COMMON_SPECULATIVE_TYPE_DFLASH) {
+            return 0u;
+        }
         return has_type(COMMON_SPECULATIVE_TYPE_DRAFT_MTP) ? draft.n_max : 0u;
     }
 };

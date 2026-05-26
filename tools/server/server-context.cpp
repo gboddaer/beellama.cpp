@@ -1559,6 +1559,13 @@ static int dflash_effective_adaptive_base_n_max(
     return base_n_max;
 }
 
+static bool server_speculative_uses_fork_slot_impls(const common_params_speculative & speculative) {
+    return speculative.has_type(COMMON_SPECULATIVE_TYPE_DFLASH) ||
+           speculative.has_type(COMMON_SPECULATIVE_TYPE_SUFFIX) ||
+           speculative.has_type(COMMON_SPECULATIVE_TYPE_COPYSPEC) ||
+           speculative.has_type(COMMON_SPECULATIVE_TYPE_RECYCLE);
+}
+
 
 
 //
@@ -1691,8 +1698,9 @@ private:
     // rejecting draft tokens, because the recurrent state cannot be rolled back
     bool needs_reeval = false;
     int  n_parallel_user = 0;
-    int  n_seq_max_full = 0;      // target n_seq_max after expansion (2*n_parallel_user)
+    int  n_seq_max_full = 0;      // target n_seq_max after optional backup-sequence expansion
     bool recurrent_expanded = true; // false = backup cells deferred, expand before first draft
+    bool recurrent_backup_sequences = false; // explicit backup seqs for speculative recurrent rollback
 
     int32_t n_ctx; // total context for all clients / slots
 
@@ -1798,7 +1806,6 @@ private:
         cparams.ctx_type = LLAMA_CONTEXT_TYPE_MTP;
         cparams.type_k   = params_base.speculative.draft.cache_type_k;
         cparams.type_v   = params_base.speculative.draft.cache_type_v;
-        cparams.n_rs_seq = 0;
         return llama_init_from_model(model_tgt, cparams);
     }
 
@@ -1806,7 +1813,14 @@ private:
         // common_context_can_seq_rm() probes support with a token-only dummy
         // decode. MTP draft contexts consume target hidden-state/token pairs,
         // so that probe is not a valid workload for this context type.
-        ctx_dft_seq_rm_type = COMMON_CONTEXT_SEQ_RM_TYPE_PART;
+        ctx_dft_seq_rm_type = llama_n_rs_seq(ctx_dft.get()) > 0 ?
+            COMMON_CONTEXT_SEQ_RM_TYPE_RS : COMMON_CONTEXT_SEQ_RM_TYPE_PART;
+    }
+
+    bool speculative_needs_recurrent_backup_sequences() const {
+        const bool needs_backup_sequences =
+            (params_base.speculative.type() != COMMON_SPECULATIVE_TYPE_NONE || params_base.speculative.has_dft());
+        return needs_backup_sequences;
     }
 
     void swap_mtp_to_mmproj_gpu() {
@@ -1879,7 +1893,7 @@ private:
     }
 
     bool recurrent_shrink_for_prompt_cache(const char * reason) {
-        if (!recurrent_expanded || !needs_reeval || n_seq_max_full <= n_parallel_user) {
+        if (!recurrent_backup_sequences || !recurrent_expanded || !needs_reeval || n_seq_max_full <= n_parallel_user) {
             return true;
         }
 
@@ -1910,7 +1924,7 @@ private:
     }
 
     void recurrent_expand_after_prompt_cache(const char * reason) {
-        if (recurrent_expanded || !needs_reeval || n_seq_max_full <= n_parallel_user) {
+        if (!recurrent_backup_sequences || recurrent_expanded || !needs_reeval || n_seq_max_full <= n_parallel_user) {
             return;
         }
 
@@ -2005,7 +2019,9 @@ private:
         }
 
         n_parallel_user = params_base.n_parallel;
+        n_seq_max_full = n_parallel_user;
         recurrent_expanded = true;
+        recurrent_backup_sequences = false;
 
         const bool has_mtp = params_base.speculative.has_type(COMMON_SPECULATIVE_TYPE_DRAFT_MTP);
 
@@ -2037,7 +2053,9 @@ private:
                     cparams_dft.type_k   = params_base.speculative.draft.cache_type_k;
                     cparams_dft.type_v   = params_base.speculative.draft.cache_type_v;
                 }
-                cparams_dft.n_rs_seq = 0;
+                if (!has_mtp) {
+                    cparams_dft.n_rs_seq = 0;
+                }
 
                 std::vector<ggml_backend_dev_t> devs;
                 uint32_t hp_ngl = 0;
@@ -2127,10 +2145,11 @@ private:
             params_base.fit_params = false;
         }
 
-        if (params_base.speculative.type() != COMMON_SPECULATIVE_TYPE_NONE || params_base.speculative.has_dft()) {
+        if (speculative_needs_recurrent_backup_sequences()) {
             params_base.n_parallel = n_parallel_user * 2;
             n_seq_max_full = params_base.n_parallel;
             recurrent_expanded = false;
+            recurrent_backup_sequences = true;
 
             if (!params_base.kv_unified && n_parallel_user == 1) {
                 params_base.kv_unified = true;
@@ -2157,7 +2176,7 @@ private:
 
         add_bos_token = llama_vocab_get_add_bos(vocab);
 
-        if (!recurrent_expanded && needs_reeval) {
+        if (recurrent_backup_sequences && !recurrent_expanded && needs_reeval) {
             if (llama_context_recurrent_shrink(ctx_tgt, n_parallel_user)) {
                 SRV_INF("shrunk recurrent state to %d cells before draft load (deferred %d backup cells)\n",
                         n_parallel_user, n_seq_max_full - n_parallel_user);
@@ -2321,7 +2340,6 @@ private:
                 cparams.ctx_type = LLAMA_CONTEXT_TYPE_MTP;
                 cparams.type_k   = params_base.speculative.draft.cache_type_k;
                 cparams.type_v   = params_base.speculative.draft.cache_type_v;
-                cparams.n_rs_seq = 0;
                 ctx_dft.reset(llama_init_from_model(model_dft.get(), cparams));
                 mark_mtp_draft_context_seq_rm_supported();
                 params_base.speculative.draft.ctx_tgt = ctx_tgt;
@@ -2415,7 +2433,7 @@ private:
         // Necessary similarity of prompt for slot selection
         slot_prompt_similarity = params_base.slot_prompt_similarity;
 
-        if (!recurrent_expanded && needs_reeval) {
+        if (recurrent_backup_sequences && !recurrent_expanded && needs_reeval) {
             if (llama_context_recurrent_expand(ctx_tgt, n_seq_max_full)) {
                 SRV_INF("expanded recurrent state to %d cells before speculative GPU buffers\n", n_seq_max_full);
                 recurrent_expanded = true;
@@ -2486,8 +2504,10 @@ private:
             slots.emplace_back();
         }
 
-        // try speculative decoding (upstream shared spec — not used by fork types which init per-slot)
-        if (ctx_tgt_seq_rm_type != COMMON_CONTEXT_SEQ_RM_TYPE_NO && !dflash_slots_cap) {
+        // try speculative decoding through upstream's shared state. Bee-only
+        // fork speculators keep per-slot state and are initialized below.
+        const bool uses_fork_slot_spec = server_speculative_uses_fork_slot_impls(params_base.speculative);
+        if (ctx_tgt_seq_rm_type != COMMON_CONTEXT_SEQ_RM_TYPE_NO && !dflash_slots_cap && !uses_fork_slot_spec) {
             try {
                 spec.reset(common_speculative_init(params_base.speculative, params_base.n_parallel));
             } catch (const std::exception & e) {
@@ -2536,13 +2556,17 @@ private:
 
             const bool slot_can_spec = can_spec &&
                 (params_base.speculative.type() != COMMON_SPECULATIVE_TYPE_DFLASH || slot_dflash);
+            const bool slot_uses_fork_spec =
+                slot_can_spec && server_speculative_uses_fork_slot_impls(params_base.speculative);
 
             if (slot_can_spec) {
-                try {
-                    slot.spec.reset(common_speculative_init(params_base.speculative, slot.ctx_tgt, ctx_dft_shared.get()));
-                } catch (const std::exception & e) {
-                    SRV_ERR("failed to initialize slot speculative decoding context: %s\n", e.what());
-                    return false;
+                if (slot_uses_fork_spec) {
+                    try {
+                        slot.spec.reset(common_speculative_init(params_base.speculative, slot.ctx_tgt, ctx_dft_shared.get()));
+                    } catch (const std::exception & e) {
+                        SRV_ERR("failed to initialize slot speculative decoding context: %s\n", e.what());
+                        return false;
+                    }
                 }
                 if (!slot.spec && spec) {
                     slot.spec_shared = spec.get();
@@ -2732,7 +2756,7 @@ private:
         // Shrink recurrent state to free backup cells during prefill.
         // Must happen after init-time decodes (common_speculative_is_compat, warmup)
         // so the scheduler's CUDA graph state isn't stale.
-        if (!recurrent_expanded && needs_reeval) {
+        if (recurrent_backup_sequences && !recurrent_expanded && needs_reeval) {
             if (params_base.speculative.type() == COMMON_SPECULATIVE_TYPE_DFLASH && n_parallel_user <= 2) {
                 recurrent_expanded = true;
             } else {
@@ -4204,6 +4228,8 @@ private:
                 const llama_tokens & cached_text_tokens = slot.prompt.tokens.get_text_tokens();
                 const int original_n_max = params_spec.n_max;
                 params_spec.n_max = std::min(params_spec.n_max, n_draft_max);
+                slot.n_tokens_before_draft = slot.prompt.n_tokens();
+                slot.n_pos_before_draft = slot.prompt.tokens.pos_next();
                 const bool use_ddtree = params_base.speculative.type() == COMMON_SPECULATIVE_TYPE_DFLASH &&
                     !dflash_active_grammar &&
                     params_spec.branch_budget > 0 && batch.n_tokens == 0 && batched_drafts[slot.id].empty();
@@ -4240,6 +4266,7 @@ private:
                         slot.n_draft_total += tree.n_nodes;
 
                         if (needs_reeval) {
+                            GGML_ASSERT(recurrent_backup_sequences && "DDTree recurrent rollback requires backup sequences");
                             const int64_t t_replay_sync_start = dflash_profile_start();
                             llama_tape_replay_sync(ctx_tgt);
                             dflash_profile_add(t_replay_sync_total, t_replay_sync_start);
@@ -4291,15 +4318,31 @@ private:
                 }
 
                 llama_tokens draft;
-                if (!batched_drafts[slot.id].empty()) {
+                const bool use_mtp_spec = params_base.speculative.has_type(COMMON_SPECULATIVE_TYPE_DRAFT_MTP) &&
+                    params_base.speculative.type() != COMMON_SPECULATIVE_TYPE_DFLASH;
+                const llama_pos draft_n_past = use_mtp_spec ? slot.n_pos_before_draft : -1;
+                if (use_mtp_spec) {
+                    slot.spec_prompt = cached_text_tokens;
+                    common_speculative_get_draft_params(slot.get_spec(), slot.id) = {
+                        /* .drafting = */ true,
+                        /* .n_max    = */ params_spec.n_max,
+                        /* .n_min    = */ params_spec.n_min,
+                        /* .n_past   = */ draft_n_past,
+                        /* .id_last  = */ slot.sampled,
+                        /* .prompt   = */ &slot.spec_prompt,
+                        /* .result   = */ &draft,
+                    };
+                    slot.draft_log_probs.clear();
+                    common_speculative_draft(slot.get_spec());
+                } else if (!batched_drafts[slot.id].empty()) {
                     draft = std::move(batched_drafts[slot.id]);
                     slot.draft_log_probs = std::move(batched_log_probs[slot.id]);
                 } else if (use_rejection_sampling) {
                     slot.draft_log_probs.clear();
-                    draft = common_speculative_draft(slot.get_spec(), params_spec, cached_text_tokens, slot.sampled, &slot.draft_log_probs);
+                    draft = common_speculative_draft(slot.get_spec(), params_spec, cached_text_tokens, slot.sampled, &slot.draft_log_probs, draft_n_past);
                 } else {
                     slot.draft_log_probs.clear();
-                    draft = common_speculative_draft(slot.get_spec(), params_spec, cached_text_tokens, slot.sampled);
+                    draft = common_speculative_draft(slot.get_spec(), params_spec, cached_text_tokens, slot.sampled, nullptr, draft_n_past);
                 }
                 slot.spec_pad_i_batch.clear();
 
@@ -4311,8 +4354,9 @@ private:
                     }
                 }
 
-                slot.n_tokens_before_draft = slot.prompt.n_tokens();
-                slot.n_pos_before_draft = slot.prompt.tokens.pos_next();
+                if (ctx_dft && use_mtp_spec) {
+                    common_context_seq_rm(ctx_dft.get(), slot.id, slot.n_pos_before_draft, -1);
+                }
 
                 slot.spec_i_batch.push_back(batch.n_tokens);
                 common_batch_add(batch, slot.sampled, slot.prompt.tokens.pos_next(), { slot.id }, true);
@@ -4347,7 +4391,10 @@ private:
                         }
 
                         // RS contexts handle rollback internally via seq_rm snapshots
-                        if (ctx_tgt_seq_rm_type != COMMON_CONTEXT_SEQ_RM_TYPE_RS) {
+                        if (ctx_tgt_seq_rm_type != COMMON_CONTEXT_SEQ_RM_TYPE_RS || use_mtp_spec) {
+                            if (!recurrent_backup_sequences) {
+                                GGML_ABORT("speculative recurrent rollback requires backup sequences when bounded snapshots are unavailable\n");
+                            }
                             if (!recurrent_expanded) {
                                 if (llama_context_recurrent_expand(ctx_tgt, n_seq_max_full)) {
                                     SRV_INF("expanded recurrent state to %d cells for speculative backup\n", n_seq_max_full);
@@ -6173,7 +6220,13 @@ private:
                     }
                 }
 
-                common_speculative_accept(slot.get_spec(), n_accepted_draft);
+                const bool use_mtp_spec = params_base.speculative.has_type(COMMON_SPECULATIVE_TYPE_DRAFT_MTP) &&
+                    params_base.speculative.type() != COMMON_SPECULATIVE_TYPE_DFLASH;
+                if (use_mtp_spec) {
+                    common_speculative_accept(slot.get_spec(), slot.id, n_accepted_draft);
+                } else {
+                    common_speculative_accept(slot.get_spec(), n_accepted_draft);
+                }
 
                 if (is_draft_tree) {
                     slot.prompt.tokens.keep_first(slot.n_tokens_before_draft + 1);
@@ -6307,6 +6360,9 @@ private:
                     slot.seq_id_backup = -1;
                 } else {
                     llama_memory_seq_rm(llama_get_memory(ctx_tgt), slot.id, slot.prompt.tokens.pos_next(), -1);
+                    if (ctx_dft && use_mtp_spec) {
+                        common_context_seq_rm(ctx_dft.get(), slot.id, slot.prompt.tokens.pos_next(), -1);
+                    }
                     if (is_draft_tree) {
                         llama_clear_tree_parent_ids(ctx_tgt);
                     }
