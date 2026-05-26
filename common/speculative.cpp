@@ -333,6 +333,9 @@ struct common_speculative_impl {
             common_speculative_tree         & /*tree*/) {}
 
     virtual void update_logits(llama_context * /*ctx*/, const llama_tokens & /*batch_tokens*/, int /*n_accepted*/) {}
+    virtual void update_logits_deferred_dflash_kv(llama_context * ctx, const llama_tokens & batch_tokens, int n_accepted) {
+        update_logits(ctx, batch_tokens, n_accepted);
+    }
 
     virtual void update_logits_by_indices(llama_context * /*ctx*/, const std::vector<int> & /*capture_indices*/) {}
 
@@ -2083,6 +2086,7 @@ struct common_speculative_impl_dflash : public common_speculative_impl {
     bool kv_cache_init_attempted = false;
     bool kv_cache_enabled = false;
     bool ring_write_discarded = false;
+    int deferred_drafter_kv_tokens = 0;
 
     int n_draft_last = 0;
     std::vector<int32_t> capture_layers;
@@ -2107,6 +2111,7 @@ struct common_speculative_impl_dflash : public common_speculative_impl {
         prefill_flush_requested = 0;
         prefill_flush_written = 0;
         prefill_suffix_seen = false;
+        deferred_drafter_kv_tokens = 0;
         ring_write_discarded = true;
         cross_buf.clear();
         common_dflash_reset_drafter_seq_and_kv_cache(ctx_dft, seq_id, reason);
@@ -2236,6 +2241,42 @@ struct common_speculative_impl_dflash : public common_speculative_impl {
             llama_dflash_kv_cache_reset(ctx_dft);
             kv_cache_enabled = false;
         }
+    }
+
+    void defer_drafter_kv_cache_update(int n_written) {
+        if (n_written <= 0) {
+            return;
+        }
+
+        deferred_drafter_kv_tokens = std::min(
+                deferred_drafter_kv_tokens + n_written,
+                std::max(RING_SIZE, cross_ctx));
+
+        if (profile_enabled(DFLASH_PROFILE_COPY)) {
+            LOG_INF("dflash profile: deferred drafter KV update tokens=%d pending=%d committed=%d ring_filled=%d\n",
+                    n_written, deferred_drafter_kv_tokens, committed_len, ring_filled);
+        }
+    }
+
+    void flush_deferred_drafter_kv_cache(const char * where) {
+        if (deferred_drafter_kv_tokens <= 0) {
+            return;
+        }
+
+        const int pending = deferred_drafter_kv_tokens;
+        deferred_drafter_kv_tokens = 0;
+
+        const int n_update = std::min(pending, std::max(0, ring_filled));
+        if (n_update <= 0) {
+            return;
+        }
+
+        if (profile_enabled(DFLASH_PROFILE_COPY | DFLASH_PROFILE_SUMMARY)) {
+            LOG_INF("dflash profile: flushing deferred drafter KV before %s pending=%d update=%d committed=%d ring_filled=%d\n",
+                    where && where[0] ? where : "draft", pending, n_update, committed_len, ring_filled);
+        }
+
+        update_drafter_kv_cache(n_update);
     }
 
     // build interleaved cross-attention data from ring buffer (GPU or CPU path)
@@ -2528,6 +2569,7 @@ struct common_speculative_impl_dflash : public common_speculative_impl {
             return -1;
         }
 
+        flush_deferred_drafter_kv_cache("batched draft");
         return build_cross_data(ctx_dft_ext);
     }
 
@@ -2697,6 +2739,7 @@ struct common_speculative_impl_dflash : public common_speculative_impl {
             ring_write_pos = 0;
             ring_filled = 0;
             committed_len = 0;
+            deferred_drafter_kv_tokens = 0;
             common_dflash_reset_drafter_seq_and_kv_cache(ctx_dft, seq_id, "first prefill flush");
         }
 
@@ -2821,6 +2864,7 @@ struct common_speculative_impl_dflash : public common_speculative_impl {
         ring_write_pos = saved_write_pos;
         ring_filled = saved_filled;
         committed_len = saved_committed;
+        deferred_drafter_kv_tokens = 0;
         common_dflash_reset_drafter_seq_and_kv_cache(ctx_dft, seq_id, "ring state load");
 
         if (profile_enabled(DFLASH_PROFILE_PREFILL | DFLASH_PROFILE_COPY)) {
@@ -2888,6 +2932,7 @@ struct common_speculative_impl_dflash : public common_speculative_impl {
 
             const int64_t t0 = ggml_time_us();
 
+            flush_deferred_drafter_kv_cache("flat draft");
             llama_memory_seq_rm(llama_get_memory(ctx_dft), seq_id, committed_len, -1);
             common_dflash_align_drafter_seq_or_clear(ctx_dft, seq_id, committed_len, "flat draft");
 
@@ -3018,6 +3063,7 @@ struct common_speculative_impl_dflash : public common_speculative_impl {
 
         const int64_t t0 = ggml_time_us();
 
+        flush_deferred_drafter_kv_cache("tree draft");
         llama_memory_seq_rm(llama_get_memory(ctx_dft), seq_id, committed_len, -1);
         common_dflash_align_drafter_seq_or_clear(ctx_dft, seq_id, committed_len, "tree draft");
 
@@ -3220,7 +3266,13 @@ struct common_speculative_impl_dflash : public common_speculative_impl {
         // In this path n_accepted means committed hidden-state rows, not output-token count.
         // [id_last, draft0, ..., draftN-1] => root + accepted draft tokens.
         // Boundary stops pass root + accepted draft tokens even when no bonus token was sampled.
-        append_target_hiddens(n_accepted);
+        append_target_hiddens(n_accepted, false);
+    }
+
+    void update_logits_deferred_dflash_kv(llama_context * ctx, const llama_tokens & batch_tokens, int n_accepted) override {
+        GGML_UNUSED(ctx);
+        GGML_UNUSED(batch_tokens);
+        append_target_hiddens(n_accepted, true);
     }
 
     // tree variant: write specific capture-buffer indices to the ring
@@ -3508,6 +3560,7 @@ private:
 
         ring_write_pos = 0;
         ring_filled = 0;
+        deferred_drafter_kv_tokens = 0;
         common_dflash_reset_drafter_seq_and_kv_cache(ctx_dft, seq_id, "capture target hiddens");
         const int actual_written = ring_write(to_store, start_offset, true);
         if (ring_write_discarded) {
@@ -3518,7 +3571,7 @@ private:
     }
 
     // called after each verification decode — append only the accepted tokens' hidden states
-    void append_target_hiddens(int n_accepted) {
+    void append_target_hiddens(int n_accepted, bool defer_drafter_kv_cache = false) {
         llama_dflash_set_active_slot(ctx_tgt, seq_id);
 
         int32_t n_slots = llama_get_n_layer_hiddens(ctx_tgt);
@@ -3552,7 +3605,16 @@ private:
             return;
         }
         committed_len += actual_written;
-        update_drafter_kv_cache(actual_written);
+        if (defer_drafter_kv_cache) {
+            defer_drafter_kv_cache_update(actual_written);
+        } else {
+            int n_update = actual_written;
+            if (deferred_drafter_kv_tokens > 0) {
+                n_update += deferred_drafter_kv_tokens;
+                deferred_drafter_kv_tokens = 0;
+            }
+            update_drafter_kv_cache(std::min(n_update, ring_filled));
+        }
     }
 };
 
@@ -4587,6 +4649,20 @@ void common_speculative_update_logits(common_speculative * spec, llama_context *
     }
     for (auto & impl : spec->impls) {
         impl->update_logits(ctx, batch_tokens, n_accepted);
+        if (impl->type == COMMON_SPECULATIVE_TYPE_COPYSPEC) {
+            static_cast<common_speculative_impl_copyspec *>(impl.get())->update_logits(ctx, batch_tokens, n_accepted);
+        } else if (impl->type == COMMON_SPECULATIVE_TYPE_RECYCLE) {
+            static_cast<common_speculative_impl_recycle *>(impl.get())->update_logits(ctx, batch_tokens, n_accepted);
+        }
+    }
+}
+
+void common_speculative_update_logits_deferred_dflash_kv(common_speculative * spec, llama_context * ctx, const llama_tokens & batch_tokens, int n_accepted) {
+    if (spec == nullptr) {
+        return;
+    }
+    for (auto & impl : spec->impls) {
+        impl->update_logits_deferred_dflash_kv(ctx, batch_tokens, n_accepted);
         if (impl->type == COMMON_SPECULATIVE_TYPE_COPYSPEC) {
             static_cast<common_speculative_impl_copyspec *>(impl.get())->update_logits(ctx, batch_tokens, n_accepted);
         } else if (impl->type == COMMON_SPECULATIVE_TYPE_RECYCLE) {

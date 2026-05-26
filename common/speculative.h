@@ -176,6 +176,7 @@ void common_speculative_draft_batch(
 
 // fork: logit/state management
 void   common_speculative_update_logits(common_speculative * spec, llama_context * ctx, const llama_tokens & batch_tokens, int n_accepted);
+void   common_speculative_update_logits_deferred_dflash_kv(common_speculative * spec, llama_context * ctx, const llama_tokens & batch_tokens, int n_accepted);
 void   common_speculative_update_logits_by_indices(common_speculative * spec, llama_context * ctx, const std::vector<int> & capture_indices);
 int    common_speculative_flush_prefill(common_speculative * spec, int src_offset = 0, int n_tokens = 0);
 void   common_speculative_set_prefill_capture_enabled(common_speculative * spec, bool enabled);

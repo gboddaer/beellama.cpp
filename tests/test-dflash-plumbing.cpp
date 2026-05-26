@@ -1663,6 +1663,16 @@ int main(int argc, char ** argv) {
                  speculative.find("incomplete target hidden capture") != std::string::npos &&
                  speculative.find("refusing to advance DFlash ring") != std::string::npos,
         "DFlash must discard partial hidden captures instead of advancing the cross-ring with missing accepted rows");
+    ok &= expect(speculative_h.find("common_speculative_update_logits_deferred_dflash_kv") != std::string::npos &&
+                 speculative.find("deferred_drafter_kv_tokens") != std::string::npos &&
+                 speculative.find("flush_deferred_drafter_kv_cache(\"flat draft\")") != std::string::npos &&
+                 speculative.find("flush_deferred_drafter_kv_cache(\"tree draft\")") != std::string::npos &&
+                 speculative.find("flush_deferred_drafter_kv_cache(\"batched draft\")") != std::string::npos,
+        "DFlash adaptive-off fallback must defer drafter KV maintenance but flush it before every probe/draft path");
+    ok &= expect(server_context.find("dflash_defer_kv_cache_update") != std::string::npos &&
+                 server_context.find("slot.dm_adaptive && slot.adaptive_n_max == 0") != std::string::npos &&
+                 server_context.find("common_speculative_update_logits_deferred_dflash_kv(slot.get_spec(), ctx_tgt, batch_tokens, 1)") != std::string::npos,
+        "server adaptive-off DFlash fallback must keep the target ring current while skipping per-token drafter KV updates");
     {
         const size_t sync_comment = server_context.find("DFlash: a previous async rollback replay");
         const size_t sync_call    = server_context.find("llama_tape_replay_sync(ctx_tgt);", sync_comment);

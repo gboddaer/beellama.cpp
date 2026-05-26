@@ -5689,7 +5689,14 @@ private:
                         llama_dflash_set_active_slot(ctx_tgt, slot.id);
                     }
                     llama_tokens batch_tokens = { id };
-                    common_speculative_update_logits(slot.get_spec(), ctx_tgt, batch_tokens, 1);
+                    const bool dflash_defer_kv_cache_update =
+                        params_base.speculative.type() == COMMON_SPECULATIVE_TYPE_DFLASH &&
+                        slot.dm_adaptive && slot.adaptive_n_max == 0;
+                    if (dflash_defer_kv_cache_update) {
+                        common_speculative_update_logits_deferred_dflash_kv(slot.get_spec(), ctx_tgt, batch_tokens, 1);
+                    } else {
+                        common_speculative_update_logits(slot.get_spec(), ctx_tgt, batch_tokens, 1);
+                    }
                 }
 
                 // here we have synchronized the llama_context (due to the sampling above), so we can do time measurement
