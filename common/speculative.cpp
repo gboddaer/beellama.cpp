@@ -110,6 +110,16 @@ static bool common_dflash_log_contract_verbose() {
     return enabled;
 }
 
+static bool common_dflash_target_capture_ready_or_skip(llama_context * ctx_tgt) {
+    if (llama_dflash_hidden_capture_available(ctx_tgt)) {
+        return true;
+    }
+
+    LOG_WRN("dflash: target hidden capture unavailable: %s\n",
+        llama_dflash_hidden_capture_unavailable_reason(ctx_tgt));
+    return false;
+}
+
 static bool common_dflash_gpu_ring_allowed(llama_context * ctx_tgt, llama_context * ctx_dft) {
     if (!common_dflash_gpu_ring_env_enabled()) {
         LOG_INF("dflash: GPU cross ring disabled by GGML_DFLASH_GPU_RING=0; using CPU hidden capture\n");
@@ -2301,6 +2311,9 @@ struct common_speculative_impl_dflash : public common_speculative_impl {
     int build_cross_data(llama_context * ctx) {
         LOG_DBG("DFLASH_DBG build_cross_data: ring_write_pos=%d ring_filled=%d committed_len=%d cross_ctx=%d gpu=%d\n",
             ring_write_pos, ring_filled, committed_len, cross_ctx, gpu_ring_handle ? 1 : 0);
+        if (!common_dflash_target_capture_ready_or_skip(ctx_tgt)) {
+            return -1;
+        }
         if (gpu_ring_handle) {
             int gpu_write_pos = ring_write_pos % cross_ctx;
             int gpu_filled = std::min(ring_filled, cross_ctx);
@@ -3562,6 +3575,13 @@ private:
 
     // called after initial prefill — grab all hidden states
     void capture_target_hiddens() {
+        if (!common_dflash_target_capture_ready_or_skip(ctx_tgt)) {
+            ring_write_pos = 0;
+            ring_filled = 0;
+            committed_len = 0;
+            return;
+        }
+
         llama_dflash_set_active_slot(ctx_tgt, seq_id);
 
         int32_t n_slots = llama_get_n_layer_hiddens(ctx_tgt);
@@ -3590,6 +3610,10 @@ private:
 
     // called after each verification decode — append only the accepted tokens' hidden states
     void append_target_hiddens(int n_accepted, bool defer_drafter_kv_cache = false) {
+        if (!common_dflash_target_capture_ready_or_skip(ctx_tgt)) {
+            return;
+        }
+
         llama_dflash_set_active_slot(ctx_tgt, seq_id);
 
         int32_t n_slots = llama_get_n_layer_hiddens(ctx_tgt);

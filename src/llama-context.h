@@ -635,6 +635,11 @@ public:
     // eval callback accumulates across this call's ubatches
     void dflash_reset_hidden_capture();
 
+    // DFlash: check whether hidden capture from the last decode was valid.
+    // Returns false when the eval callback was suppressed on a meta backend.
+    bool dflash_hidden_capture_available() const;
+    const char * dflash_hidden_capture_unavailable_reason() const;
+
     // DFlash: enable/disable tape recording for DeltaNet state rollback
     void set_tape_recording(bool enable);
     void dflash_ensure_recurrent_setup();
@@ -882,6 +887,12 @@ private:
     bool dflash_kv_cache_multi_gpu_fallback_logged = false;
     llama_seq_id dflash_kv_cache_active_seq = -1;
     std::map<llama_seq_id, std::unique_ptr<dflash_kv_cache_data>> dflash_kv_caches;
+
+    bool dflash_capture_valid_last_decode = true;
+    std::string dflash_capture_invalid_reason;
+
+    void dflash_mark_capture_valid();
+    void dflash_mark_capture_invalid(const char * reason);
 
     llm_graph_result_ptr gf_res_prev;
     llm_graph_result_ptr gf_res_reserve;

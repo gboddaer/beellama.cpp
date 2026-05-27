@@ -177,6 +177,32 @@ extern "C" void * dflash_cross_ring_gpu_alloc(int n_layers, int n_embd, int ring
     return ring;
 }
 
+extern "C" void * dflash_cross_ring_gpu_alloc_device(
+        int device,
+        int n_layers,
+        int n_embd,
+        int ring_size) {
+    const char * env = getenv("GGML_DFLASH_GPU_RING");
+    if (env && atoi(env) == 0) {
+        return nullptr;
+    }
+
+    int prev_device = -1;
+    cudaGetDevice(&prev_device);
+
+    if (device >= 0) {
+        cudaSetDevice(device);
+    }
+
+    void * result = dflash_cross_ring_gpu_alloc(n_layers, n_embd, ring_size);
+
+    if (prev_device >= 0) {
+        cudaSetDevice(prev_device);
+    }
+
+    return result;
+}
+
 extern "C" void dflash_cross_ring_gpu_free(void * handle) {
     if (!handle) return;
     auto * ring = (dflash_cross_ring_gpu *)handle;

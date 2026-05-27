@@ -33,6 +33,8 @@
 // llama_context
 //
 
+static bool dflash_diagnostic_debug_enabled();
+
 static llama_memory_recurrent * get_recurrent_mem(llama_memory_t mem);
 
 static bool dflash_env_is_zero(const char * value) {
@@ -75,6 +77,80 @@ static bool dflash_is_cuda_compatible_tensor(const ggml_tensor * t) {
     }
     const char * name = ggml_backend_buffer_name(t->buffer);
     return name && (std::strncmp(name, "CUDA", 4) == 0 || std::strncmp(name, "ROCm", 4) == 0);
+}
+
+static const char * dflash_backend_dev_type_name(enum ggml_backend_dev_type type) {
+    switch (type) {
+        case GGML_BACKEND_DEVICE_TYPE_CPU:   return "CPU";
+        case GGML_BACKEND_DEVICE_TYPE_GPU:   return "GPU";
+        case GGML_BACKEND_DEVICE_TYPE_IGPU:  return "IGPU";
+        case GGML_BACKEND_DEVICE_TYPE_ACCEL: return "ACCEL";
+        case GGML_BACKEND_DEVICE_TYPE_META:  return "META";
+    }
+    return "UNKNOWN";
+}
+
+static bool dflash_context_has_meta_backend(const std::vector<ggml_backend_ptr> & backends) {
+    for (const auto & backend : backends) {
+        if (!backend) {
+            continue;
+        }
+        ggml_backend_dev_t dev = ggml_backend_get_device(backend.get());
+        if (dev && ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_META) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static bool dflash_multi_gpu_debug_enabled() {
+    static const bool enabled = [] {
+        const char * env = std::getenv("GGML_DFLASH_MULTI_GPU_DEBUG");
+        return env && env[0] != '\0' && std::strcmp(env, "0") != 0;
+    }();
+    return enabled;
+}
+
+static bool dflash_force_meta_callback_guard_for_test() {
+    static const bool enabled = [] {
+        const char * env = std::getenv("GGML_DFLASH_FORCE_META_CALLBACK_GUARD");
+        return env && env[0] != '\0' && std::strcmp(env, "0") != 0;
+    }();
+    return enabled;
+}
+
+static int dflash_gpu_ring_device_override() {
+    const char * env = std::getenv("GGML_DFLASH_GPU_RING_DEVICE");
+    if (!env || env[0] == '\0') {
+        return -1;
+    }
+    return std::atoi(env);
+}
+
+static void dflash_log_backend_layout(
+        const char * func,
+        const char * label,
+        const std::vector<ggml_backend_ptr> & backends) {
+    if (!dflash_multi_gpu_debug_enabled() && !dflash_diagnostic_debug_enabled()) {
+        return;
+    }
+
+    LLAMA_LOG_INFO("%s: dflash backend layout for %s: n_backends=%zu\n",
+        func, label, backends.size());
+
+    for (size_t i = 0; i < backends.size(); ++i) {
+        ggml_backend_t backend = backends[i].get();
+        ggml_backend_dev_t dev = backend ? ggml_backend_get_device(backend) : nullptr;
+        const auto type = dev ? ggml_backend_dev_type(dev) : GGML_BACKEND_DEVICE_TYPE_CPU;
+
+        LLAMA_LOG_INFO(
+            "%s: dflash backend[%zu]: backend=%s dev=%s type=%s\n",
+            func,
+            i,
+            backend ? ggml_backend_name(backend) : "<null>",
+            dev ? ggml_backend_dev_name(dev) : "<null>",
+            dev ? dflash_backend_dev_type_name(type) : "<null>");
+    }
 }
 
 static ggml_backend_t dflash_backend_for_dev(
@@ -1843,6 +1919,26 @@ void llama_context::set_dflash_gpu_capture(bool enabled) {
     // allocate_tape_gpu path handles slot-count changes.
 }
 
+void llama_context::dflash_mark_capture_valid() {
+    dflash_capture_valid_last_decode = true;
+    dflash_capture_invalid_reason.clear();
+}
+
+void llama_context::dflash_mark_capture_invalid(const char * reason) {
+    dflash_capture_valid_last_decode = false;
+    dflash_capture_invalid_reason = reason ? reason : "unknown";
+}
+
+bool llama_context::dflash_hidden_capture_available() const {
+    return dflash_capture_valid_last_decode;
+}
+
+const char * llama_context::dflash_hidden_capture_unavailable_reason() const {
+    return dflash_capture_invalid_reason.empty()
+        ? ""
+        : dflash_capture_invalid_reason.c_str();
+}
+
 void llama_context::dflash_reset_hidden_capture() {
     if (!dflash_capture) {
         return;
@@ -1963,6 +2059,8 @@ void llama_context::allocate_tape_gpu(int n_slots, int max_tokens) {
     if (!dflash_capture) {
         return;
     }
+
+    dflash_log_backend_layout(__func__, "target", backends);
     if (n_slots < 1) {
         n_slots = 1;
     }
@@ -3975,7 +4073,8 @@ bool llama_context::dflash_kv_cache_init(int ctx_size) {
         dflash_kv_caches.clear();
         cross.dflash_kv_cache = nullptr;
         if (!dflash_kv_cache_multi_gpu_fallback_logged) {
-            LLAMA_LOG_INFO("%s: multi-GPU drafter detected (%zu devices); disabling DFlash drafter K/V projection cache because updates run on a single CUDA backend\n",
+            LLAMA_LOG_INFO("%s: multi-device DFlash drafter detected (%zu devices); disabling DFlash drafter K/V projection cache. "
+                "Use a single --spec-draft-device to keep the cache enabled.\n",
                 __func__, model.n_devices());
             dflash_kv_cache_multi_gpu_fallback_logged = true;
         }
@@ -4730,8 +4829,9 @@ void llama_context::allocate_tree_buffers(int max_tree_tokens) {
     // single llama_decode call — only the recurrent kernel changes, and for
     // linear chains the sequential kernel produces identical results.
     if (model.n_devices() > 1) {
-        LLAMA_LOG_INFO("%s: multi-GPU detected (%zu devices) — disabling tree verify, using flat chain\n",
-                       __func__, model.n_devices());
+        LLAMA_LOG_INFO(
+            "%s: multi-GPU layer-split detected (%zu devices): disabling tree verify because parent_ids are not replicated per device; using flat chain verification\n",
+            __func__, model.n_devices());
         tree_bufs.disabled = true;
         return;
     }
@@ -5918,6 +6018,10 @@ int llama_context::decode(const llama_batch & batch_inp) {
     // otherwise leave only the last ubatch's hiddens in layer_hiddens).
     dflash_reset_hidden_capture();
 
+    if (dflash_capture) {
+        dflash_mark_capture_valid();
+    }
+
     do {
         const auto & ubatch = mctx->get_ubatch();
         bool dflash_gpu_capture_ready = false;
@@ -6302,6 +6406,41 @@ int llama_context::decode(const llama_batch & batch_inp) {
 
                     dflash_skip_eval_callback =
                         dflash_graph_hidden_ready || dflash_suppress_callback_for_view;
+
+                    const bool dflash_meta_backend_active =
+                        dflash_context_has_meta_backend(backends) ||
+                        dflash_force_meta_callback_guard_for_test();
+
+                    const bool dflash_would_enable_eval_callback =
+                        dflash_capture &&
+                        dflash_capture->capture_active &&
+                        !dflash_skip_eval_callback;
+
+                    if (dflash_meta_backend_active && dflash_would_enable_eval_callback) {
+                        dflash_suppress_callback_for_view = true;
+                        dflash_graph_hidden_ready = false;
+                        dflash_graph_tape_ready = false;
+                        dflash_skip_eval_callback = true;
+
+                        cparams.hidden_gpu_n_seqs = 0;
+                        cparams.tape_gpu_n_seqs = 0;
+                        cparams.tape_gpu = nullptr;
+
+                        for (int s = 0; s < (int) LLAMA_DFLASH_MAX_SLOTS; ++s) {
+                            cparams.hidden_gpu_seqs[s] = nullptr;
+                            cparams.tape_gpu_seqs[s] = nullptr;
+                        }
+
+                        dflash_mark_capture_invalid(
+                            "DFlash eval callback suppressed on meta backend because callback graph slicing is unsafe");
+
+                        if (dflash_multi_gpu_debug_enabled() || dflash_diagnostic_debug_enabled()) {
+                            LLAMA_LOG_WARN(
+                                "%s: dflash: suppressing eval callback on meta backend; "
+                                "tensor-split/meta callback capture is unsafe\n",
+                                __func__);
+                        }
+                    }
 
                     ggml_backend_sched_eval_callback cb_eval_new =
                         dflash_skip_eval_callback ? nullptr : dflash_eval_callback;
@@ -8118,6 +8257,14 @@ void llama_set_dflash_gpu_capture(llama_context * ctx, bool enabled) {
     ctx->set_dflash_gpu_capture(enabled);
 }
 
+bool llama_dflash_hidden_capture_available(const struct llama_context * ctx) {
+    return ctx ? ctx->dflash_hidden_capture_available() : false;
+}
+
+const char * llama_dflash_hidden_capture_unavailable_reason(const struct llama_context * ctx) {
+    return ctx ? ctx->dflash_hidden_capture_unavailable_reason() : "null context";
+}
+
 void llama_set_dflash_sample_temp(llama_context * ctx, float temp) {
     ctx->set_dflash_sample_temp(temp);
 }
@@ -8204,19 +8351,22 @@ struct dflash_cross_ring_handle {
 };
 
 void * llama_context::init_cross_ring_gpu(int n_layers, int n_embd, int ring_size) {
-    // find CUDA backend registry
-    ggml_backend_reg_t cuda_reg = nullptr;
-    for (auto & backend : backends) {
-        auto * dev = ggml_backend_get_device(backend.get());
-        if (dev && ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_GPU) {
-            cuda_reg = ggml_backend_dev_backend_reg(dev);
-            break;
+    ggml_backend_reg_t cuda_reg = dflash_gpu_backend_reg();
+    if (!cuda_reg) {
+        if (dflash_multi_gpu_debug_enabled() || dflash_diagnostic_debug_enabled()) {
+            LLAMA_LOG_WARN("%s: dflash GPU ring unavailable: CUDA/ROCm backend registry not found\n", __func__);
         }
+        return nullptr;
     }
-    if (!cuda_reg) return nullptr;
+
+    if (dflash_multi_gpu_debug_enabled() || dflash_diagnostic_debug_enabled()) {
+        LLAMA_LOG_INFO("%s: dflash GPU ring using backend registry %s\n",
+            __func__, ggml_backend_reg_name(cuda_reg));
+    }
 
     // resolve all function pointers
     using alloc_fn_t      = void * (*)(int, int, int);
+    using alloc_device_fn_t = void * (*)(int, int, int, int);
     using free_fn_t       = void   (*)(void *);
     using write_fn_t      = void   (*)(void *, int, int, const float *, int, int);
     using write_d2d_fn_t  = bool   (*)(void *, int, int, const void *, int, int);
@@ -8225,6 +8375,8 @@ void * llama_context::init_cross_ring_gpu(int n_layers, int n_embd, int ring_siz
     using interleave_fn_t = const float * (*)(void *, int, int, int);
     using set_tensor_fn_t = void   (*)(void *, const void *, size_t, size_t);
 
+    auto fn_alloc_device = (alloc_device_fn_t)
+        ggml_backend_reg_get_proc_address(cuda_reg, "dflash_cross_ring_gpu_alloc_device");
     auto fn_alloc      = (alloc_fn_t)      ggml_backend_reg_get_proc_address(cuda_reg, "dflash_cross_ring_gpu_alloc");
     auto fn_free       = (free_fn_t)       ggml_backend_reg_get_proc_address(cuda_reg, "dflash_cross_ring_gpu_free");
     auto fn_write      = (write_fn_t)      ggml_backend_reg_get_proc_address(cuda_reg, "dflash_cross_ring_gpu_write");
@@ -8238,7 +8390,14 @@ void * llama_context::init_cross_ring_gpu(int n_layers, int n_embd, int ring_siz
         return nullptr;
     }
 
-    void * gpu_ring = fn_alloc(n_layers, n_embd, ring_size);
+    const int ring_device = dflash_gpu_ring_device_override();
+
+    void * gpu_ring = nullptr;
+    if (fn_alloc_device && ring_device >= 0) {
+        gpu_ring = fn_alloc_device(ring_device, n_layers, n_embd, ring_size);
+    } else {
+        gpu_ring = fn_alloc(n_layers, n_embd, ring_size);
+    }
     if (!gpu_ring) return nullptr;
 
     auto * handle = new dflash_cross_ring_handle();

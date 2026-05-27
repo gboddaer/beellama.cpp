@@ -126,6 +126,11 @@ static bool server_dflash_single_explicit_draft_device(const common_params & par
     return dev != nullptr;
 }
 
+static bool server_dflash_tensor_split_experimental_enabled() {
+    const char * env = std::getenv("GGML_DFLASH_ALLOW_TENSOR_SPLIT");
+    return env && env[0] != '\0' && std::strcmp(env, "0") != 0;
+}
+
 static bool server_tail_pos_is_in_code_fence(
         const std::string & text,
         size_t              pos) {
@@ -2219,10 +2224,18 @@ private:
 
             if (draft_type_is_dflash && !draft_devices_explicit) {
                 if (target_output_is_meta) {
-                    params_dft.split_mode = LLAMA_SPLIT_MODE_TENSOR;
-                    params_dft.devices = params_base.devices;
-                    SRV_INF("DFlash draft model will use target tensor-split placement for shared output device %s by default; pass --spec-draft-device to override\n",
-                            ggml_backend_dev_name(target_output_dev));
+                    if (!server_dflash_tensor_split_experimental_enabled()) {
+                        SRV_WRN("%s",
+                            "DFlash disabled for tensor-split target: meta-backend eval-callback capture is unsafe. "
+                            "Set GGML_DFLASH_ALLOW_TENSOR_SPLIT=1 only after implementing a safe tensor-split capture path.\n");
+                        params_base.speculative.set_type(COMMON_SPECULATIVE_TYPE_NONE);
+                    } else {
+                        params_dft.split_mode = LLAMA_SPLIT_MODE_TENSOR;
+                        params_dft.devices = params_base.devices;
+                        SRV_WRN("%s",
+                            "DFlash on tensor-split target is EXPERIMENTAL (GGML_DFLASH_ALLOW_TENSOR_SPLIT=1); "
+                            "hidden-state capture may produce corrupted cross-attention data.\n");
+                    }
                 } else {
                     params_dft.split_mode = LLAMA_SPLIT_MODE_NONE;
                     if (target_output_is_gpu) {
@@ -2262,8 +2275,13 @@ private:
             const bool dflash_auto_device_mismatch =
                     draft_is_dflash && !draft_devices_explicit && target_output_needs_shared_placement &&
                     !server_model_supports_device_buffer(model_dft.get(), target_output_dev);
+            const bool draft_output_is_meta =
+                    llama_model_dev_output(model_dft.get()) &&
+                    ggml_backend_dev_type(llama_model_dev_output(model_dft.get())) == GGML_BACKEND_DEVICE_TYPE_META;
             const bool dflash_auto_single_gpu_reload =
-                    llama_model_n_devices(model_dft.get()) > 1 || (target_output_is_gpu && dflash_auto_device_mismatch);
+                    llama_model_n_devices(model_dft.get()) > 1 ||
+                    draft_output_is_meta ||
+                    (target_output_is_gpu && dflash_auto_device_mismatch);
             if (draft_is_dflash && !draft_devices_explicit && dflash_auto_single_gpu_reload) {
                 SRV_INF("%s", "reloading auto-detected DFlash draft model on a single device; pass --spec-draft-device to override\n");
                 model_dft.reset();
@@ -2281,7 +2299,8 @@ private:
                 draft_is_dflash = server_model_is_dflash_drafter(model_dft.get());
             }
             if (draft_is_dflash && !draft_devices_explicit && target_output_is_meta &&
-                    !server_model_supports_device_buffer(model_dft.get(), target_output_dev)) {
+                    !server_model_supports_device_buffer(model_dft.get(), target_output_dev) &&
+                    server_dflash_tensor_split_experimental_enabled()) {
                 SRV_ERR("DFlash draft model could not create a tensor-split backend compatible with shared target output device %s; pass matching --spec-draft-device values or disable target tensor split\n",
                         ggml_backend_dev_name(target_output_dev));
                 return false;

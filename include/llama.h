@@ -1122,6 +1122,14 @@ extern "C" {
     // DFlash: true unless multi-GPU tape is explicitly disabled by environment.
     LLAMA_API bool llama_dflash_allow_multi_gpu_tape(void);
 
+    // DFlash: check whether the last decode produced valid hidden-state capture.
+    // Returns false when capture was suppressed (e.g. meta-backend eval callback is unsafe).
+    // speculative code must skip DFlash when this returns false.
+    LLAMA_API bool llama_dflash_hidden_capture_available(const struct llama_context * ctx);
+
+    // DFlash: human-readable reason why hidden capture is unavailable; empty string if available.
+    LLAMA_API const char * llama_dflash_hidden_capture_unavailable_reason(const struct llama_context * ctx);
+
     // DFlash: set drafter sampling temperature (Gumbel-max trick)
     // temp=0: greedy argmax (default), temp>0: sample from softmax(logits/temp)
     LLAMA_API void llama_set_dflash_sample_temp(struct llama_context * ctx, float temp);
