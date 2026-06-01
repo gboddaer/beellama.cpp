@@ -1,6 +1,6 @@
 # Docker
 
-BeeLlama Docker images are published by the daily/manual Docker workflow to
+BeeLlama Docker images are published by the push/manual Docker workflow to
 `ghcr.io/anbeeld/beellama.cpp`. CUDA images are built from the stock
 `.devops/cuda.Dockerfile`; pass `CUDA_DOCKER_ARCH` when building locally for a
 specific GPU generation, for example `120` for Blackwell or `86` for RTX 3090.
@@ -22,8 +22,8 @@ Additionally, there the following images, similar to the above:
 - `ghcr.io/anbeeld/beellama.cpp:full-cuda13`: Same as `full` but compiled with CUDA 13 support. (platforms: `linux/amd64`, `linux/arm64`)
 - `ghcr.io/anbeeld/beellama.cpp:light-cuda`: Same as `light` but compiled with CUDA 12 support. (platforms: `linux/amd64`, `linux/arm64`)
 - `ghcr.io/anbeeld/beellama.cpp:light-cuda13`: Same as `light` but compiled with CUDA 13 support. (platforms: `linux/amd64`, `linux/arm64`)
-- `ghcr.io/anbeeld/beellama.cpp:server-cuda`: Same as `server` but compiled with CUDA 12 support. (platforms: `linux/amd64`, `linux/arm64`)
-- `ghcr.io/anbeeld/beellama.cpp:server-cuda13`: Same as `server` but compiled with CUDA 13 support. (platforms: `linux/amd64`, `linux/arm64`)
+- `ghcr.io/anbeeld/beellama.cpp:server-cuda`: Same as `server` but compiled with CUDA 12.4 support. (platforms: `linux/amd64`)
+- `ghcr.io/anbeeld/beellama.cpp:server-cuda13`: Same as `server` but compiled with CUDA 13.1 support. (platforms: `linux/amd64`)
 - `ghcr.io/anbeeld/beellama.cpp:full-rocm`: Same as `full` but compiled with ROCm support. (platforms: `linux/amd64`)
 - `ghcr.io/anbeeld/beellama.cpp:light-rocm`: Same as `light` but compiled with ROCm support. (platforms: `linux/amd64`)
 - `ghcr.io/anbeeld/beellama.cpp:server-rocm`: Same as `server` but compiled with ROCm support. (platforms: `linux/amd64`)
@@ -93,7 +93,8 @@ You may want to pass in some different `ARGS`, depending on the CUDA environment
 
 The defaults are:
 
-- `CUDA_VERSION` set to `12.8.1`
+- `CUDA_VERSION` set to `12.4.1`
+- `UBUNTU_VERSION` set to `22.04`
 - `CUDA_DOCKER_ARCH` set to the cmake build default, which includes all the supported architectures
 
 The resulting images, are essentially the same as the non-CUDA images:

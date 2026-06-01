@@ -4,12 +4,14 @@ on:
   push:
     branches:
       - main
+      - "v*"
     tags:
       - "v*"
+  workflow_dispatch:
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: false
+  cancel-in-progress: ${{ github.ref_type == 'branch' }}
 
 permissions:
   contents: read
@@ -22,7 +24,10 @@ jobs:
     outputs:
       image_repo: ${{ steps.meta.outputs.image_repo }}
       version: ${{ steps.meta.outputs.version }}
+      ref_name_safe: ${{ steps.meta.outputs.ref_name_safe }}
+      short_sha: ${{ steps.meta.outputs.short_sha }}
       publish: ${{ steps.meta.outputs.publish }}
+      release: ${{ steps.meta.outputs.release }}
     steps:
       - name: Check out the repo
         uses: actions/checkout@v6
@@ -36,34 +41,51 @@ jobs:
           set -euo pipefail
 
           publish="false"
+          release="false"
           short_sha="${GITHUB_SHA::12}"
           exact_tag="$(git tag --points-at "${GITHUB_SHA}" --list 'v*' | sort -V | tail -n 1 || true)"
+          ref_name_safe="$(printf '%s' "${GITHUB_REF_NAME}" | tr '[:upper:]' '[:lower:]' | sed -E 's#[^a-z0-9_.-]+#-#g; s#^[.-]+##; s#[.-]+$##')"
+          if [[ -z "${ref_name_safe}" ]]; then
+            ref_name_safe="${short_sha}"
+          fi
 
-          if [[ "${GITHUB_EVENT_NAME}" == "push" && "${GITHUB_REF}" == refs/tags/v* ]]; then
+          if [[ "${GITHUB_REF}" == refs/tags/v* ]]; then
             version="${GITHUB_REF_NAME}"
             git fetch origin +refs/heads/main:refs/remotes/origin/main --no-tags
             if git merge-base --is-ancestor "${GITHUB_SHA}" refs/remotes/origin/main; then
               publish="true"
+              release="true"
             else
               echo "Tag ${GITHUB_REF_NAME} is not on origin/main; skipping Docker publish."
             fi
-          elif [[ "${GITHUB_EVENT_NAME}" == "push" && "${GITHUB_REF}" == "refs/heads/main" && -n "${exact_tag}" ]]; then
+          elif [[ "${GITHUB_REF}" == "refs/heads/main" && -n "${exact_tag}" ]]; then
             version="${exact_tag}"
             publish="true"
+            release="true"
+          elif [[ "${GITHUB_REF}" == "refs/heads/main" || "${GITHUB_REF}" == refs/heads/v* ]]; then
+            version="${ref_name_safe}-${short_sha}"
+            publish="true"
+          elif [[ "${GITHUB_EVENT_NAME}" == "workflow_dispatch" ]]; then
+            version="${ref_name_safe}-${short_sha}"
+            publish="true"
           else
-            version="${GITHUB_REF_NAME//\//-}-${short_sha}"
+            version="${ref_name_safe}-${short_sha}"
           fi
 
           owner="$(echo "${GITHUB_REPOSITORY_OWNER}" | tr '[:upper:]' '[:lower:]')"
           repo="$(echo "${GITHUB_REPOSITORY#*/}" | tr '[:upper:]' '[:lower:]')"
           image_repo="ghcr.io/${owner}/${repo}"
 
-          echo "version=${version}" >> "${GITHUB_OUTPUT}"
           echo "image_repo=${image_repo}" >> "${GITHUB_OUTPUT}"
+          echo "version=${version}" >> "${GITHUB_OUTPUT}"
+          echo "ref_name_safe=${ref_name_safe}" >> "${GITHUB_OUTPUT}"
+          echo "short_sha=${short_sha}" >> "${GITHUB_OUTPUT}"
           echo "publish=${publish}" >> "${GITHUB_OUTPUT}"
+          echo "release=${release}" >> "${GITHUB_OUTPUT}"
           echo "Using image repository: ${image_repo}"
           echo "Using version: ${version}"
           echo "Publish Docker images: ${publish}"
+          echo "Release Docker tags: ${release}"
 
   build:
     name: Build server${{ matrix.config.display_suffix }}
@@ -82,17 +104,23 @@ jobs:
             platforms: linux/amd64,linux/arm64
             free_disk_space: false
           - name: cuda12
-            display_suffix: " CUDA 12"
+            display_suffix: " CUDA 12.4"
             dockerfile: .devops/cuda.Dockerfile
-            cuda_version: "12.8.1"
+            cuda_version: "12.4.1"
+            ubuntu_version: "22.04"
+            cuda_arch: "default"
+            cuda_build_target: "llama-server"
             tag_suffixes: "-cuda -cuda12"
             cache_name: cuda12
             platforms: linux/amd64
             free_disk_space: true
           - name: cuda13
-            display_suffix: " CUDA 13"
+            display_suffix: " CUDA 13.1"
             dockerfile: .devops/cuda.Dockerfile
             cuda_version: "13.1.1"
+            ubuntu_version: "24.04"
+            cuda_arch: "default"
+            cuda_build_target: "llama-server"
             tag_suffixes: "-cuda13"
             cache_name: cuda13
             platforms: linux/amd64
@@ -153,6 +181,9 @@ jobs:
         env:
           IMAGE_REPO: ${{ needs.docker-meta.outputs.image_repo }}
           VERSION: ${{ needs.docker-meta.outputs.version }}
+          REF_NAME_SAFE: ${{ needs.docker-meta.outputs.ref_name_safe }}
+          SHORT_SHA: ${{ needs.docker-meta.outputs.short_sha }}
+          RELEASE_TAGS: ${{ needs.docker-meta.outputs.release }}
           TAG_SUFFIXES: ${{ matrix.config.tag_suffixes }}
           CACHE_NAME: ${{ matrix.config.cache_name }}
         run: |
@@ -163,8 +194,14 @@ jobs:
             if [[ "${suffix}" == "none" ]]; then
               suffix=""
             fi
-            tags+=("${IMAGE_REPO}:server${suffix}")
-            tags+=("${IMAGE_REPO}:server${suffix}-${VERSION}")
+
+            if [[ "${RELEASE_TAGS}" == "true" ]]; then
+              tags+=("${IMAGE_REPO}:server${suffix}")
+              tags+=("${IMAGE_REPO}:server${suffix}-${VERSION}")
+            else
+              tags+=("${IMAGE_REPO}:server${suffix}-${REF_NAME_SAFE}-dev")
+              tags+=("${IMAGE_REPO}:server${suffix}-${REF_NAME_SAFE}-${SHORT_SHA}")
+            fi
           done
 
           {
@@ -193,7 +230,10 @@ jobs:
             APP_REVISION=${{ github.sha }}
             IMAGE_URL=${{ github.server_url }}/${{ github.repository }}
             IMAGE_SOURCE=${{ github.server_url }}/${{ github.repository }}
+            ${{ matrix.config.ubuntu_version && format('UBUNTU_VERSION={0}', matrix.config.ubuntu_version) || '' }}
             ${{ matrix.config.cuda_version && format('CUDA_VERSION={0}', matrix.config.cuda_version) || '' }}
+            ${{ matrix.config.cuda_arch && format('CUDA_DOCKER_ARCH={0}', matrix.config.cuda_arch) || '' }}
+            ${{ matrix.config.cuda_build_target && format('CUDA_BUILD_TARGET={0}', matrix.config.cuda_build_target) || '' }}
           annotations: |
             manifest:org.opencontainers.image.created=${{ steps.build_date.outputs.date }}
             manifest:org.opencontainers.image.version=${{ needs.docker-meta.outputs.version }}

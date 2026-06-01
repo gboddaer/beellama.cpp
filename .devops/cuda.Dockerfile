@@ -1,6 +1,8 @@
-ARG UBUNTU_VERSION=24.04
+# syntax=docker/dockerfile:1.7
+
+ARG UBUNTU_VERSION=22.04
 # This needs to generally match the container host's environment.
-ARG CUDA_VERSION=12.8.1
+ARG CUDA_VERSION=12.4.1
 # Target the CUDA build image
 ARG BASE_CUDA_DEV_CONTAINER=nvidia/cuda:${CUDA_VERSION}-devel-ubuntu${UBUNTU_VERSION}
 
@@ -14,21 +16,44 @@ FROM ${BASE_CUDA_DEV_CONTAINER} AS build
 
 # CUDA architecture to build for (defaults to all supported archs)
 ARG CUDA_DOCKER_ARCH=default
+# CMake target to build. Keep "all" for full/local images; CI server images set this to llama-server.
+ARG CUDA_BUILD_TARGET=all
 
-RUN apt-get update && \
-    apt-get install -y gcc-14 g++-14 build-essential cmake python3 python3-pip git libssl-dev libgomp1
+RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
+    --mount=type=cache,target=/var/lib/apt/lists,sharing=locked \
+    apt-get update && \
+    apt-get install -y --no-install-recommends build-essential cmake ninja-build ccache python3 python3-pip git libssl-dev libgomp1 && \
+    rm -rf /var/lib/apt/lists/*
 
-ENV CC=gcc-14 CXX=g++-14 CUDAHOSTCXX=g++-14
+ENV CC=gcc CXX=g++ CUDAHOSTCXX=g++ CCACHE_SLOPPINESS=time_macros CCACHE_MAXSIZE=2G
 
 WORKDIR /app
 
 COPY . .
 
-RUN if [ "${CUDA_DOCKER_ARCH}" != "default" ]; then \
+RUN --mount=type=cache,target=/root/.ccache \
+    if [ "${CUDA_DOCKER_ARCH}" != "default" ]; then \
     export CMAKE_ARGS="-DCMAKE_CUDA_ARCHITECTURES=${CUDA_DOCKER_ARCH}"; \
     fi && \
-    cmake -B build -DGGML_NATIVE=OFF -DGGML_CUDA=ON -DGGML_BACKEND_DL=ON -DGGML_CPU_ALL_VARIANTS=ON -DLLAMA_BUILD_TESTS=OFF ${CMAKE_ARGS} -DCMAKE_EXE_LINKER_FLAGS=-Wl,--allow-shlib-undefined . && \
-    cmake --build build --config Release -j$(nproc)
+    cmake -S . -B build -G Ninja \
+      -DGGML_NATIVE=OFF \
+      -DGGML_CUDA=ON \
+      -DGGML_CUDA_FA=ON \
+      -DGGML_CUDA_FA_ALL_QUANTS=ON \
+      -DGGML_BACKEND_DL=ON \
+      -DGGML_CPU_ALL_VARIANTS=ON \
+      -DLLAMA_BUILD_TESTS=OFF \
+      -DCMAKE_C_COMPILER_LAUNCHER=ccache \
+      -DCMAKE_CXX_COMPILER_LAUNCHER=ccache \
+      -DCMAKE_CUDA_COMPILER_LAUNCHER=ccache \
+      ${CMAKE_ARGS} \
+      -DCMAKE_EXE_LINKER_FLAGS=-Wl,--allow-shlib-undefined && \
+    if [ "${CUDA_BUILD_TARGET}" = "all" ]; then \
+      cmake --build build --config Release -j"$(nproc)"; \
+    else \
+      cmake --build build --config Release -j"$(nproc)" --target "${CUDA_BUILD_TARGET}"; \
+    fi && \
+    ccache --show-stats
 
 RUN mkdir -p /app/lib && \
     find build -name "*.so*" -exec cp -P {} /app/lib \;
