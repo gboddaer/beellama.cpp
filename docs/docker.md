@@ -10,76 +10,68 @@ specific GPU generation, for example `120` for Blackwell or `86` for RTX 3090.
 * Create a folder to store big models & intermediate files (ex. /llama/models)
 
 ## Images
-We have three Docker images available for this project:
+The CI workflow publishes `llama-server` images to
+`ghcr.io/anbeeld/beellama.cpp`:
 
-1. `ghcr.io/anbeeld/beellama.cpp:full`: This image includes both the `llama-cli` and `llama-completion` executables and the tools to convert LLaMA models into ggml and convert into 4-bit quantization. (platforms: `linux/amd64`, `linux/arm64`, `linux/s390x`)
-2. `ghcr.io/anbeeld/beellama.cpp:light`: This image only includes the `llama-cli` and `llama-completion` executables. (platforms: `linux/amd64`, `linux/arm64`, `linux/s390x`)
-3. `ghcr.io/anbeeld/beellama.cpp:server`: This image only includes the `llama-server` executable. (platforms: `linux/amd64`, `linux/arm64`, `linux/s390x`)
+- `server` / `server-cpu`: CPU backend. (`linux/amd64`, `linux/arm64`)
+- `server-cuda` / `server-cuda12`: CUDA 12.4 backend. (`linux/amd64`)
+- `server-cuda13`: CUDA 13.1 backend. (`linux/amd64`)
+- `server-rocm`: ROCm backend. (`linux/amd64`)
+- `server-vulkan`: Vulkan backend. (`linux/amd64`)
+- `server-sycl`: SYCL backend for Intel GPUs. (`linux/amd64`)
 
-Additionally, there the following images, similar to the above:
+Release tags are published as both floating tags such as `server-sycl` and
+versioned tags such as `server-sycl-v0.3.0`. Branch builds use development tags
+such as `server-sycl-v0.3.0-dev` and commit-specific tags such as
+`server-sycl-v0.3.0-<short-sha>`.
 
-- `ghcr.io/anbeeld/beellama.cpp:full-cuda`: Same as `full` but compiled with CUDA 12 support. (platforms: `linux/amd64`, `linux/arm64`)
-- `ghcr.io/anbeeld/beellama.cpp:full-cuda13`: Same as `full` but compiled with CUDA 13 support. (platforms: `linux/amd64`, `linux/arm64`)
-- `ghcr.io/anbeeld/beellama.cpp:light-cuda`: Same as `light` but compiled with CUDA 12 support. (platforms: `linux/amd64`, `linux/arm64`)
-- `ghcr.io/anbeeld/beellama.cpp:light-cuda13`: Same as `light` but compiled with CUDA 13 support. (platforms: `linux/amd64`, `linux/arm64`)
-- `ghcr.io/anbeeld/beellama.cpp:server-cuda`: Same as `server` but compiled with CUDA 12.4 support. (platforms: `linux/amd64`)
-- `ghcr.io/anbeeld/beellama.cpp:server-cuda13`: Same as `server` but compiled with CUDA 13.1 support. (platforms: `linux/amd64`)
-- `ghcr.io/anbeeld/beellama.cpp:full-rocm`: Same as `full` but compiled with ROCm support. (platforms: `linux/amd64`)
-- `ghcr.io/anbeeld/beellama.cpp:light-rocm`: Same as `light` but compiled with ROCm support. (platforms: `linux/amd64`)
-- `ghcr.io/anbeeld/beellama.cpp:server-rocm`: Same as `server` but compiled with ROCm support. (platforms: `linux/amd64`)
-- `ghcr.io/anbeeld/beellama.cpp:full-musa`: Same as `full` but compiled with MUSA support. (platforms: `linux/amd64`)
-- `ghcr.io/anbeeld/beellama.cpp:light-musa`: Same as `light` but compiled with MUSA support. (platforms: `linux/amd64`)
-- `ghcr.io/anbeeld/beellama.cpp:server-musa`: Same as `server` but compiled with MUSA support. (platforms: `linux/amd64`)
-- `ghcr.io/anbeeld/beellama.cpp:full-intel`: Same as `full` but compiled with SYCL support. (platforms: `linux/amd64`)
-- `ghcr.io/anbeeld/beellama.cpp:light-intel`: Same as `light` but compiled with SYCL support. (platforms: `linux/amd64`)
-- `ghcr.io/anbeeld/beellama.cpp:server-intel`: Same as `server` but compiled with SYCL support. (platforms: `linux/amd64`)
-- `ghcr.io/anbeeld/beellama.cpp:full-vulkan`: Same as `full` but compiled with Vulkan support. (platforms: `linux/amd64`, `linux/arm64`)
-- `ghcr.io/anbeeld/beellama.cpp:light-vulkan`: Same as `light` but compiled with Vulkan support. (platforms: `linux/amd64`, `linux/arm64`)
-- `ghcr.io/anbeeld/beellama.cpp:server-vulkan`: Same as `server` but compiled with Vulkan support. (platforms: `linux/amd64`, `linux/arm64`)
-- `ghcr.io/anbeeld/beellama.cpp:full-openvino`: Same as `full` but compiled with OpenVino support. (platforms: `linux/amd64`)
-- `ghcr.io/anbeeld/beellama.cpp:light-openvino`: Same as `light` but compiled with OpenVino support. (platforms: `linux/amd64`)
-- `ghcr.io/anbeeld/beellama.cpp:server-openvino`: Same as `server` but compiled with OpenVino support. (platforms: `linux/amd64`)
-- `ghcr.io/anbeeld/beellama.cpp:full-s390x`: Identical to `full`, an alias for the `s390x` platform. (platforms: `linux/s390x`)
-- `ghcr.io/anbeeld/beellama.cpp:light-s390x`: Identical to `light`, an alias for the `s390x` platform. (platforms: `linux/s390x`)
-- `ghcr.io/anbeeld/beellama.cpp:server-s390x`: Identical to `server`, an alias for the `s390x` platform. (platforms: `linux/s390x`)
-
-The GPU enabled images are not currently tested by CI beyond being built. They are not built with any variation from the ones in the Dockerfiles defined in [.devops/](../.devops/) and the GitHub Action defined in [.github/workflows/docker.yml](../.github/workflows/docker.yml). If you need different settings (for example, a different CUDA, ROCm or MUSA library, you'll need to build the images locally for now).
+The SYCL image is built as a generic Intel SYCL target. It intentionally does
+not set `GGML_SYCL_DEVICE_ARCH`, so device code is selected by the oneAPI
+runtime for the host Intel GPU instead of being pinned to one GPU generation.
 
 ## Usage
-
-The easiest way to download the models, convert them to ggml and optimize them is with the --all-in-one command which includes the full docker image.
 
 Replace `/path/to/models` below with the actual path where you downloaded the models.
 
 ```bash
-docker run -v /path/to/models:/models ghcr.io/anbeeld/beellama.cpp:full --all-in-one "/models/" 7B
+docker run --rm -it \
+  -v /path/to/models:/models \
+  -p 8080:8080 \
+  ghcr.io/anbeeld/beellama.cpp:server \
+  -m /models/model.gguf --port 8080 --host 0.0.0.0 -n 512
 ```
 
-On completion, you are ready to play!
+Use the backend-specific server tag for GPU acceleration. For example:
 
 ```bash
-docker run -v /path/to/models:/models ghcr.io/anbeeld/beellama.cpp:full --run -m /models/7B/ggml-model-q4_0.gguf
-docker run -v /path/to/models:/models ghcr.io/anbeeld/beellama.cpp:full --run-legacy -m /models/32B/ggml-model-q8_0.gguf -no-cnv -p "Building a mobile app can be done in 15 steps:" -n 512
+docker run --gpus all \
+  -v /path/to/models:/models \
+  -p 8080:8080 \
+  ghcr.io/anbeeld/beellama.cpp:server-cuda13 \
+  -m /models/model.gguf --port 8080 --host 0.0.0.0 -ngl 999
 ```
-
-or with a light image:
-
-```bash
-docker run -v /path/to/models:/models --entrypoint /app/llama-cli ghcr.io/anbeeld/beellama.cpp:light -m /models/7B/ggml-model-q4_0.gguf
-docker run -v /path/to/models:/models --entrypoint /app/llama-completion ghcr.io/anbeeld/beellama.cpp:light -m /models/32B/ggml-model-q8_0.gguf -no-cnv -p "Building a mobile app can be done in 15 steps:" -n 512
-```
-
-or with a server image:
-
-```bash
-docker run -v /path/to/models:/models -p 8080:8080 ghcr.io/anbeeld/beellama.cpp:server -m /models/7B/ggml-model-q4_0.gguf --port 8080 --host 0.0.0.0 -n 512
-```
-
-In the above examples, `--entrypoint /app/llama-cli` is specified for clarity, but you can safely omit it since it's the default entrypoint in the container.
 
 ## Docker With CUDA
 
 Assuming one has the [nvidia-container-toolkit](https://github.com/NVIDIA/nvidia-container-toolkit) properly installed on Linux, or is using a GPU enabled cloud, `cuBLAS` should be accessible inside the container.
+
+## Docker With SYCL
+
+The SYCL image targets Intel GPUs through oneAPI and Level Zero. The host still
+needs a working Intel GPU driver stack, and the container needs access to the
+DRI devices:
+
+```bash
+docker run --rm -it \
+  --device /dev/dri \
+  -v /path/to/models:/models \
+  -p 8080:8080 \
+  ghcr.io/anbeeld/beellama.cpp:server-sycl \
+  -m /models/model.gguf --port 8080 --host 0.0.0.0 -ngl 999
+```
+
+Set `ONEAPI_DEVICE_SELECTOR=level_zero:<index>` if the host has multiple Intel
+GPU devices and you need to choose one explicitly.
 
 ## Building Docker locally
 

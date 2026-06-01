@@ -173,7 +173,7 @@ docker build -t llama-cpp-sycl --build-arg="GGML_SYCL_F16=ON" --target light -f 
 
 *Notes*:
 
-You can also use the `.devops/llama-server-intel.Dockerfile`, which builds the *"server"* alternative.
+Use `--target server` with `.devops/intel.Dockerfile` to build the *"server"* alternative.
 Check the [documentation for Docker](../docker.md) to see the available images.
 
 ### Run container
