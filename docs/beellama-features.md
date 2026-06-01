@@ -42,7 +42,7 @@ BeeLlama's practical advantage is combination. Public llama.cpp has the main run
 | Draft top-k for DFlash tree | No | No | `--draft-topk` | `--spec-draft-top-k` |
 | Adaptive DFlash depth | No | No | Speculative-code adaptive tracking | Server-side `profit` and `fringe` controllers with `--spec-dm-*` CLI |
 | Sampled DFlash CLI | No | No | No checked CLI surface for draft temperature | `--spec-draft-temp 0`, positive value, or `auto` |
-| Multi-slot DFlash | No | No | Shared DFlash slot machinery | Shared drafter context, slot cap, and flat batched drafting |
+| Multi-slot DFlash | No | No | Shared DFlash slot machinery | Shared drafter context, slot cap, and per-slot cached drafting by default; experimental flat batched drafting behind `GGML_DFLASH_SHARED_DRAFT_BATCH=1` |
 | Multimodal with speculation | Upstream rules | Upstream rules | Speculative decoding disabled under multimodal | Flat DFlash allowed; tree and non-DFlash spec disabled |
 | CopySpec | No checked match | No checked match | Yes | Yes as explicit `--spec-type copyspec` |
 | Suffix/recycle speculation | No checked match | No checked match | Yes | Yes |

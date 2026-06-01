@@ -68,6 +68,14 @@ static bool dflash_verify_padding_enabled() {
     return enabled;
 }
 
+static bool dflash_shared_drafter_batch_enabled() {
+    static const bool enabled = [] {
+        const char * env = getenv("GGML_DFLASH_SHARED_DRAFT_BATCH");
+        return env && env[0] != '\0' && strcmp(env, "0") != 0;
+    }();
+    return enabled;
+}
+
 static bool server_model_is_dflash_drafter(const llama_model * model) {
     return model &&
         llama_model_dflash_block_size(model) > 1 &&
@@ -1981,6 +1989,9 @@ private:
     }
 
     bool dflash_shared_drafter_batch_allowed(int n_drafting) {
+        if (!dflash_shared_drafter_batch_enabled()) {
+            return false;
+        }
         if (n_drafting < 2) {
             return false;
         }

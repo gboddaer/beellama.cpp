@@ -530,6 +530,7 @@ DFlash diagnostic environment variables:
 | `GGML_DFLASH_VERBOSE_CONTRACT=1` | Logs extra drafter/target contract details during DFlash setup. |
 | `GGML_DFLASH_FORCE_CPU_CROSS=1` | Force the CPU hidden-state cross path even when the GPU ring is available. |
 | `GGML_DFLASH_VERIFY_PAD=1` | Re-enable diagnostic verifier padding to the active draft depth. Default is off because padded rows consume target verify time but are not sampled or accepted. |
+| `GGML_DFLASH_SHARED_DRAFT_BATCH=1` | Opt into the experimental shared multi-slot DFlash drafter graph. The default keeps per-slot cached drafting because the shared graph pays the full multi-slot cross-attention window and disables the drafter K/V projection cache. |
 | `GGML_DFLASH_GPU_RING=0` | Disable the GPU cross-attention ring and force the CPU ring path. |
 | `GGML_DFLASH_MULTI_GPU_TAPE=0` | Disable default-on multi-GPU DFlash GPU ring, hidden capture, tape, and replay. Use to force the CPU/eval-callback fallback for split target placement. |
 | `GGML_DFLASH_ALLOW_MULTI_GPU_TAPE=0` | Compatibility spelling for the same multi-GPU DFlash kill switch. |

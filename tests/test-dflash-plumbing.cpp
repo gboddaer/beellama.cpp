@@ -207,6 +207,21 @@ int main(int argc, char ** argv) {
     ok &= expect(server_context.find("mark_mtp_draft_context_seq_rm_supported") == std::string::npos,
         "server must not keep the stale MTP seq_rm helper now that upstream probes ctx_dft directly");
 
+    {
+        const size_t shared_gate = server_context.find("bool dflash_shared_drafter_batch_allowed");
+        const size_t opt_in_env = server_context.find("GGML_DFLASH_SHARED_DRAFT_BATCH");
+        const size_t opt_in_check = server_context.find("dflash_shared_drafter_batch_enabled()", shared_gate);
+        const size_t draft_batch_call = server_context.find("common_speculative_draft_batch", shared_gate);
+
+        ok &= expect(shared_gate != std::string::npos &&
+                     opt_in_env != std::string::npos &&
+                     opt_in_check != std::string::npos &&
+                     draft_batch_call != std::string::npos &&
+                     shared_gate < opt_in_check &&
+                     opt_in_check < draft_batch_call,
+            "flat DFlash shared drafter batching must be explicit opt-in because the multi-slot graph disables the single-slot K/V cache");
+    }
+
     const size_t pretranspose = qwen35moe.find("\"qkv_mixed_pretranspose\"");
     const size_t transpose    = qwen35moe.find("qkv_mixed = ggml_transpose(ctx0, qkv_mixed)");
     const size_t transposed   = qwen35moe.find("cb(qkv_mixed, \"qkv_mixed_transposed\", il)");
