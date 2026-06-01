@@ -1753,7 +1753,7 @@ struct common_speculative_impl_copyspec : public common_speculative_impl {
     }
 
     // incrementally extend index with accepted tokens
-    void update_logits(llama_context * /*ctx*/, const llama_tokens & batch_tokens, int n_accepted) {
+    void update_logits(llama_context * /*ctx*/, const llama_tokens & batch_tokens, int n_accepted) override {
         // batch_tokens = [id_last, draft0, draft1, ...], n_accepted of which were accepted
         for (int i = 0; i < n_accepted && i < (int)batch_tokens.size(); i++) {
             prompt_tokens.push_back(batch_tokens[i]);
@@ -1883,7 +1883,7 @@ struct common_speculative_impl_recycle : public common_speculative_impl {
     void accept(llama_seq_id /*seq_id*/, uint16_t /*n_accepted*/, bool /*is_other*/) override {
     }
 
-    void update_logits(llama_context * ctx, const llama_tokens & batch_tokens, int n_accepted) {
+    void update_logits(llama_context * ctx, const llama_tokens & batch_tokens, int n_accepted) override {
         if (n_vocab == 0) {
             const llama_model * model = llama_get_model(ctx);
             n_vocab = llama_vocab_n_tokens(llama_model_get_vocab(model));
