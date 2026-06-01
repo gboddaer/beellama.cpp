@@ -136,6 +136,14 @@ bool common_dflash_tree_update_requires_cpu_hidden_for_test(
         bool has_cpu_hidden,
         bool has_gpu_ring);
 
+int common_dflash_invalid_reduced_logits_next_streak_for_test(
+        int  current_streak,
+        bool valid_draft);
+
+bool common_dflash_invalid_reduced_logits_fail_closed_for_test(
+        int invalid_streak,
+        int threshold);
+
 struct common_speculative_deleter {
     void operator()(common_speculative * s) { common_speculative_free(s); }
 };

@@ -61,6 +61,39 @@ static inline bool llama_dflash_prefill_plan_needs_staging_for_test(
     return planned_tokens > LLAMA_DFLASH_MAX_VERIFY_TOKENS;
 }
 
+static inline bool llama_dflash_replay_gdn_supported_s_for_test(int64_t s) {
+    return s == 16 || s == 32 || s == 64 || s == 128;
+}
+
+static inline bool llama_dflash_replay_state_shape_valid_for_test(
+        int64_t  s,
+        int64_t  h_v,
+        uint32_t n_embd_s) {
+    if (s <= 0 || h_v <= 0) {
+        return false;
+    }
+
+    const uint64_t max_u64 = (uint64_t) -1;
+    const uint64_t us = (uint64_t) s;
+    const uint64_t uh = (uint64_t) h_v;
+    if (us > max_u64 / us) {
+        return false;
+    }
+    const uint64_t ss = us * us;
+    if (uh > 0 && ss > max_u64 / uh) {
+        return false;
+    }
+
+    return ss * uh == (uint64_t) n_embd_s;
+}
+
+static inline bool llama_dflash_view_span_in_bounds_for_test(
+        uint64_t total_bytes,
+        uint64_t offset_bytes,
+        uint64_t n_bytes) {
+    return offset_bytes <= total_bytes && n_bytes <= total_bytes - offset_bytes;
+}
+
 class llama_memory_recurrent;
 
 struct llama_model;

@@ -79,6 +79,13 @@ static bool dflash_is_cuda_compatible_tensor(const ggml_tensor * t) {
     return name && (std::strncmp(name, "CUDA", 4) == 0 || std::strncmp(name, "ROCm", 4) == 0);
 }
 
+static bool dflash_tensor_span_in_bounds(const ggml_tensor * t, size_t offset_bytes, size_t n_bytes) {
+    return t && llama_dflash_view_span_in_bounds_for_test(
+            (uint64_t) ggml_nbytes(t),
+            (uint64_t) offset_bytes,
+            (uint64_t) n_bytes);
+}
+
 static const char * dflash_backend_dev_type_name(enum ggml_backend_dev_type type) {
     switch (type) {
         case GGML_BACKEND_DEVICE_TYPE_CPU:   return "CPU";
@@ -2110,6 +2117,14 @@ void llama_context::allocate_tape_gpu(int n_slots, int max_tokens) {
     const int64_t H_k = (cparams.fused_gdn_ar && cparams.fused_gdn_ch)
                        ? (int64_t) hparams.ssm_n_group   // 1 (not repeated)
                        : H_v;                             // 8 (repeated)
+    if (!llama_dflash_replay_gdn_supported_s_for_test(S) ||
+            !llama_dflash_replay_state_shape_valid_for_test(S, H_v, hparams.n_embd_s())) {
+        dflash_capture->tapes.clear();
+        LLAMA_LOG_INFO("%s: GPU tape disabled for DFlash recurrent replay shape "
+                "S=%lld H_v=%lld n_embd_s=%u; using eval-callback tape fallback\n",
+                __func__, (long long) S, (long long) H_v, hparams.n_embd_s());
+        return;
+    }
 
     dflash_capture->tapes.clear();
     dflash_capture->tapes.reserve(n_slots);
@@ -2705,6 +2720,7 @@ void llama_context::tape_replay(llama_seq_id seq_id, int n_accepted) {
         };
         std::vector<replay_input> inputs;
         inputs.reserve(n_rec);
+        bool replay_graph_unsafe = false;
 
         for (int li = 0; li < n_rec; ++li) {
             int il = rec_ids[li];
@@ -2721,6 +2737,21 @@ void llama_context::tape_replay(llama_seq_id seq_id, int n_accepted) {
                 S   = tape.S_k;
                 H_k = tape.H_k;
                 H_v = tape.H_v;
+            }
+
+            if (S <= 0 || H_k <= 0 || H_v <= 0) {
+                continue;
+            }
+
+            if (!llama_dflash_replay_gdn_supported_s_for_test(S) ||
+                    !llama_dflash_replay_state_shape_valid_for_test(S, H_v, n_embd_s)) {
+                LLAMA_LOG_WARN("%s: DFlash recurrent replay view out of bounds or unsupported shape "
+                        "(layer=%d S=%lld H_v=%lld n_embd_s=%u use_gpu_tape=%d); %s\n",
+                        __func__, il, (long long) S, (long long) H_v, n_embd_s,
+                        use_gpu_tape ? 1 : 0,
+                        use_gpu_tape ? "skipping GPU replay" : "falling back to CPU replay");
+                replay_graph_unsafe = true;
+                break;
             }
 
             ggml_tensor * k_in, * v_in, * g_in, * b_in;
@@ -2755,7 +2786,23 @@ void llama_context::tape_replay(llama_seq_id seq_id, int n_accepted) {
 
             // state view: reads directly from recurrent memory GPU buffer (zero-copy)
             ggml_tensor * s_tensor = mem_recurrent->s_l[il];
+            if (!s_tensor) {
+                LLAMA_LOG_WARN("%s: missing recurrent state tensor for DFlash replay layer=%d; %s\n",
+                        __func__, il, use_gpu_tape ? "skipping GPU replay" : "falling back to CPU replay");
+                replay_graph_unsafe = true;
+                break;
+            }
+            const size_t state_bytes = (size_t) n_embd_s * ggml_element_size(s_tensor);
             size_t s_byte_offset = (size_t)cell_idx * n_embd_s * ggml_element_size(s_tensor);
+            if (!dflash_tensor_span_in_bounds(s_tensor, s_byte_offset, state_bytes)) {
+                LLAMA_LOG_WARN("%s: DFlash recurrent replay view out of bounds "
+                        "(layer=%d tensor_bytes=%zu offset=%zu bytes=%zu cell=%d n_embd_s=%u); %s\n",
+                        __func__, il, s_tensor ? ggml_nbytes(s_tensor) : (size_t) 0,
+                        s_byte_offset, state_bytes, cell_idx, n_embd_s,
+                        use_gpu_tape ? "skipping GPU replay" : "falling back to CPU replay");
+                replay_graph_unsafe = true;
+                break;
+            }
             ggml_tensor * s_view = ggml_view_4d(ctx, s_tensor, S, S, H_v, (int64_t)1,
                 S * ggml_element_size(s_tensor),
                 S * S * ggml_element_size(s_tensor),
@@ -2767,6 +2814,16 @@ void llama_context::tape_replay(llama_seq_id seq_id, int n_accepted) {
 
             // extract state from result (layout: [attn_output | new_state])
             size_t attn_bytes = (size_t)(S * H_v * n_accepted) * ggml_element_size(result);
+            const size_t result_state_bytes = (size_t) n_embd_s * ggml_element_size(result);
+            if (!dflash_tensor_span_in_bounds(result, attn_bytes, result_state_bytes)) {
+                LLAMA_LOG_WARN("%s: DFlash recurrent replay view out of bounds "
+                        "(layer=%d result_bytes=%zu offset=%zu bytes=%zu S=%lld H_v=%lld n_accepted=%d); %s\n",
+                        __func__, il, ggml_nbytes(result), attn_bytes, result_state_bytes,
+                        (long long) S, (long long) H_v, n_accepted,
+                        use_gpu_tape ? "skipping GPU replay" : "falling back to CPU replay");
+                replay_graph_unsafe = true;
+                break;
+            }
             ggml_tensor * result_state = ggml_view_1d(ctx, result, n_embd_s, attn_bytes);
 
             // write-back view: points to same location in s_l[il]
@@ -2777,6 +2834,16 @@ void llama_context::tape_replay(llama_seq_id seq_id, int n_accepted) {
             ggml_build_forward_expand(graph, cpy);
 
             inputs.push_back({ q_in, k_in, v_in, g_in, b_in, (size_t)li });
+        }
+
+        if (replay_graph_unsafe) {
+            ggml_free(ctx);
+            if (!use_gpu_tape) {
+                tape_replay_cpu(mem_recurrent, cell_idx, n_accepted);
+                tape_replay_conv(mem_recurrent, cell_idx, n_accepted, seq_id);
+                return;
+            }
+            goto conv_rebuild;
         }
 
         if (inputs.empty()) {
@@ -2953,8 +3020,15 @@ bool llama_context::tape_replay_gdn_direct_gpu(llama_memory_recurrent * mem_recu
         if (!(S_i64 == 16 || S_i64 == 32 || S_i64 == 64 || S_i64 == 128)) {
             return false;
         }
+        if (!llama_dflash_replay_state_shape_valid_for_test(S_i64, H_v_i64, n_embd_s)) {
+            return false;
+        }
 
         const size_t s_offset = (size_t) cell_idx * n_embd_s * ggml_element_size(s_tensor);
+        const size_t state_bytes = (size_t) n_embd_s * ggml_element_size(s_tensor);
+        if (!dflash_tensor_span_in_bounds(s_tensor, s_offset, state_bytes)) {
+            return false;
+        }
         launches.push_back({
             (char *) s_tensor->data + s_offset,
             tl.k->data,
@@ -3159,6 +3233,12 @@ bool llama_context::tape_replay_gdn_direct_from_cpu_tape(llama_memory_recurrent 
         ggml_backend_tensor_set(upload.beta, tape.beta.data(), 0, gb_elems * sizeof(float));
 
         const size_t s_offset = (size_t) cell_idx * n_embd_s * ggml_element_size(s_tensor);
+        const size_t state_bytes = (size_t) n_embd_s * ggml_element_size(s_tensor);
+        if (!dflash_tensor_span_in_bounds(s_tensor, s_offset, state_bytes)) {
+            uploads.push_back(upload);
+            cleanup();
+            return false;
+        }
         upload.state = (char *) s_tensor->data + s_offset;
         upload.S = (int) S_i64;
         upload.H_k = (int) H_k_i64;
@@ -3790,7 +3870,18 @@ void llama_context::tape_replay_cpu(llama_memory_recurrent * mem_recurrent, int3
         }
 
         ggml_tensor * s_tensor = mem_recurrent->s_l[il];
+        if (!s_tensor) {
+            continue;
+        }
         const size_t s_offset = (size_t)cell_idx * n_embd_s * ggml_element_size(s_tensor);
+        const size_t state_bytes = (size_t) n_embd_s * ggml_element_size(s_tensor);
+        if (!dflash_tensor_span_in_bounds(s_tensor, s_offset, state_bytes)) {
+            LLAMA_LOG_WARN("%s: DFlash CPU recurrent replay state span out of bounds "
+                    "(layer=%d tensor_bytes=%zu offset=%zu bytes=%zu cell=%d n_embd_s=%u)\n",
+                    __func__, il, s_tensor ? ggml_nbytes(s_tensor) : (size_t) 0,
+                    s_offset, state_bytes, cell_idx, n_embd_s);
+            continue;
+        }
         std::vector<float> state(n_embd_s);
         ggml_backend_tensor_get(s_tensor, state.data(), s_offset, n_embd_s * sizeof(float));
 

@@ -14,8 +14,10 @@
 
 #include <algorithm>
 #include <cassert>
+#include <climits>
 #include <cstring>
 #include <iomanip>
+#include <limits>
 #include <map>
 #include <unordered_map>
 #include <cmath>
@@ -187,6 +189,24 @@ static void common_dflash_align_drafter_seq_or_clear(
 static bool common_dflash_argmax_token_valid(int32_t token_id, int n_vocab) {
     return token_id >= 0 && token_id < n_vocab;
 }
+
+static int common_dflash_invalid_reduced_logits_next_streak(
+        int  current_streak,
+        bool valid_draft) {
+    if (valid_draft) {
+        return 0;
+    }
+
+    return current_streak < INT_MAX ? current_streak + 1 : current_streak;
+}
+
+static bool common_dflash_invalid_reduced_logits_fail_closed(
+        int invalid_streak,
+        int threshold) {
+    return threshold > 0 && invalid_streak >= threshold;
+}
+
+static constexpr int DFLASH_INVALID_REDUCED_LOGITS_FAIL_CLOSED_STREAK = 4;
 
 static bool common_dflash_argmax_shape_valid(
         const char * where,
@@ -2075,9 +2095,52 @@ struct common_speculative_impl_dflash : public common_speculative_impl {
     std::vector<int32_t> capture_layers;
     bool target_capture_enabled = true;
     bool gpu_capture_available = false;
+    int  invalid_reduced_logits_streak = 0;
+    bool invalid_reduced_logits_fail_closed = false;
 
     bool profile_enabled(uint32_t flags) const {
         return dflash_profile_has(profile_flags, flags);
+    }
+
+    void reset_invalid_reduced_logits_state() {
+        invalid_reduced_logits_streak = 0;
+        invalid_reduced_logits_fail_closed = false;
+    }
+
+    void note_valid_reduced_logits_draft() {
+        reset_invalid_reduced_logits_state();
+    }
+
+    void note_invalid_reduced_logits(
+            const char * where,
+            int32_t token_raw,
+            int row,
+            int rows,
+            int top_k,
+            int committed,
+            int cross_len,
+            int spec_idx,
+            int offset,
+            float score) {
+        invalid_reduced_logits_streak = common_dflash_invalid_reduced_logits_next_streak(
+                invalid_reduced_logits_streak, false);
+
+        LOG_ERR("dflash: invalid reduced-logits token %d in %s at row=%d/%d "
+                "(top_k=%d committed=%d cross_len=%d ring_filled=%d ring_write_pos=%d "
+                "gpu_ring=%d cpu_ring_valid=%d invalid_reduced_logits_streak=%d score=%g spec=%d offset=%d)\n",
+                token_raw, where && where[0] ? where : "draft", row, rows, top_k,
+                committed, cross_len, ring_filled, ring_write_pos,
+                gpu_ring_handle ? 1 : 0, cpu_ring_valid ? 1 : 0,
+                invalid_reduced_logits_streak, (double) score, spec_idx, offset);
+
+        if (common_dflash_invalid_reduced_logits_fail_closed(
+                    invalid_reduced_logits_streak,
+                    DFLASH_INVALID_REDUCED_LOGITS_FAIL_CLOSED_STREAK)) {
+            invalid_reduced_logits_fail_closed = true;
+            LOG_ERR("dflash: fail-closed after %d consecutive invalid reduced-logits drafts; "
+                    "skipping DFlash drafting until the cross-ring state is reset\n",
+                    invalid_reduced_logits_streak);
+        }
     }
 
     void discard_cross_ring(const char * reason) {
@@ -2096,6 +2159,7 @@ struct common_speculative_impl_dflash : public common_speculative_impl {
         prefill_suffix_seen = false;
         deferred_drafter_kv_tokens = 0;
         ring_write_discarded = true;
+        reset_invalid_reduced_logits_state();
         cross_buf.clear();
         common_dflash_reset_drafter_seq_and_kv_cache(ctx_dft, seq_id, reason);
     }
@@ -2556,6 +2620,9 @@ struct common_speculative_impl_dflash : public common_speculative_impl {
         if (committed_len == 0) {
             return -1;
         }
+        if (invalid_reduced_logits_fail_closed) {
+            return -1;
+        }
 
         flush_deferred_drafter_kv_cache("batched draft");
         return build_cross_data(ctx_dft_ext);
@@ -2582,6 +2649,7 @@ struct common_speculative_impl_dflash : public common_speculative_impl {
             prefill_flush_requested = 0;
             prefill_flush_written = 0;
             prefill_suffix_seen = false;
+            reset_invalid_reduced_logits_state();
             llama_dflash_prefill_capture_end(ctx_tgt);
             return;
         }
@@ -2917,6 +2985,9 @@ struct common_speculative_impl_dflash : public common_speculative_impl {
             if (committed_len == 0) {
                 continue;
             }
+            if (invalid_reduced_logits_fail_closed) {
+                continue;
+            }
 
             const int64_t t0 = ggml_time_us();
 
@@ -2984,8 +3055,9 @@ struct common_speculative_impl_dflash : public common_speculative_impl {
                         }
                         const int32_t token_raw = argmax[i * K_flat];
                         if (!common_dflash_argmax_token_valid(token_raw, n_vocab)) {
-                            LOG_ERR("dflash: invalid reduced-logits token %d in %s at row=%d/%d (top_k=%d committed=%d cross_len=%d)\n",
-                                    token_raw, __func__, i, batch_len, K_flat, committed_len, cross_len);
+                            const float score = argmax_probs ? argmax_probs[i * K_flat] : std::numeric_limits<float>::quiet_NaN();
+                            note_invalid_reduced_logits(__func__, token_raw, i, batch_len, K_flat,
+                                    committed_len, cross_len, -1, 0, score);
                             if (dp.draft_log_probs) {
                                 dp.draft_log_probs->clear();
                             }
@@ -3018,6 +3090,9 @@ struct common_speculative_impl_dflash : public common_speculative_impl {
             const int64_t t4 = ggml_time_us();
 
             n_draft_last = (int) result.size();
+            if (!result.empty()) {
+                note_valid_reduced_logits_draft();
+            }
 
             if (profile_enabled(DFLASH_PROFILE_SUMMARY)) {
                 const llama_perf_context_data perf_dft = llama_perf_context(ctx_dft);
@@ -3046,6 +3121,9 @@ struct common_speculative_impl_dflash : public common_speculative_impl {
             common_speculative_tree         & tree) override {
         const int n_draft = std::min((int) params.n_max, block_size - 1);
         if (n_draft <= 0 || committed_len == 0) {
+            return;
+        }
+        if (invalid_reduced_logits_fail_closed) {
             return;
         }
 
@@ -3127,8 +3205,9 @@ struct common_speculative_impl_dflash : public common_speculative_impl {
             for (int d = 1; d <= depth_limit && d <= main_path_len && tree.n_nodes < tree_budget; ++d) {
                 const int32_t token_raw = argmax[d * K];
                 if (!common_dflash_argmax_token_valid(token_raw, n_vocab)) {
-                    LOG_ERR("dflash tree: invalid reduced-logits token %d in %s at depth=%d/%d (top_k=%d)\n",
-                            token_raw, __func__, d, depth_limit, K);
+                    const float score = argmax_probs ? argmax_probs[d * K] : std::numeric_limits<float>::quiet_NaN();
+                    note_invalid_reduced_logits(__func__, token_raw, d, depth_limit, K,
+                            committed_len, cross_len, -1, 0, score);
                     break;
                 }
 
@@ -3225,6 +3304,10 @@ struct common_speculative_impl_dflash : public common_speculative_impl {
         }
 
         // build visibility matrix [(n_nodes+1) × (n_nodes+1)]
+        if (tree.n_nodes > 0) {
+            note_valid_reduced_logits_draft();
+        }
+
         int n = tree.n_nodes + 1;
         tree.visibility.assign(n * n, false);
         tree.visibility[0] = true; // root sees itself
@@ -3536,6 +3619,7 @@ private:
             ring_write_pos = 0;
             ring_filled = 0;
             committed_len = 0;
+            reset_invalid_reduced_logits_state();
             return;
         }
 
@@ -3556,6 +3640,7 @@ private:
         ring_write_pos = 0;
         ring_filled = 0;
         deferred_drafter_kv_tokens = 0;
+        reset_invalid_reduced_logits_state();
         common_dflash_reset_drafter_seq_and_kv_cache(ctx_dft, seq_id, "capture target hiddens");
         const int actual_written = ring_write(to_store, start_offset, true);
         if (ring_write_discarded) {
@@ -4148,6 +4233,18 @@ bool common_dflash_tree_update_requires_cpu_hidden_for_test(
     return !has_cpu_hidden && has_gpu_ring;
 }
 
+int common_dflash_invalid_reduced_logits_next_streak_for_test(
+        int  current_streak,
+        bool valid_draft) {
+    return common_dflash_invalid_reduced_logits_next_streak(current_streak, valid_draft);
+}
+
+bool common_dflash_invalid_reduced_logits_fail_closed_for_test(
+        int invalid_streak,
+        int threshold) {
+    return common_dflash_invalid_reduced_logits_fail_closed(invalid_streak, threshold);
+}
+
 // ============================================================================
 // Fork-specific init and dispatch functions
 // ============================================================================
@@ -4540,8 +4637,10 @@ void common_speculative_draft_batch(
                 }
                 const int32_t token_raw = argmax[(offset + i) * K_flat];
                 if (!common_dflash_argmax_token_valid(token_raw, n_vocab)) {
-                    LOG_ERR("dflash batch: invalid reduced-logits token %d in %s at spec=%d row=%d/%d (top_k=%d offset=%d)\n",
-                            token_raw, __func__, rs.spec_idx, i, batch_len, K_flat, offset);
+                    const float score = argmax_probs ? argmax_probs[(offset + i) * K_flat] : std::numeric_limits<float>::quiet_NaN();
+                    auto * dfl = static_cast<common_speculative_impl_dflash *>(rs.impl);
+                    dfl->note_invalid_reduced_logits(__func__, token_raw, i, batch_len, K_flat,
+                            rs.draft_pos_base, rs.cross_len, rs.spec_idx, offset, score);
                     if (log_probs) {
                         log_probs->clear();
                     }
@@ -4579,6 +4678,7 @@ void common_speculative_draft_batch(
             }
         }
         if (!result.empty()) {
+            dfl->note_valid_reduced_logits_draft();
             rs.impl->n_gen_drafts++;
             rs.impl->n_gen_tokens += result.size();
             specs[rs.spec_idx]->curr_impl = rs.impl;

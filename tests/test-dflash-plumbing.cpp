@@ -242,6 +242,22 @@ int main(int argc, char ** argv) {
                  count_occurrences(context_cpp, "dflash_gpu_hidden_span_in_bounds(") >= 3 &&
                  context_cpp.find("src_offset_bytes + n_bytes <= ggml_nbytes(tensor)") != std::string::npos,
         "DFlash GPU hidden ring writes must byte-check tensor spans before D2D/readback to avoid backend read OOB asserts");
+    ok &= expect(llama_dflash_replay_gdn_supported_s_for_test(16) &&
+                 llama_dflash_replay_gdn_supported_s_for_test(128) &&
+                 !llama_dflash_replay_gdn_supported_s_for_test(256),
+        "DFlash replay must know which CUDA GDN state sizes are supported before building replay graphs");
+    ok &= expect(llama_dflash_replay_state_shape_valid_for_test(128, 8, 128 * 128 * 8) &&
+                 !llama_dflash_replay_state_shape_valid_for_test(128, 8, 128 * 128 * 8 + 1),
+        "DFlash replay must verify S*S*H_v matches recurrent state size before creating state views");
+    ok &= expect(llama_dflash_view_span_in_bounds_for_test(1024, 512, 512) &&
+                 !llama_dflash_view_span_in_bounds_for_test(1024, 513, 512),
+        "DFlash replay must validate tensor byte spans before creating ggml views");
+    ok &= expect(context_cpp.find("DFlash recurrent replay view out of bounds") != std::string::npos &&
+                 context_cpp.find("llama_dflash_view_span_in_bounds_for_test") != std::string::npos,
+        "DFlash recurrent replay must guard result/state ggml views instead of relying on ggml assertions");
+    ok &= expect(cuda_argmax.find("argmax < 0") != std::string::npos &&
+                 cuda_argmax.find("dst[nrows + row]") != std::string::npos,
+        "CUDA reduced-logits argmax must not read rowx[-1] when every row candidate is invalid");
     ok &= expect(context_cpp.find("cparams.ctx_type == LLAMA_CONTEXT_TYPE_MTP && has_token && has_embd") != std::string::npos,
         "decode must allow MTP draft batches to carry both token ids and target hidden embeddings");
     ok &= expect(context_cpp.find("/*.ctx_type =*/ cparams.ctx_type") != std::string::npos,
@@ -1890,6 +1906,18 @@ int main(int argc, char ** argv) {
         "CPU hidden available: indexed writer can proceed");
     ok &= expect(!common_dflash_tree_update_requires_cpu_hidden_for_test(false, false),
         "No GPU ring: CPU fallback world, not the GPU-only hazard");
+    ok &= expect(common_dflash_invalid_reduced_logits_next_streak_for_test(0, false) == 1 &&
+                 common_dflash_invalid_reduced_logits_next_streak_for_test(3, false) == 4 &&
+                 common_dflash_invalid_reduced_logits_next_streak_for_test(3, true) == 0,
+        "invalid reduced-logits streak must count consecutive failures and reset on a valid draft");
+    ok &= expect(!common_dflash_invalid_reduced_logits_fail_closed_for_test(3, 4) &&
+                 common_dflash_invalid_reduced_logits_fail_closed_for_test(4, 4),
+        "invalid reduced-logits streak must fail closed once the threshold is reached");
+    ok &= expect(speculative.find("invalid_reduced_logits_streak") != std::string::npos &&
+                 speculative.find("fail-closed") != std::string::npos &&
+                 speculative.find("invalid reduced-logits token") != std::string::npos &&
+                 speculative.find("ring_filled") != std::string::npos,
+        "DFlash invalid reduced-logits logs must carry enough ring context and then fail closed");
 
     // DFlash draft depth must have one source of truth: server adaptive DM.
     ok &= expect(arg_cpp.find("--spec-dflash-fixed-depth") == std::string::npos &&

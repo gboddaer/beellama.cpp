@@ -203,6 +203,14 @@ static __global__ void argmax_f32(
     if (warp_id == 0 && lane_id == 0) {
         dst[row] = argmax;
 
+        if (argmax < 0 || argmax >= ncols) {
+            const float invalid_score = -FLT_MAX;
+            int32_t invalid_bits;
+            memcpy(&invalid_bits, &invalid_score, sizeof(float));
+            dst[nrows + row] = invalid_bits;
+            return;
+        }
+
         if (output_logprob) {
             // log_prob = logits[argmax] * inv_temp - (logit_max + log(sum_exp))
             float log_prob = rowx[argmax] * inv_temp - logit_max - logf(sum_exp);
