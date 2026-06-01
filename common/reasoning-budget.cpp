@@ -285,3 +285,24 @@ size_t common_reasoning_budget_forced_token_count(const struct llama_sampler * s
     const auto * ctx = (const common_reasoning_budget_ctx *) smpl->ctx;
     return ctx->forced_tokens.size();
 }
+
+bool common_reasoning_budget_force(struct llama_sampler * smpl) {
+    if (!smpl) {
+        return false;
+    }
+
+    auto * ctx = (common_reasoning_budget_ctx *) smpl->ctx;
+
+    // only a sampler that is actively counting down the budget may be forced;
+    // any other state (idle, already forcing/waiting, or done) is left untouched
+    if (ctx->state != REASONING_BUDGET_COUNTING) {
+        return false;
+    }
+
+    ctx->state = REASONING_BUDGET_FORCING;
+    ctx->force_pos = 0;
+    ctx->end_matcher.reset();
+    LOG_INF("reasoning-budget: forced into forcing state (manual transition)\n");
+
+    return true;
+}

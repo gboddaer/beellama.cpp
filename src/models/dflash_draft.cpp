@@ -1,4 +1,5 @@
 #include "models.h"
+#include "llama-impl.h"
 #include "llama-kv-cache.h"
 #include "llama-kv-cache-iswa.h"
 
@@ -134,6 +135,23 @@ static int64_t dflash_draft_ctx_len(const llama_cross * cross, const llama_cpara
     }
 
     return (int64_t) n_slots * per_slot_ctx;
+}
+
+template <typename Fn>
+static void dflash_fill_kq_mask(ggml_tensor * mask, const Fn & fn) {
+    GGML_ASSERT(ggml_backend_buffer_is_host(mask->buffer));
+
+    if (mask->type == GGML_TYPE_F16) {
+        fn((ggml_fp16_t *) mask->data);
+    } else {
+        GGML_ASSERT(mask->type == GGML_TYPE_F32);
+        fn((float *) mask->data);
+    }
+}
+
+template <typename T>
+static void dflash_set_mask_value(T * data, int64_t index, float value) {
+    data[index] = llama_cast<T>(value);
 }
 
 static ggml_tensor * dflash_mul_mat_aux(
@@ -551,41 +569,38 @@ void llm_graph_input_dflash::set_input(const llama_ubatch * ubatch) {
         }
 
         if (kq_mask && kq_mask->buffer) {
-            GGML_ASSERT(ggml_backend_buffer_is_host(kq_mask->buffer));
-            float * data = (float *) kq_mask->data;
-            const int64_t n_kv = ctx_len + n_block;
-            for (int64_t q = 0; q < n_block; ++q) {
-                for (int64_t k = 0; k < n_kv; ++k) {
-                    if (k >= n_real && k < ctx_len) {
-                        data[q * n_kv + k] = -INFINITY;
-                    } else {
-                        data[q * n_kv + k] = 0.0f;
+            dflash_fill_kq_mask(kq_mask, [&](auto * data) {
+                const int64_t n_kv = ctx_len + n_block;
+                for (int64_t q = 0; q < n_block; ++q) {
+                    for (int64_t k = 0; k < n_kv; ++k) {
+                        const float v = (k >= n_real && k < ctx_len) ? -INFINITY : 0.0f;
+                        dflash_set_mask_value(data, q * n_kv + k, v);
                     }
                 }
-            }
+            });
         }
 
         if (kq_mask_swa && kq_mask_swa->buffer && n_swa > 0) {
-            GGML_ASSERT(ggml_backend_buffer_is_host(kq_mask_swa->buffer));
-            float * data = (float *) kq_mask_swa->data;
-            const int64_t n_kv   = ctx_len + n_block;
-            const int32_t window = (int32_t) n_swa;
-            for (int64_t q = 0; q < n_block; ++q) {
-                const int32_t q_pos = have_pos ? (int32_t) ubatch->pos[q] : (ctx_pos_base + (int32_t) n_real + (int32_t) q);
-                for (int64_t k = 0; k < n_kv; ++k) {
-                    float v = 0.0f;
-                    if (k < n_real) {
-                        const int32_t k_pos = ctx_pos_base + (int32_t) k;
-                        if (q_pos - k_pos >= window) v = -INFINITY;
-                    } else if (k < ctx_len) {
-                        v = -INFINITY;
-                    } else {
-                        const int64_t b_k = k - ctx_len;
-                        if (b_k > q) v = -INFINITY;
+            dflash_fill_kq_mask(kq_mask_swa, [&](auto * data) {
+                const int64_t n_kv   = ctx_len + n_block;
+                const int32_t window = (int32_t) n_swa;
+                for (int64_t q = 0; q < n_block; ++q) {
+                    const int32_t q_pos = have_pos ? (int32_t) ubatch->pos[q] : (ctx_pos_base + (int32_t) n_real + (int32_t) q);
+                    for (int64_t k = 0; k < n_kv; ++k) {
+                        float v = 0.0f;
+                        if (k < n_real) {
+                            const int32_t k_pos = ctx_pos_base + (int32_t) k;
+                            if (q_pos - k_pos >= window) v = -INFINITY;
+                        } else if (k < ctx_len) {
+                            v = -INFINITY;
+                        } else {
+                            const int64_t b_k = k - ctx_len;
+                            if (b_k > q) v = -INFINITY;
+                        }
+                        dflash_set_mask_value(data, q * n_kv + k, v);
                     }
-                    data[q * n_kv + k] = v;
                 }
-            }
+            });
         }
     } else {
         // === Multi-slot batched draft path ===
@@ -724,60 +739,60 @@ void llm_graph_input_dflash::set_input(const llama_ubatch * ubatch) {
         // kq_mask: per-slot isolation — query in slot S sees only slot S's
         // cross keys (real only) and slot S's block keys (causal).
         if (kq_mask && kq_mask->buffer) {
-            GGML_ASSERT(ggml_backend_buffer_is_host(kq_mask->buffer));
-            float * data = (float *) kq_mask->data;
-            const int64_t n_kv = ctx_len + n_block;
-            for (int64_t q = 0; q < n_block; q++) {
-                const int qs = (int)(q / n_seq_tokens);
-                const int ql = (int)(q % n_seq_tokens);
-                const int64_t nc = slot_n_copy[qs];
-                for (int64_t k = 0; k < n_kv; k++) {
-                    float v = -INFINITY;
-                    if (k < ctx_len) {
-                        const int ks = (int)(k / per_slot_ctx);
-                        const int kl = (int)(k % per_slot_ctx);
-                        if (ks == qs && kl < nc) { v = 0.0f; }
-                    } else {
-                        const int bi = (int)(k - ctx_len);
-                        const int ks = bi / n_seq_tokens;
-                        const int kl = bi % n_seq_tokens;
-                        if (ks == qs && kl <= ql) { v = 0.0f; }
+            dflash_fill_kq_mask(kq_mask, [&](auto * data) {
+                const int64_t n_kv = ctx_len + n_block;
+                for (int64_t q = 0; q < n_block; q++) {
+                    const int qs = (int)(q / n_seq_tokens);
+                    const int ql = (int)(q % n_seq_tokens);
+                    const int64_t nc = slot_n_copy[qs];
+                    for (int64_t k = 0; k < n_kv; k++) {
+                        float v = -INFINITY;
+                        if (k < ctx_len) {
+                            const int ks = (int)(k / per_slot_ctx);
+                            const int kl = (int)(k % per_slot_ctx);
+                            if (ks == qs && kl < nc) { v = 0.0f; }
+                        } else {
+                            const int bi = (int)(k - ctx_len);
+                            const int ks = bi / n_seq_tokens;
+                            const int kl = bi % n_seq_tokens;
+                            if (ks == qs && kl <= ql) { v = 0.0f; }
+                        }
+                        dflash_set_mask_value(data, q * n_kv + k, v);
                     }
-                    data[q * n_kv + k] = v;
                 }
-            }
+            });
         }
 
         // kq_mask_swa: per-slot isolation + sliding window on cross keys
         if (kq_mask_swa && kq_mask_swa->buffer && n_swa > 0) {
-            GGML_ASSERT(ggml_backend_buffer_is_host(kq_mask_swa->buffer));
-            float * data = (float *) kq_mask_swa->data;
-            const int64_t n_kv   = ctx_len + n_block;
-            const int32_t window = (int32_t) n_swa;
-            for (int64_t q = 0; q < n_block; q++) {
-                const int qs = (int)(q / n_seq_tokens);
-                const int ql = (int)(q % n_seq_tokens);
-                const int64_t nc = slot_n_copy[qs];
-                const int64_t full_nr = slot_info[qs].n_real > 0 ? slot_info[qs].n_real : 0;
-                const int32_t q_pos = have_pos ? (int32_t) ubatch->pos[q] : (slot_ctx_pos_base[qs] + (int32_t) full_nr + ql);
-                for (int64_t k = 0; k < n_kv; k++) {
-                    float v = -INFINITY;
-                    if (k < ctx_len) {
-                        const int ks = (int)(k / per_slot_ctx);
-                        const int kl = (int)(k % per_slot_ctx);
-                        const int32_t k_pos = slot_ctx_pos_base[ks] + kl;
-                        if (ks == qs && kl < nc && q_pos - k_pos < window) {
-                            v = 0.0f;
+            dflash_fill_kq_mask(kq_mask_swa, [&](auto * data) {
+                const int64_t n_kv   = ctx_len + n_block;
+                const int32_t window = (int32_t) n_swa;
+                for (int64_t q = 0; q < n_block; q++) {
+                    const int qs = (int)(q / n_seq_tokens);
+                    const int ql = (int)(q % n_seq_tokens);
+                    const int64_t nc = slot_n_copy[qs];
+                    const int64_t full_nr = slot_info[qs].n_real > 0 ? slot_info[qs].n_real : 0;
+                    const int32_t q_pos = have_pos ? (int32_t) ubatch->pos[q] : (slot_ctx_pos_base[qs] + (int32_t) full_nr + ql);
+                    for (int64_t k = 0; k < n_kv; k++) {
+                        float v = -INFINITY;
+                        if (k < ctx_len) {
+                            const int ks = (int)(k / per_slot_ctx);
+                            const int kl = (int)(k % per_slot_ctx);
+                            const int32_t k_pos = slot_ctx_pos_base[ks] + kl;
+                            if (ks == qs && kl < nc && q_pos - k_pos < window) {
+                                v = 0.0f;
+                            }
+                        } else {
+                            const int bi = (int)(k - ctx_len);
+                            const int ks = bi / n_seq_tokens;
+                            const int kl = bi % n_seq_tokens;
+                            if (ks == qs && kl <= ql) { v = 0.0f; }
                         }
-                    } else {
-                        const int bi = (int)(k - ctx_len);
-                        const int ks = bi / n_seq_tokens;
-                        const int kl = bi % n_seq_tokens;
-                        if (ks == qs && kl <= ql) { v = 0.0f; }
+                        dflash_set_mask_value(data, q * n_kv + k, v);
                     }
-                    data[q * n_kv + k] = v;
                 }
-            }
+            });
         }
     }
 }
@@ -828,19 +843,16 @@ llm_build_dflash_draft::llm_build_dflash_draft(
     cb(inp_dflash->pos_q_rebased, "dflash_pos_q_rebased", -1);
 
     // asymmetric non-causal mask [n_kv_total, n_tokens, 1, 1] — full-attention layers
-    inp_dflash->kq_mask = ggml_new_tensor_4d(ctx0, GGML_TYPE_F32, n_kv_total, n_tokens, 1, 1);
+    const ggml_type type_mask = cparams.flash_attn ? GGML_TYPE_F16 : GGML_TYPE_F32;
+    inp_dflash->kq_mask = ggml_new_tensor_4d(ctx0, type_mask, n_kv_total, n_tokens, 1, 1);
     ggml_set_input(inp_dflash->kq_mask);
-    inp_dflash->kq_mask_cnv = cparams.flash_attn
-        ? ggml_cast(ctx0, inp_dflash->kq_mask, GGML_TYPE_F16)
-        : inp_dflash->kq_mask;
+    inp_dflash->kq_mask_cnv = inp_dflash->kq_mask;
 
     if (need_swa_mask) {
-        inp_dflash->kq_mask_swa = ggml_new_tensor_4d(ctx0, GGML_TYPE_F32, n_kv_total, n_tokens, 1, 1);
+        inp_dflash->kq_mask_swa = ggml_new_tensor_4d(ctx0, type_mask, n_kv_total, n_tokens, 1, 1);
         ggml_set_input(inp_dflash->kq_mask_swa);
         cb(inp_dflash->kq_mask_swa, "dflash_kq_mask_swa", -1);
-        inp_dflash->kq_mask_swa_cnv = cparams.flash_attn
-            ? ggml_cast(ctx0, inp_dflash->kq_mask_swa, GGML_TYPE_F16)
-            : inp_dflash->kq_mask_swa;
+        inp_dflash->kq_mask_swa_cnv = inp_dflash->kq_mask_swa;
     }
 
     ggml_tensor * kq_mask_full  = inp_dflash->kq_mask_cnv;

@@ -586,6 +586,85 @@ static std::string server_loop_guard_reason_to_string(const server_loop_guard_re
 
 constexpr int HTTP_POLLING_SECONDS = 1;
 
+static uint32_t server_n_outputs_max(const common_params & params) {
+    const uint32_t n_batch  = params.n_batch;
+
+    if (params.embedding ||
+            (params.pooling_type != LLAMA_POOLING_TYPE_UNSPECIFIED && params.pooling_type != LLAMA_POOLING_TYPE_NONE)) {
+        return n_batch;
+    }
+
+    uint32_t n_outputs_per_seq = 1;
+    const auto spec_n_max = [](int32_t n) -> uint32_t {
+        return (uint32_t) std::max(0, n);
+    };
+    const auto dflash_outputs_per_seq = [&]() -> uint32_t {
+        const uint32_t n_max_base = spec_n_max(params.speculative.n_max_base > 0 ?
+                params.speculative.n_max_base : params.speculative.n_max);
+        uint32_t n_nodes = spec_n_max(params.speculative.n_max);
+
+        if (params.speculative.branch_budget > 0 && n_max_base > 0) {
+            const uint32_t topk = (uint32_t) std::max(1, params.speculative.draft_topk);
+            const uint32_t tree_budget = std::min<uint32_t>(
+                    n_max_base + spec_n_max(params.speculative.branch_budget),
+                    n_max_base * topk);
+            n_nodes = std::max(n_nodes, tree_budget);
+        }
+
+        return 1 + n_nodes;
+    };
+
+    for (const auto type : params.speculative.types) {
+        switch (type) {
+            case COMMON_SPECULATIVE_TYPE_DRAFT_SIMPLE:
+            case COMMON_SPECULATIVE_TYPE_DRAFT_EAGLE3:
+            case COMMON_SPECULATIVE_TYPE_DRAFT_MTP:
+                n_outputs_per_seq = std::max<uint32_t>(n_outputs_per_seq, 1 + std::max(0, params.speculative.draft.n_max));
+                break;
+            case COMMON_SPECULATIVE_TYPE_NGRAM_SIMPLE:
+                n_outputs_per_seq = std::max<uint32_t>(n_outputs_per_seq, 1 + params.speculative.ngram_simple.size_m);
+                break;
+            case COMMON_SPECULATIVE_TYPE_NGRAM_MAP_K:
+                n_outputs_per_seq = std::max<uint32_t>(n_outputs_per_seq, 1 + params.speculative.ngram_map_k.size_m);
+                break;
+            case COMMON_SPECULATIVE_TYPE_NGRAM_MAP_K4V:
+                n_outputs_per_seq = std::max<uint32_t>(n_outputs_per_seq, 1 + params.speculative.ngram_map_k4v.size_m);
+                break;
+            case COMMON_SPECULATIVE_TYPE_NGRAM_MOD:
+                n_outputs_per_seq = std::max<uint32_t>(n_outputs_per_seq, 1 + std::max(0, params.speculative.ngram_mod.n_max));
+                break;
+            case COMMON_SPECULATIVE_TYPE_NGRAM_CACHE:
+                n_outputs_per_seq = std::max<uint32_t>(n_outputs_per_seq, 1 + 8);
+                break;
+            case COMMON_SPECULATIVE_TYPE_SUFFIX:
+            case COMMON_SPECULATIVE_TYPE_COPYSPEC:
+            case COMMON_SPECULATIVE_TYPE_RECYCLE:
+                n_outputs_per_seq = std::max<uint32_t>(n_outputs_per_seq, 1 + spec_n_max(params.speculative.n_max));
+                break;
+            case COMMON_SPECULATIVE_TYPE_DFLASH:
+                n_outputs_per_seq = std::max<uint32_t>(n_outputs_per_seq, dflash_outputs_per_seq());
+                break;
+            case COMMON_SPECULATIVE_TYPE_NONE:
+            case COMMON_SPECULATIVE_TYPE_COUNT:
+                break;
+        }
+    }
+
+    // Draft model present without an explicit speculative type: init can auto-enable
+    // draft-simple, so reserve room for the verify batch. Bee can also auto-detect
+    // DFlash after the target context is already created, which needs the DFlash cap.
+    if (params.speculative.has_dft()) {
+        n_outputs_per_seq = std::max<uint32_t>(n_outputs_per_seq, 1 + spec_n_max(params.speculative.draft.n_max));
+        if (params.speculative.type() == COMMON_SPECULATIVE_TYPE_NONE) {
+            n_outputs_per_seq = std::max<uint32_t>(n_outputs_per_seq, dflash_outputs_per_seq());
+        }
+    }
+
+    const uint64_t n_outputs = (uint64_t) params.n_parallel * n_outputs_per_seq;
+
+    return std::max<uint32_t>(1, std::min<uint64_t>(n_batch, n_outputs));
+}
+
 // state diagram: https://github.com/ggml-org/llama.cpp/pull/9283
 enum slot_state {
     SLOT_STATE_IDLE,
@@ -1856,10 +1935,11 @@ private:
 
     llama_context * create_mtp_context() {
         auto cparams = common_context_params_to_llama(params_base);
-        cparams.ctx_type = LLAMA_CONTEXT_TYPE_MTP;
-        cparams.type_k   = params_base.speculative.draft.cache_type_k;
-        cparams.type_v   = params_base.speculative.draft.cache_type_v;
-        cparams.n_rs_seq = 0;
+        cparams.ctx_type      = LLAMA_CONTEXT_TYPE_MTP;
+        cparams.type_k        = params_base.speculative.draft.cache_type_k;
+        cparams.type_v        = params_base.speculative.draft.cache_type_v;
+        cparams.n_rs_seq      = 0;
+        cparams.n_outputs_max = params_base.n_parallel;
         return llama_init_from_model(model_tgt, cparams);
     }
 
@@ -2024,6 +2104,7 @@ private:
         SRV_INF("loading model '%s'\n", params.model.path.c_str());
 
         params_base = params;
+        params_base.n_outputs_max = server_n_outputs_max(params_base);
         const std::string & mmproj_path = params_base.mmproj.path;
         const bool has_mmproj = !mmproj_path.empty();
 
@@ -2097,6 +2178,10 @@ private:
                 } else {
                     // MTP draft context lives on the target model, only context+compute are new.
                     measure_model_bytes = false;
+                }
+
+                if (!has_draft) {
+                    params_dft.n_outputs_max = params_base.n_parallel;
                 }
 
                 auto mparams_dft = common_model_params_to_llama(params_dft);

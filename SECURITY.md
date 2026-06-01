@@ -12,6 +12,9 @@
 
 ## Reporting a vulnerability
 
+> [!IMPORTANT]
+> The private security disclosure program is disabled until further notice. Please submit patches with fixes directly to the repo as public PRs. Emails will be ignored.
+
 If you have discovered a security vulnerability in this project that falls inside the [covered topics](#covered-topics), please report it privately. **Do not disclose it as a public issue.** This gives us time to work with you to fix the issue before public exposure, reducing the chance that the exploit will be used before a patch is released.
 
 Please disclose it as a private [security advisory](https://github.com/Anbeeld/beellama.cpp/security/advisories/new).
@@ -31,7 +34,7 @@ Before submitting your report, ensure you meet the following requirements:
 
 Maintainers reserve the right to close the report if these requirements are not fulfilled.
 
-## Covered Topics
+### Covered Topics
 
 Only vulnerabilities that fall within these parts of the project are considered valid. For problems falling outside of this list, please report them as issues.
 
