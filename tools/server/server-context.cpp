@@ -83,13 +83,21 @@ static bool server_model_is_dflash_drafter(const llama_model * model) {
         llama_model_dflash_n_target_features(model) > 0;
 }
 
+static bool server_backend_dev_type_is_gpu(enum ggml_backend_dev_type type) {
+    return type == GGML_BACKEND_DEVICE_TYPE_GPU || type == GGML_BACKEND_DEVICE_TYPE_IGPU;
+}
+
+static bool server_backend_dev_is_gpu(ggml_backend_dev_t dev) {
+    return dev && server_backend_dev_type_is_gpu(ggml_backend_dev_type(dev));
+}
+
 static bool server_backend_dev_is_dflash_shared_output_compatible(ggml_backend_dev_t dev) {
     if (!dev) {
         return false;
     }
 
     const enum ggml_backend_dev_type type = ggml_backend_dev_type(dev);
-    return type == GGML_BACKEND_DEVICE_TYPE_GPU || type == GGML_BACKEND_DEVICE_TYPE_META;
+    return server_backend_dev_type_is_gpu(type) || type == GGML_BACKEND_DEVICE_TYPE_META;
 }
 
 static bool server_model_supports_device_buffer(const llama_model * model, ggml_backend_dev_t dev) {
@@ -117,7 +125,7 @@ static ggml_backend_dev_t server_single_gpu_device_from_list(const std::vector<g
         return nullptr;
     }
 
-    if (ggml_backend_dev_type(devices[0]) != GGML_BACKEND_DEVICE_TYPE_GPU) {
+    if (!server_backend_dev_is_gpu(devices[0])) {
         return nullptr;
     }
 
@@ -2352,7 +2360,7 @@ private:
                 params_dft.main_gpu = 0;
             }
             ggml_backend_dev_t target_output_dev = llama_model_dev_output(model_tgt);
-            const bool target_output_is_gpu  = target_output_dev && ggml_backend_dev_type(target_output_dev) == GGML_BACKEND_DEVICE_TYPE_GPU;
+            const bool target_output_is_gpu  = server_backend_dev_is_gpu(target_output_dev);
             const bool target_output_is_meta = target_output_dev && ggml_backend_dev_type(target_output_dev) == GGML_BACKEND_DEVICE_TYPE_META;
             const bool target_output_needs_shared_placement =
                     server_backend_dev_is_dflash_shared_output_compatible(target_output_dev);

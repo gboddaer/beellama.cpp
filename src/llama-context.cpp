@@ -86,6 +86,14 @@ static bool dflash_tensor_span_in_bounds(const ggml_tensor * t, size_t offset_by
             (uint64_t) n_bytes);
 }
 
+static bool dflash_backend_dev_type_is_gpu(enum ggml_backend_dev_type type) {
+    return type == GGML_BACKEND_DEVICE_TYPE_GPU || type == GGML_BACKEND_DEVICE_TYPE_IGPU;
+}
+
+static bool dflash_backend_dev_is_gpu(ggml_backend_dev_t dev) {
+    return dev && dflash_backend_dev_type_is_gpu(ggml_backend_dev_type(dev));
+}
+
 static const char * dflash_backend_dev_type_name(enum ggml_backend_dev_type type) {
     switch (type) {
         case GGML_BACKEND_DEVICE_TYPE_CPU:   return "CPU";
@@ -165,7 +173,7 @@ static ggml_backend_t dflash_backend_for_dev(
         ggml_backend_dev_t want_dev) {
     for (const auto & backend : backends) {
         auto * dev = ggml_backend_get_device(backend.get());
-        if (dev == want_dev && ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_GPU) {
+        if (dev == want_dev && dflash_backend_dev_is_gpu(dev)) {
             return backend.get();
         }
     }
@@ -2452,7 +2460,7 @@ bool llama_context::dflash_memory_seq_cp_recurrent_ordered(
 
     for (auto & backend : backends) {
         auto * dev = ggml_backend_get_device(backend.get());
-        if (dev && ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_GPU) {
+        if (dflash_backend_dev_is_gpu(dev)) {
             ggml_backend_reg_t cuda_reg = ggml_backend_dev_backend_reg(dev);
             auto fn_wait_backend = cuda_reg
                 ? (sync_dflash_stream_to_backend_fn_t)
@@ -2652,7 +2660,7 @@ void llama_context::tape_replay(llama_seq_id seq_id, int n_accepted) {
     ggml_backend_t gpu_backend = nullptr;
     for (auto & backend : backends) {
         auto * dev = ggml_backend_get_device(backend.get());
-        if (dev && ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_GPU) {
+        if (dflash_backend_dev_is_gpu(dev)) {
             gpu_backend = backend.get();
             break;
         }
@@ -3612,7 +3620,7 @@ void llama_context::tape_replay_conv(llama_memory_recurrent * mem_recurrent, int
     ggml_backend_t gpu_backend = nullptr;
     for (auto & backend : backends) {
         auto * dev = ggml_backend_get_device(backend.get());
-        if (dev && ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_GPU) {
+        if (dflash_backend_dev_is_gpu(dev)) {
             gpu_backend = backend.get();
             break;
         }
@@ -4170,7 +4178,7 @@ bool llama_context::dflash_kv_cache_init(int ctx_size) {
     ggml_backend_reg_t cuda_reg = nullptr;
     for (auto & backend : backends) {
         auto * dev = ggml_backend_get_device(backend.get());
-        if (dev && ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_GPU) {
+        if (dflash_backend_dev_is_gpu(dev)) {
             gpu_backend = backend.get();
             cuda_reg = ggml_backend_dev_backend_reg(dev);
             break;
@@ -4316,7 +4324,7 @@ bool llama_context::dflash_kv_cache_prepare_batch(const llama_seq_id * seq_ids, 
     ggml_backend_t gpu_backend = nullptr;
     for (auto & backend : backends) {
         auto * dev = ggml_backend_get_device(backend.get());
-        if (dev && ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_GPU) {
+        if (dflash_backend_dev_is_gpu(dev)) {
             gpu_backend = backend.get();
             break;
         }
@@ -4524,7 +4532,7 @@ bool llama_context::dflash_kv_cache_update(int n_tokens) {
     ggml_backend_t gpu_backend = nullptr;
     for (auto & backend : backends) {
         auto * dev = ggml_backend_get_device(backend.get());
-        if (dev && ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_GPU) {
+        if (dflash_backend_dev_is_gpu(dev)) {
             gpu_backend = backend.get();
             break;
         }
@@ -4929,7 +4937,7 @@ bool llama_context::dflash_target_kv_cache_update_gpu(
     ggml_backend_t gpu_backend = nullptr;
     for (auto & backend : backends) {
         auto * dev = ggml_backend_get_device(backend.get());
-        if (dev && ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_GPU) {
+        if (dflash_backend_dev_is_gpu(dev)) {
             gpu_backend = backend.get();
             break;
         }
@@ -5234,7 +5242,7 @@ void llama_context::tree_rollback(llama_seq_id seq_id, llama_seq_id seq_backup, 
     ggml_backend_t gpu_backend = nullptr;
     for (auto & backend : backends) {
         auto * dev = ggml_backend_get_device(backend.get());
-        if (dev && ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_GPU) {
+        if (dflash_backend_dev_is_gpu(dev)) {
             gpu_backend = backend.get();
             break;
         }
