@@ -54,7 +54,8 @@ int main() {
     assert_candidates(2,  {0, 1, 2});
     assert_candidates(8,  {0, 1, 2, 3, 4, 5, 6, 7, 8});
     assert_candidates(11, {0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11});
-    assert_candidates(16, {0, 4, 8, 10, 12, 14, 16});
+    assert_candidates(16, {0, 1, 2, 3, 4, 5, 6, 7, 8,
+            9, 10, 11, 12, 13, 14, 15, 16});
 
     assert(server_adaptive_dm_next_explore_depth(0, 8, 0.25f) == 2);
     assert(server_adaptive_dm_next_explore_depth(2, 8, 0.25f) == 3);
@@ -64,22 +65,23 @@ int main() {
 
     {
         server_adaptive_dm_state explore;
-        assert(explore.profit_explore_depth_for_step(15, 15, 1) == 4);
-        assert(explore.profit_explore_depth_for_step(15, 15, 2) == 8);
-        assert(explore.profit_explore_depth_for_step(15, 15, 3) == 10);
-        assert(explore.profit_explore_depth_for_step(15, 15, 4) == 12);
-        assert(explore.profit_explore_depth_for_step(15, 15, 5) == 14);
-        assert(explore.profit_explore_depth_for_step(15, 15, 6) == 4);
-        assert(explore.profit_explore_depth_for_step(8, 15, 1) == 10);
-        assert(explore.profit_explore_depth_for_step(8, 15, 4) == 15);
-        assert(explore.profit_explore_depth_for_step(8, 15, 5) == 4);
+        assert(explore.profit_explore_depth_for_step(15, 15, 1) == 1);
+        assert(explore.profit_explore_depth_for_step(15, 15, 2) == 2);
+        assert(explore.profit_explore_depth_for_step(15, 15, 3) == 3);
+        assert(explore.profit_explore_depth_for_step(15, 15, 4) == 4);
+        assert(explore.profit_explore_depth_for_step(15, 15, 14) == 14);
+        assert(explore.profit_explore_depth_for_step(15, 15, 15) == 1);
+        assert(explore.profit_explore_depth_for_step(8, 15, 1) == 9);
+        assert(explore.profit_explore_depth_for_step(8, 15, 7) == 15);
+        assert(explore.profit_explore_depth_for_step(8, 15, 8) == 1);
     }
 
     {
         server_adaptive_dm_state explore_ready;
         explore_ready.dm_profit_min_samples = 1;
-        assert(explore_ready.profit_next_unready_explore_depth(10, 15, 1) == 12);
-        const int ready_depths[] = {4, 8, 10, 12, 14, 15};
+        assert(explore_ready.profit_next_unready_explore_depth(10, 15, 1) == 11);
+        const int ready_depths[] = {1, 2, 3, 4, 5, 6, 7, 8,
+                9, 10, 11, 12, 13, 14, 15};
         for (const int depth : ready_depths) {
             for (int i = 0; i < 6; ++i) {
                 observe_profit_cycle(explore_ready, depth, depth, depth >= 8 ? 1 : 0, 80.0f);
@@ -95,10 +97,8 @@ int main() {
         observe_profit_cycle(initial_large, 4, 4, 0, 80.0f);
         assert(initial_large.profit_next_unready_probe_depth(15) == 8);
         observe_profit_cycle(initial_large, 8, 8, 1, 80.0f);
-        assert(initial_large.profit_next_unready_probe_depth(15) == 10);
-        observe_profit_cycle(initial_large, 10, 10, 1, 80.0f);
-        assert(initial_large.profit_next_unready_probe_depth(15) == 12);
-        observe_profit_cycle(initial_large, 12, 12, 1, 80.0f);
+        assert(initial_large.profit_next_unready_probe_depth(15) == 15);
+        observe_profit_cycle(initial_large, 15, 15, 1, 80.0f);
         assert(initial_large.profit_next_unready_probe_depth(15) < 0);
     }
 
@@ -150,7 +150,7 @@ int main() {
         const int nc8 = server_adaptive_dm_build_candidates(8, cand, 160);
         assert(server_adaptive_dm_apply_profit_hysteresis(2, 4, 30.0f, 30.9f, 0.06f, 0.02f, cand, nc8) == 2);
         assert(server_adaptive_dm_apply_profit_hysteresis(2, 8, 30.0f, 33.0f, 0.06f, 0.02f, cand, nc8) == 4);
-        assert(server_adaptive_dm_apply_profit_hysteresis(6, 2, 30.0f, 31.5f, 0.06f, 0.02f, cand, nc8) == 5);
+        assert(server_adaptive_dm_apply_profit_hysteresis(6, 2, 30.0f, 31.5f, 0.06f, 0.02f, cand, nc8) == 4);
 
         int cand16[160];
         const int nc16 = server_adaptive_dm_build_candidates(16, cand16, 160);
@@ -296,6 +296,7 @@ int main() {
         assert(warm_start.adaptive_n_max == 12);
         assert(warm_start.profit_last_recommended_n == 12);
         assert(warm_start.profit_active_episode_n == 12);
+        assert(warm_start.profit_request_requires_fresh_switch_sample);
         assert(warm_start.profit_depth[15].samples == 1);
     }
 
@@ -527,7 +528,7 @@ int main() {
             est.observe_profit_timing(0, 0, 0, 0.0f, 35.0f, 0.0f, 35.0f);
         }
 
-        assert(est.decide_profit_n_max(15) == 14);
+        assert(est.decide_profit_n_max(15) == 13);
     }
 
     // Sustained low acceptance without a baseline must collect baseline data,
@@ -648,7 +649,7 @@ int main() {
 
         stale.observe_profit_timing(0, 0, 0, 0.0f, 24.0f, 0.0f, 24.0f);
         const int after = stale.decide_profit_n_max(15);
-        assert(after == 14);
+        assert(after == 13);
     }
 
     // Positive-depth changes also need a residence window. A directly measured
@@ -728,8 +729,39 @@ int main() {
             observe_profit_cycle(demote_without_reprobe, 15, 15, 1, 95.0f);
         }
 
-        assert(demote_without_reprobe.decide_profit_n_max(15) == 14);
+        assert(demote_without_reprobe.decide_profit_n_max(15) == 13);
         assert(!demote_without_reprobe.profit_baseline_probe_pending);
+    }
+
+    // Preserving an active depth across a similar prompt should not let stale
+    // challenger stats immediately demote the run. A challenger can replace the
+    // preserved production depth after it has fresh samples in the new request.
+    {
+        server_adaptive_dm_state preserved_challenger;
+        preserved_challenger.dm_profit_min_samples = 1;
+        preserved_challenger.dm_profit_raise_margin = 0.0f;
+        preserved_challenger.dm_profit_lower_margin = 0.0f;
+        preserved_challenger.dm_profit_baseline_interval = 1024;
+        preserved_challenger.adaptive_n_max = 15;
+        preserved_challenger.profit_last_recommended_n = 15;
+        preserved_challenger.profit_has_key = true;
+        preserved_challenger.profit_key = {};
+        preserved_challenger.profit_key.base_n_max = 15;
+
+        preserved_challenger.observe_profit_timing(0, 0, 0, 0.0f, 30.0f, 0.0f, 30.0f);
+        for (int i = 0; i < 6; ++i) {
+            observe_profit_cycle(preserved_challenger, 12, 12, 10, 70.0f);
+            observe_profit_cycle(preserved_challenger, 15, 15, 10, 90.0f);
+        }
+
+        preserved_challenger.reset_request_state(true);
+        for (int i = 0; i < 6; ++i) {
+            observe_profit_cycle(preserved_challenger, 15, 15, 10, 90.0f);
+        }
+
+        assert(preserved_challenger.decide_profit_n_max(15) == 15);
+        observe_profit_cycle(preserved_challenger, 12, 12, 10, 70.0f);
+        assert(preserved_challenger.decide_profit_n_max(15) == 13);
     }
 
     // test lower acceptance can still be faster; controller must optimize TPS,
@@ -887,17 +919,21 @@ int main() {
         observe_profit_cycle(confirm, 8, 8, 2, 75.0f);
         observe_profit_cycle(confirm, 8, 8, 2, 75.0f);
         observe_profit_cycle(confirm, 8, 8, 2, 75.0f);
+        observe_profit_cycle(confirm, 8, 8, 2, 75.0f);
+        observe_profit_cycle(confirm, 8, 8, 2, 75.0f);
         observe_profit_cycle(confirm, 12, 12, 3, 85.0f);
         assert(confirm.decide_profit_n_max(12) == 8);
+        observe_profit_cycle(confirm, 12, 12, 3, 85.0f);
+        observe_profit_cycle(confirm, 12, 12, 3, 85.0f);
         observe_profit_cycle(confirm, 12, 12, 3, 85.0f);
         observe_profit_cycle(confirm, 12, 12, 3, 85.0f);
         observe_profit_cycle(confirm, 12, 12, 3, 85.0f);
         assert(confirm.decide_profit_n_max(12) == 12);
     }
 
-    // Cold-start measurement must stay inside the positive-depth ladder until
-    // useful DFlash candidates have enough samples. Disabling after the sparse
-    // 4/8/base probe set forces slow 0 -> depth bounces on prose.
+    // Cold-start measurement should ramp quickly to the configured base depth.
+    // If that active depth is clearly bad after its residence window, the
+    // controller should try a lower rescue depth before disabling speculation.
     {
         server_adaptive_dm_state cold_ladder;
         cold_ladder.dm_profit_min_samples = 1;
@@ -915,8 +951,8 @@ int main() {
             observe_profit_cycle(cold_ladder, 15, 15, 0, 110.0f);
         }
 
-        assert(cold_ladder.profit_next_unready_probe_depth(15) == 10);
-        assert(cold_ladder.decide_profit_n_max(15) == 10);
+        assert(cold_ladder.profit_next_unready_probe_depth(15) < 0);
+        assert(cold_ladder.decide_profit_n_max(15) == 12);
     }
 
     // A shorter horizon can become best when recent per-position acceptance is
@@ -952,9 +988,9 @@ int main() {
         assert(recent_acceptance.decide_profit_n_max(15) == 10);
     }
 
-    // Off-state probes must sweep through the normal initial probe depths
-    // and then the coarse candidate ladder before backing off, so a weak
-    // shallow probe does not prevent discovery of a deeper profitable depth.
+    // Off-state probes must sweep through every low-end depth before backing
+    // off, so a marginal prompt can still discover depth 1/2/3 instead of
+    // treating depth 4 as the minimum viable speculative horizon.
     {
         server_adaptive_dm_state sweep;
         sweep.dm_profit_min_samples = 1;
@@ -962,42 +998,24 @@ int main() {
         sweep.adaptive_n_max = 0;
         sweep.observe_profit_timing(0, 0, 0, 0.0f, 30.0f, 0.0f, 30.0f);
 
-        assert(sweep.profit_next_off_probe_depth(15, 3) == 4);
-        observe_profit_cycle(sweep, 4, 4, 0, 60.0f);
-        sweep.profit_note_off_probe_result(4, 15, false);
-        assert(sweep.profit_next_off_probe_depth(15, 3) == 8);
-        assert(sweep.profit_off_probe_failures == 0);
-        assert(sweep.profit_off_probe_interval() == 4);
-
-        observe_profit_cycle(sweep, 8, 8, 0, 70.0f);
-        sweep.profit_note_off_probe_result(8, 15, false);
-        assert(sweep.profit_next_off_probe_depth(15, 3) == 10);
-        assert(sweep.profit_off_probe_failures == 0);
-
-        observe_profit_cycle(sweep, 10, 10, 0, 75.0f);
-        sweep.profit_note_off_probe_result(10, 15, false);
-        assert(sweep.profit_next_off_probe_depth(15, 3) == 12);
-        assert(sweep.profit_off_probe_failures == 0);
-
-        observe_profit_cycle(sweep, 12, 12, 0, 78.0f);
-        sweep.profit_note_off_probe_result(12, 15, false);
-        assert(sweep.profit_next_off_probe_depth(15, 3) == 14);
-        assert(sweep.profit_off_probe_failures == 0);
-
-        observe_profit_cycle(sweep, 14, 14, 0, 79.0f);
-        sweep.profit_note_off_probe_result(14, 15, false);
-        assert(sweep.profit_next_off_probe_depth(15, 3) == 15);
-        assert(sweep.profit_off_probe_failures == 0);
+        assert(sweep.profit_next_off_probe_depth(15, 3) == 1);
+        for (int depth = 1; depth <= 14; ++depth) {
+            observe_profit_cycle(sweep, depth, depth, 0, 60.0f + (float) depth);
+            sweep.profit_note_off_probe_result(depth, 15, false);
+            assert(sweep.profit_next_off_probe_depth(15, 3) == depth + 1);
+            assert(sweep.profit_off_probe_failures == 0);
+            assert(sweep.profit_off_probe_interval() == 4);
+        }
 
         observe_profit_cycle(sweep, 15, 15, 0, 80.0f);
         sweep.profit_note_off_probe_result(15, 15, false);
-        assert(sweep.profit_next_off_probe_depth(15, 3) == 4);
+        assert(sweep.profit_next_off_probe_depth(15, 3) == 1);
         assert(sweep.profit_off_probe_failures == 1);
         assert(sweep.profit_off_probe_interval() == 8);
 
-        sweep.profit_note_off_probe_result(4, 15, true);
+        sweep.profit_note_off_probe_result(1, 15, true);
         assert(sweep.profit_off_probe_failures == 0);
-        assert(sweep.profit_next_off_probe_depth(15, 3) == 4);
+        assert(sweep.profit_next_off_probe_depth(15, 3) == 1);
     }
 
     // Failed wake probes advance the off-state sweep instead of retrying the
@@ -1016,7 +1034,7 @@ int main() {
         assert(failed.profit_off_probe_interval() == 4);
         assert(failed.decide_profit_n_max(8) == 0);
         assert(failed.profit_off_probe_failures == 0);
-        assert(failed.profit_next_off_probe_depth(8, 2) == 8);
+        assert(failed.profit_next_off_probe_depth(8, 2) == 5);
         assert(failed.profit_off_probe_interval() == 4);
     }
 
