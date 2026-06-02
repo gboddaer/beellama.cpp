@@ -1063,8 +1063,7 @@ struct server_slot : server_adaptive_dm_state {
                     return 0;
                 }
                 const int profit_probe_n_max = [&]() {
-                    const int unready = profit_next_unready_probe_depth(base_n_max);
-                    return unready > 0 ? unready : probe_n_max;
+                    return profit_next_off_probe_depth(base_n_max, probe_n_max);
                 }();
                 if (advance_adaptive_probe) {
                     adaptive_probe_counter = 0;
@@ -1076,12 +1075,12 @@ struct server_slot : server_adaptive_dm_state {
                 if (advance_adaptive_probe) {
                     explore_counter++;
                     if (explore_counter % dm_explore_interval == 0) {
-                        // Every 4th explore: full-depth probe to rediscover profitability.
-                        // Otherwise: probe next ladder rung.
-                        if ((explore_counter / dm_explore_interval) % 4 == 0) {
-                            n_draft_max = base_n_max;
-                        } else {
-                            n_draft_max = server_adaptive_dm_next_explore_depth(adaptive_n_max, base_n_max, dm_probe_fraction);
+                        const int explore_n_max = profit_next_unready_explore_depth(
+                                adaptive_n_max,
+                                base_n_max,
+                                explore_counter / dm_explore_interval);
+                        if (explore_n_max > 0) {
+                            n_draft_max = explore_n_max;
                         }
                     }
                 }
@@ -3009,9 +3008,10 @@ private:
                         SLT_INF(*ret, "adaptive dm: preserving state for continuation (sim=%.3f, keep=%.3f, n_max=%d)\n",
                                 sim_best, f_keep, ret->adaptive_n_max);
                     } else {
-                        ret->reset_request_state();
-                        SLT_INF(*ret, "adaptive dm: reset state for prompt change (sim=%.3f, keep=%.3f)\n",
-                                sim_best, f_keep);
+                        const bool preserve_policy = sim_best > 0.98f;
+                        ret->reset_request_state(preserve_policy);
+                        SLT_INF(*ret, "adaptive dm: reset state for prompt change (sim=%.3f, keep=%.3f, preserve_policy=%d, n_max=%d)\n",
+                                sim_best, f_keep, preserve_policy ? 1 : 0, ret->adaptive_n_max);
                     }
                 }
 
