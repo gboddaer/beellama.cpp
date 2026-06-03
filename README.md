@@ -18,6 +18,7 @@ BeeLlama.cpp (or just Bee) is a performance-focused llama.cpp fork for squeezing
 - **DFlash speculative decoding**: `--spec-type dflash` drives a DFlash draft GGUF alongside the target model. The target captures hidden states into a ring buffer, the drafter cross-attends to the most recent `--spec-dflash-cross-ctx` hidden-state tokens and proposes drafts for target verification.
 - **Adaptive draft-max control**: The server adjusts the active draft horizon at runtime instead of using a fixed `--spec-draft-n-max`. The default `profit` controller compares speculative throughput against a no-spec baseline, the `fringe` alternative maps acceptance-rate bands to draft depth.
 - **Full multimodal support**: When `--mmproj` is active, the server keeps DFlash available for text generation. The model can be fully offloaded to CPU with no problems to reduce VRAM pressure.
+- **Up to date with upstream llama.cpp** — MTP speculative decoding, parallel drafting, the unified llama app, updated server/API behavior, backend improvements across CUDA, HIP, Metal, Vulkan, and more.
 - **TurboQuant / TCQ KV-cache compression**: Five cache types (`turbo2`, `turbo3`, `turbo4`, `turbo2_tcq`, `turbo3_tcq`) spanning from 4x to 7.5x compression, with TCQ types offering good precision for their size. Set independently with `--cache-type-k` and `--cache-type-v`.
 - **Tom TQ3/TQ4 model weight formats**: `TQ3_1S` and `TQ4_1S` are available through `llama-quantize` with non-conflicting GGML type IDs `47` and `48`. These are GGUF weight formats, not KV-cache types; backend acceleration should be validated before claiming it for a deployment.
 - **Reasoning-loop protection**: The server detects repeated hidden reasoning output and intervenes. Default mode is `force-close`, with `--reasoning-loop-window` and `--reasoning-loop-max-period` tuning available.
@@ -291,17 +292,6 @@ K and V cache types are set independently with `--cache-type-k` and `--cache-typ
 | turbo2_tcq | fork | 2.25 | 7.11× | Last resort, 54% precision at KLD 99.9%. CUDA-only |
 | turbo2 | fork | 2.125 | 7.53× | Extreme quality risk. Use only when TCQ is unavailable |
 
-### Model Weight Quantization
-
-Tom's `TQ3_1S` and `TQ4_1S` are model weight formats exposed through `llama-quantize`:
-
-```sh
-llama-quantize model.f16.gguf model.tq3_1s.gguf TQ3_1S
-llama-quantize model.f16.gguf model.tq4_1s.gguf TQ4_1S
-```
-
-These formats use GGML type IDs `47` and `48` so they do not collide with Bee/Buun TCQ cache IDs `45` and `46`. They are separate from `--cache-type-k` and `--cache-type-v`.
-
 ## Installation
 
 ### Plug-and-Play Setups
@@ -309,9 +299,35 @@ These formats use GGML type IDs `47` and `48` so they do not collide with Bee/Bu
 - [Qwen 3.6 27B Q5_K_S + DFlash + vision + 160k context in 24 GB VRAM](docs/quickstart-qwen36-dflash.md)
 - [Gemma 4 31B Q4_K_S + DFlash + vision + 140k context in 24 GB VRAM](docs/quickstart-gemma-4-31b-dflash.md)
 
-### Prebuilt (Windows)
+### Prebuilt
 
-Download the release archive for your CUDA version (12.4 or 13.1) from the [releases page](https://github.com/Anbeeld/beellama.cpp/releases). Extract it. The server binary is `llama-server.exe`. Don't forget to download a separate archive with CUDA libraries and place it in the same folder!
+Binaries for every backend are on the [releases page](https://github.com/Anbeeld/beellama.cpp/releases):
+
+| Platform | Backend | Archive |
+| --- | --- | --- |
+| macOS | Apple Silicon Metal | `bin-macos-arm64.tar.gz` |
+| Linux x64 | CPU | `bin-ubuntu-x64.tar.gz` |
+| Linux x64 | Vulkan | `bin-ubuntu-vulkan-x64.tar.gz` |
+| Linux x64 | ROCm 7.2 | `bin-ubuntu-rocm-7.2-x64.tar.gz` |
+| Linux x64 | SYCL | `bin-ubuntu-sycl-x64.tar.gz` |
+| Windows x64 | CPU | `bin-win-cpu-x64.zip` |
+| Windows x64 | SYCL | `bin-win-sycl-x64.zip` |
+| Windows x64 | CUDA 12 | `bin-win-cuda-12.4-x64.zip` |
+| Windows x64 | CUDA 13 | `bin-win-cuda-13.1-x64.zip` |
+| Windows x64 | HIP/Radeon | `bin-win-hip-radeon-x64.zip` |
+
+Windows CUDA archives contain a `ggml-cuda.dll` backend; download the matching `cudart-win-cuda-*-x64.zip` runtime archive and extract it into the same folder. Windows SYCL and HIP archives ship as standalone packages with all required runtime DLLs bundled.
+
+Docker images are published to `ghcr.io/anbeeld/beellama.cpp`:
+
+| Image | Acceleration | Platforms |
+| --- | --- | --- |
+| `server-cpu` | CPU | linux/amd64, linux/arm64 |
+| `server-cuda12` | CUDA 12.4 | linux/amd64 |
+| `server-cuda13` | CUDA 13.1 | linux/amd64 |
+| `server-rocm` | ROCm | linux/amd64 |
+| `server-vulkan` | Vulkan | linux/amd64 |
+| `server-sycl` | SYCL | linux/amd64 |
 
 Building from source with `-DGGML_NATIVE=ON` *may* result in a *tiny* bit better performance, so it might still be a good idea to do that if/when you decide to use this fork long-term.
 

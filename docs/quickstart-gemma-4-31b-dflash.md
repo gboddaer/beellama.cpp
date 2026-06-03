@@ -16,9 +16,35 @@ DFlash is a speculative decoding mode where a small draft model reads recent hid
 
 ## Get the binary
 
-### Prebuilt (Windows)
+### Prebuilt
 
-Download the release archive for your CUDA version (12.4 or 13.1) from the [releases page](https://github.com/Anbeeld/beellama.cpp/releases). Extract it. The server binary is `llama-server.exe`. Don't forget to download a separate archive with CUDA libraries and place it in the same folder.
+Binaries for every backend are on the [releases page](https://github.com/Anbeeld/beellama.cpp/releases):
+
+| Platform | Backend | Archive |
+| --- | --- | --- |
+| macOS | Apple Silicon Metal | `bin-macos-arm64.tar.gz` |
+| Linux x64 | CPU | `bin-ubuntu-x64.tar.gz` |
+| Linux x64 | Vulkan | `bin-ubuntu-vulkan-x64.tar.gz` |
+| Linux x64 | ROCm 7.2 | `bin-ubuntu-rocm-7.2-x64.tar.gz` |
+| Linux x64 | SYCL | `bin-ubuntu-sycl-x64.tar.gz` |
+| Windows x64 | CPU | `bin-win-cpu-x64.zip` |
+| Windows x64 | SYCL | `bin-win-sycl-x64.zip` |
+| Windows x64 | CUDA 12 | `bin-win-cuda-12.4-x64.zip` |
+| Windows x64 | CUDA 13 | `bin-win-cuda-13.1-x64.zip` |
+| Windows x64 | HIP/Radeon | `bin-win-hip-radeon-x64.zip` |
+
+Windows CUDA archives contain a `ggml-cuda.dll` backend; download the matching `cudart-win-cuda-*-x64.zip` runtime archive and extract it into the same folder. Windows SYCL and HIP archives ship as standalone packages with all required runtime DLLs bundled.
+
+Docker images are published to `ghcr.io/anbeeld/beellama.cpp`:
+
+| Image | Acceleration | Platforms |
+| --- | --- | --- |
+| `server-cpu` | CPU | linux/amd64, linux/arm64 |
+| `server-cuda12` | CUDA 12.4 | linux/amd64 |
+| `server-cuda13` | CUDA 13.1 | linux/amd64 |
+| `server-rocm` | ROCm | linux/amd64 |
+| `server-vulkan` | Vulkan | linux/amd64 |
+| `server-sycl` | SYCL | linux/amd64 |
 
 Building from source with `-DGGML_NATIVE=ON` may result in a tiny bit better performance, so it can still be worth doing if you plan to use this fork long-term.
 
@@ -122,7 +148,6 @@ llama-server.exe `
   --ctx-size 102400 `
   --cache-type-k q5_0 --cache-type-v q4_1 `
   --flash-attn on `
-  --cache-ram 0 `
   --jinja `
   --no-mmap --mlock `
   --no-host `
@@ -149,7 +174,6 @@ llama-server \
   --ctx-size 102400 \
   --cache-type-k q5_0 --cache-type-v q4_1 \
   --flash-attn on \
-  --cache-ram 0 \
   --jinja \
   --no-mmap --mlock \
   --no-host \
@@ -228,7 +252,6 @@ For full command-line tuning, including upstream llama.cpp args, DFlash args, Tu
 | `--cache-type-k` | `q5_0` | K cache quantization. `q5_0` is the current default for the precision Gemma setup |
 | `--cache-type-v` | `q4_1` | V cache quantization. `q4_1` keeps the cache footprint reasonable while preserving better tail behavior |
 | `--flash-attn` | `on` | Use Flash Attention kernels |
-| `--cache-ram` | `0` | Disable prompt-cache RAM snapshots (default is 8192 MiB). Live-slot prefix reuse still works |
 | `--jinja` | - | Enable Jinja template engine for chat formatting |
 
 ### Model and sampling flags
@@ -291,10 +314,16 @@ Tree verification (`--spec-branch-budget` > 0) is automatically disabled when th
 The default command targets 24 GB VRAM with `Q4_K_S`. If you are running out of memory, adjust in this order:
 
 1. **Reduce `--ctx-size`.** Each unit of context costs VRAM for both the target model's KV cache and the DFlash cross-attention buffer. Dropping from `102400` to `65536` or `32768` frees significant memory.
-2. **Switch cache types.** Replace `q5_0` / `q4_1` with `q4_0` / `q4_0` first. On CUDA, `turbo3_tcq` for K and `q4_1` for V is a practical next step if you still need room.
+2. **Switch cache types.** Replace `q5_0` / `q4_1` with `q4_0` / `q4_0` first. On CUDA, `turbo3_tcq` for both K and V squeezes further; `turbo2_tcq` is the last resort. On Metal, use `turbo3` for both K and V if `q4_0` is too large.
 3. **Drop the target quantization.** Move from `Q4_K_S` to `IQ4_XS`, then to `Q3_K_M` or `Q3_K_S` if needed.
 4. **Reduce `--spec-dflash-cross-ctx`.** Lowering from `1024` to `512` saves VRAM at the cost of less context for the drafter's cross-attention.
-5. **Remove `--mlock`.** If system RAM is abundant and swapping is not a concern, `--mlock` can be removed.
+5. **Lower `--cache-ram`.** The prompt-cache RAM subsystem defaults to 8192 MiB. If system RAM is tight, lower it to 4096 or 2048 to reduce the RAM ceiling:
+
+   ```
+   --cache-ram 4096
+   ```
+
+6. **Remove `--mlock`.** If system RAM is abundant and swapping is not a concern, `--mlock` can be removed.
 
 Start with the balanced combo and drop down if VRAM is tight.
 
