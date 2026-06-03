@@ -149,7 +149,11 @@ COPY --from=build /app/full/llama-server /app
 
 WORKDIR /app
 
-RUN /app/llama-server --version
+RUN test -s /app/libggml-sycl.so \
+    && ldd /app/libggml-sycl.so \
+    && mv /app/libggml-sycl.so /app/libggml-sycl.so.smoke-disabled \
+    && /app/llama-server --version \
+    && mv /app/libggml-sycl.so.smoke-disabled /app/libggml-sycl.so
 
 HEALTHCHECK CMD [ "curl", "-f", "http://localhost:8080/health" ]
 

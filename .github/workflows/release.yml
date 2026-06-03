@@ -495,6 +495,10 @@ jobs:
       - name: Smoke package binaries
         run: |
           source "${ONEAPI_ROOT}/setvars.sh"
+          test -s ./build/bin/libggml-sycl.so
+          ldd ./build/bin/libggml-sycl.so
+          mv ./build/bin/libggml-sycl.so ./build/bin/libggml-sycl.so.smoke-disabled
+          trap 'mv ./build/bin/libggml-sycl.so.smoke-disabled ./build/bin/libggml-sycl.so' EXIT
           ./build/bin/llama-server --version
           ./build/bin/llama-cli --version
 
@@ -870,11 +874,12 @@ jobs:
         run: |
           $ErrorActionPreference = "Stop"
           Invoke-WebRequest -Uri "https://download.amd.com/developer/eula/rocm-hub/AMD-Software-PRO-Edition-${{ env.HIPSDK_INSTALLER_VERSION }}-Win11-For-HIP.exe" -OutFile "${env:RUNNER_TEMP}\rocm-install.exe"
-          $proc = Start-Process "${env:RUNNER_TEMP}\rocm-install.exe" -ArgumentList '-install' -NoNewWindow -PassThru
-          $completed = $proc.WaitForExit(600000)
+          $installTimeoutSeconds = 1800
+          $proc = Start-Process "${env:RUNNER_TEMP}\rocm-install.exe" -ArgumentList '-install' -WindowStyle Hidden -PassThru
+          $completed = $proc.WaitForExit($installTimeoutSeconds * 1000)
           if (-not $completed) {
             $proc.Kill()
-            Write-Error "ROCm installation timed out after 10 minutes"
+            Write-Error "ROCm installation timed out after $($installTimeoutSeconds / 60) minutes"
           }
           if ($proc.ExitCode -ne 0) {
             Write-Error "ROCm installation failed with exit code $($proc.ExitCode)"
