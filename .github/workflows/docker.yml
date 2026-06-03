@@ -3,11 +3,20 @@ name: Publish Docker image
 on:
   push:
     branches:
-      - main
       - "v*"
     tags:
       - "v*"
   workflow_dispatch:
+    inputs:
+      tag_name:
+        description: "Docker release tag name to use, for example v0.3.0"
+        required: false
+        type: string
+      publish_release_tags:
+        description: "Publish stable release Docker tags for tag_name"
+        required: false
+        default: false
+        type: boolean
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
@@ -44,6 +53,8 @@ jobs:
           release="false"
           short_sha="${GITHUB_SHA::12}"
           exact_tag="$(git tag --points-at "${GITHUB_SHA}" --list 'v*' | sort -V | tail -n 1 || true)"
+          input_tag_name="${INPUT_TAG_NAME:-}"
+          input_publish_release_tags="${INPUT_PUBLISH_RELEASE_TAGS:-false}"
           ref_name_safe="$(printf '%s' "${GITHUB_REF_NAME}" | tr '[:upper:]' '[:lower:]' | sed -E 's#[^a-z0-9_.-]+#-#g; s#^[.-]+##; s#[.-]+$##')"
           if [[ -z "${ref_name_safe}" ]]; then
             ref_name_safe="${short_sha}"
@@ -62,11 +73,29 @@ jobs:
             version="${exact_tag}"
             publish="true"
             release="true"
-          elif [[ "${GITHUB_REF}" == "refs/heads/main" || "${GITHUB_REF}" == refs/heads/v* ]]; then
+          elif [[ "${GITHUB_REF}" == refs/heads/v* ]]; then
             version="${ref_name_safe}-${short_sha}"
             publish="true"
           elif [[ "${GITHUB_EVENT_NAME}" == "workflow_dispatch" ]]; then
-            version="${ref_name_safe}-${short_sha}"
+            if [[ -n "${input_tag_name}" ]]; then
+              if [[ "${input_tag_name}" != v* ]]; then
+                echo "Manual release Docker publishing requires a v* tag_name input." >&2
+                exit 1
+              fi
+              version="${input_tag_name}"
+              release="${input_publish_release_tags}"
+              if [[ "${release}" == "true" ]]; then
+                git fetch origin +refs/heads/main:refs/remotes/origin/main --no-tags
+                git fetch origin +refs/tags/"${input_tag_name}":refs/tags/"${input_tag_name}"
+                tag_commit="$(git rev-list -n 1 "${input_tag_name}")"
+                if ! git merge-base --is-ancestor "${tag_commit}" refs/remotes/origin/main; then
+                  echo "Tag ${input_tag_name} is not on origin/main; refusing to publish release Docker tags." >&2
+                  exit 1
+                fi
+              fi
+            else
+              version="${ref_name_safe}-${short_sha}"
+            fi
             publish="true"
           else
             version="${ref_name_safe}-${short_sha}"
@@ -86,6 +115,9 @@ jobs:
           echo "Using version: ${version}"
           echo "Publish Docker images: ${publish}"
           echo "Release Docker tags: ${release}"
+        env:
+          INPUT_TAG_NAME: ${{ inputs.tag_name || '' }}
+          INPUT_PUBLISH_RELEASE_TAGS: ${{ inputs.publish_release_tags }}
 
   build:
     name: Build server${{ matrix.config.display_suffix }}

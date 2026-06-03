@@ -128,6 +128,8 @@ COPY --from=build /app/full/llama-server /app
 
 WORKDIR /app
 
+RUN /app/llama-server --version
+
 HEALTHCHECK CMD [ "curl", "-f", "http://localhost:8080/health" ]
 
 ENTRYPOINT [ "/app/llama-server" ]

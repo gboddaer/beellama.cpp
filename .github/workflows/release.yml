@@ -3,11 +3,25 @@ name: Build Packages
 on:
   push:
     branches:
-      - main
       - "v*"
     tags:
       - "v*"
   workflow_dispatch:
+    inputs:
+      tag_name:
+        description: "Release/package tag name to use, for example v0.3.0"
+        required: false
+        type: string
+      publish_release:
+        description: "Create or update the GitHub release for tag_name"
+        required: false
+        default: false
+        type: boolean
+      wait_for_docker:
+        description: "When publishing a release, wait for the matching Docker workflow to succeed"
+        required: false
+        default: true
+        type: boolean
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
@@ -22,7 +36,9 @@ jobs:
     runs-on: ubuntu-24.04
     outputs:
       tag_name: ${{ steps.meta.outputs.tag_name }}
+      build_packages: ${{ steps.meta.outputs.build_packages }}
       create_release: ${{ steps.meta.outputs.create_release }}
+      wait_docker: ${{ steps.meta.outputs.wait_docker }}
     steps:
       - name: Clone
         uses: actions/checkout@v6
@@ -38,7 +54,12 @@ jobs:
           short_sha="${GITHUB_SHA::12}"
           ref_name_safe="${GITHUB_REF_NAME//\//-}"
           exact_tag="$(git tag --points-at "${GITHUB_SHA}" --list 'v*' | sort -V | tail -n 1 || true)"
+          build_packages="false"
           create_release="false"
+          wait_docker="true"
+          input_tag_name="${INPUT_TAG_NAME:-}"
+          input_publish_release="${INPUT_PUBLISH_RELEASE:-false}"
+          input_wait_docker="${INPUT_WAIT_DOCKER:-true}"
 
           if [[ "${GITHUB_REF}" == refs/tags/v* ]]; then
             tag_name="${GITHUB_REF_NAME}"
@@ -52,23 +73,58 @@ jobs:
             git fetch origin +refs/heads/main:refs/remotes/origin/main --no-tags
             if [[ "${GITHUB_REF}" == refs/tags/v* ]]; then
               if git merge-base --is-ancestor "${GITHUB_SHA}" refs/remotes/origin/main; then
+                build_packages="true"
                 create_release="true"
               else
-                echo "Tag ${GITHUB_REF_NAME} is not on origin/main; building packages without publishing a release."
+                echo "Tag ${GITHUB_REF_NAME} is not on origin/main; skipping package build."
               fi
             elif [[ "${GITHUB_REF}" == "refs/heads/main" && -n "${exact_tag}" ]]; then
+              build_packages="true"
               create_release="true"
+            elif [[ "${GITHUB_REF}" == refs/heads/v* ]]; then
+              build_packages="true"
+            fi
+          elif [[ "${GITHUB_EVENT_NAME}" == "workflow_dispatch" ]]; then
+            if [[ -n "${input_tag_name}" ]]; then
+              tag_name="${input_tag_name}"
+            fi
+            build_packages="true"
+            wait_docker="${input_wait_docker}"
+            if [[ "${input_publish_release}" == "true" ]]; then
+              if [[ -z "${tag_name}" || "${tag_name}" != v* ]]; then
+                echo "Manual release publishing requires a v* tag_name input." >&2
+                exit 1
+              fi
+
+              git fetch origin +refs/heads/main:refs/remotes/origin/main --no-tags
+              git fetch origin +refs/tags/"${tag_name}":refs/tags/"${tag_name}"
+              tag_commit="$(git rev-list -n 1 "${tag_name}")"
+              if git merge-base --is-ancestor "${tag_commit}" refs/remotes/origin/main; then
+                create_release="true"
+              else
+                echo "Tag ${tag_name} is not on origin/main; refusing to publish a release." >&2
+                exit 1
+              fi
             fi
           fi
 
           echo "tag_name=${tag_name}" >> "${GITHUB_OUTPUT}"
+          echo "build_packages=${build_packages}" >> "${GITHUB_OUTPUT}"
           echo "create_release=${create_release}" >> "${GITHUB_OUTPUT}"
+          echo "wait_docker=${wait_docker}" >> "${GITHUB_OUTPUT}"
           echo "Using package version: ${tag_name}"
+          echo "Build packages: ${build_packages}"
           echo "Publish GitHub release: ${create_release}"
+          echo "Wait for Docker workflow: ${wait_docker}"
+        env:
+          INPUT_TAG_NAME: ${{ inputs.tag_name || '' }}
+          INPUT_PUBLISH_RELEASE: ${{ inputs.publish_release }}
+          INPUT_WAIT_DOCKER: ${{ inputs.wait_for_docker }}
 
   macos-arm64:
     name: macOS arm64 Metal
     needs: release-meta
+    if: ${{ needs.release-meta.outputs.build_packages == 'true' }}
     runs-on: macos-14
     steps:
       - name: Clone
@@ -106,6 +162,11 @@ jobs:
         if: always()
         run: ccache --show-stats
 
+      - name: Smoke package binaries
+        run: |
+          ./build/bin/llama-server --version
+          ./build/bin/llama-cli --version
+
       - name: Pack artifacts
         run: |
           cp LICENSE ./build/bin/
@@ -122,6 +183,7 @@ jobs:
   ubuntu-cpu:
     name: Ubuntu x64 CPU
     needs: release-meta
+    if: ${{ needs.release-meta.outputs.build_packages == 'true' }}
     runs-on: ubuntu-22.04
     steps:
       - name: Clone
@@ -164,6 +226,11 @@ jobs:
         if: always()
         run: ccache --show-stats
 
+      - name: Smoke package binaries
+        run: |
+          ./build/bin/llama-server --version
+          ./build/bin/llama-cli --version
+
       - name: Pack artifacts
         run: |
           cp LICENSE ./build/bin/
@@ -180,6 +247,7 @@ jobs:
   ubuntu-vulkan:
     name: Ubuntu x64 Vulkan
     needs: release-meta
+    if: ${{ needs.release-meta.outputs.build_packages == 'true' }}
     runs-on: ubuntu-22.04
     steps:
       - name: Clone
@@ -225,6 +293,11 @@ jobs:
         if: always()
         run: ccache --show-stats
 
+      - name: Smoke package binaries
+        run: |
+          ./build/bin/llama-server --version
+          ./build/bin/llama-cli --version
+
       - name: Pack artifacts
         run: |
           cp LICENSE ./build/bin/
@@ -241,6 +314,7 @@ jobs:
   ubuntu-rocm:
     name: Ubuntu x64 ROCm
     needs: release-meta
+    if: ${{ needs.release-meta.outputs.build_packages == 'true' }}
     runs-on: ubuntu-22.04
     env:
       ROCM_VERSION: "7.2.1"
@@ -311,6 +385,11 @@ jobs:
         if: always()
         run: ccache --show-stats
 
+      - name: Smoke package binaries
+        run: |
+          ./build/bin/llama-server --version
+          ./build/bin/llama-cli --version
+
       - name: Pack artifacts
         run: |
           rocm_short="$(echo "${ROCM_VERSION}" | cut -d '.' -f 1,2)"
@@ -328,6 +407,7 @@ jobs:
   ubuntu-sycl:
     name: Ubuntu x64 SYCL
     needs: release-meta
+    if: ${{ needs.release-meta.outputs.build_packages == 'true' }}
     runs-on: ubuntu-24.04
     env:
       ONEAPI_ROOT: /opt/intel/oneapi
@@ -412,6 +492,12 @@ jobs:
         if: always()
         run: ccache --show-stats
 
+      - name: Smoke package binaries
+        run: |
+          source "${ONEAPI_ROOT}/setvars.sh"
+          ./build/bin/llama-server --version
+          ./build/bin/llama-cli --version
+
       - name: Pack artifacts
         run: |
           cp LICENSE ./build/bin/
@@ -428,6 +514,7 @@ jobs:
   windows-cpu:
     name: Windows x64 CPU
     needs: release-meta
+    if: ${{ needs.release-meta.outputs.build_packages == 'true' }}
     runs-on: windows-2025
     steps:
       - name: Clone
@@ -476,10 +563,18 @@ jobs:
           $ErrorActionPreference = "Stop"
           $bin = ".\build\bin\Release"
           Copy-Item ".\LICENSE" $bin
-          $omp = Get-ChildItem "C:\Program Files\Microsoft Visual Studio\2022\Enterprise\VC\Redist\MSVC" -Recurse -Filter "libomp140.x86_64.dll" | Select-Object -First 1
-          if ($omp) {
-            Copy-Item $omp.FullName $bin
+          $redistRoot = "C:\Program Files\Microsoft Visual Studio\2022\Enterprise\VC\Redist\MSVC"
+          $omp = Get-ChildItem $redistRoot -Recurse -Filter "libomp140.x86_64.dll" |
+            Where-Object { $_.FullName -like "*\debug_nonredist\x64\Microsoft.VC143.OpenMP.LLVM\libomp140.x86_64.dll" } |
+            Sort-Object FullName -Descending |
+            Select-Object -First 1
+          if (-not $omp) {
+            throw "VC143 x64 libomp140.x86_64.dll not found under $redistRoot"
           }
+          Copy-Item $omp.FullName $bin -Force
+          python scripts\verify-windows-package.py $bin
+          & "$bin\llama-server.exe" --version
+          & "$bin\llama-cli.exe" --version
           7z a -snl "beellama-bin-win-cpu-x64.zip" "$bin\*"
 
       - name: Upload artifacts
@@ -491,6 +586,7 @@ jobs:
   windows-sycl:
     name: Windows x64 SYCL
     needs: release-meta
+    if: ${{ needs.release-meta.outputs.build_packages == 'true' }}
     runs-on: windows-2022
     env:
       WINDOWS_BASEKIT_URL: https://registrationcenter-download.intel.com/akdlm/IRC_NAS/b60765d1-2b85-4e85-86b6-cb0e9563a699/intel-deep-learning-essentials-2025.3.3.18_offline.exe
@@ -604,6 +700,7 @@ jobs:
             Write-Warning "ze_loader.dll was not found in oneAPI or the Level Zero SDK; relying on the system driver runtime"
           }
 
+          python scripts\verify-windows-package.py $bin
           7z a -snl "beellama-bin-win-sycl-x64.zip" "$bin\*"
 
       - name: Upload SYCL backend
@@ -615,6 +712,7 @@ jobs:
   windows-cuda:
     name: Windows x64 CUDA ${{ matrix.cuda }}
     needs: release-meta
+    if: ${{ needs.release-meta.outputs.build_packages == 'true' }}
     runs-on: windows-2022
     env:
       CCACHE_MAXSIZE: 5G
@@ -732,6 +830,7 @@ jobs:
   windows-hip:
     name: Windows x64 HIP/Radeon
     needs: release-meta
+    if: ${{ needs.release-meta.outputs.build_packages == 'true' }}
     runs-on: windows-2022
     env:
       HIPSDK_INSTALLER_VERSION: "26.Q1"
@@ -819,7 +918,9 @@ jobs:
         run: ccache --show-stats
 
       - name: Pack artifacts
-        run: 7z a -snl "beellama-bin-win-hip-radeon-x64.zip" .\build\bin\*
+        run: |
+          python scripts\verify-windows-package.py .\build\bin
+          7z a -snl "beellama-bin-win-hip-radeon-x64.zip" .\build\bin\*
 
       - name: Upload artifacts
         uses: actions/upload-artifact@v6
@@ -892,6 +993,18 @@ jobs:
             mv "${tar_file}" release/
           done
 
+          python3 scripts/verify-windows-package.py release/beellama-${TAG_NAME}-bin-win-*.zip
+          for cuda_version in 12.4 13.1; do
+            package_zip="release/beellama-${TAG_NAME}-bin-win-cuda-${cuda_version}-x64.zip"
+            runtime_zip="release/beellama-${TAG_NAME}-cudart-win-cuda-${cuda_version}-x64.zip"
+            if [[ -f "${package_zip}" && -f "${runtime_zip}" ]]; then
+              temp_dir="$(mktemp -d)"
+              unzip -q "${package_zip}" -d "${temp_dir}"
+              unzip -q "${runtime_zip}" -d "${temp_dir}"
+              python3 scripts/verify-windows-package.py "${temp_dir}"
+              rm -rf "${temp_dir}"
+            fi
+          done
           sha256sum release/* > release/SHA256SUMS.txt
           ls -lh release
 
@@ -979,21 +1092,33 @@ jobs:
           HEAD_SHA: ${{ github.sha }}
           REF_NAME: ${{ github.ref_name }}
           TAG_NAME: ${{ needs.release-meta.outputs.tag_name }}
+          WAIT_DOCKER: ${{ needs.release-meta.outputs.wait_docker }}
         run: |
           set -euo pipefail
 
+          if [[ "${WAIT_DOCKER}" != "true" ]]; then
+            echo "Skipping Docker workflow wait."
+            exit 0
+          fi
+
           deadline=$((SECONDS + 7200))
           while (( SECONDS < deadline )); do
-            run_info="$(
-              gh run list \
-                --repo "${GITHUB_REPOSITORY}" \
-                --workflow docker.yml \
-                --commit "${HEAD_SHA}" \
-                --event push \
-                --json databaseId,status,conclusion,headBranch,url,createdAt \
-                --limit 20 \
-                --jq "map(select(.headBranch == \"${TAG_NAME}\" or .headBranch == \"${REF_NAME}\" or .headBranch == \"\" or .headBranch == null)) | sort_by(.createdAt) | reverse | .[0] | select(. != null) | [.databaseId, .status, (.conclusion // \"\"), .url] | @tsv"
-            )"
+            run_info=""
+            for event_name in push workflow_dispatch; do
+              run_info="$(
+                gh run list \
+                  --repo "${GITHUB_REPOSITORY}" \
+                  --workflow docker.yml \
+                  --commit "${HEAD_SHA}" \
+                  --event "${event_name}" \
+                  --json databaseId,status,conclusion,headBranch,url,createdAt \
+                  --limit 20 \
+                  --jq "map(select(.headBranch == \"${TAG_NAME}\" or .headBranch == \"${REF_NAME}\" or .headBranch == \"\" or .headBranch == null)) | sort_by(.createdAt) | reverse | .[0] | select(. != null) | [.databaseId, .status, (.conclusion // \"\"), .url] | @tsv"
+              )"
+              if [[ -n "${run_info}" ]]; then
+                break
+              fi
+            done
 
             if [[ -z "${run_info}" ]]; then
               echo "Waiting for Docker workflow run for ${TAG_NAME} (${HEAD_SHA})..."
