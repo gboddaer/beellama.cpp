@@ -1,0 +1,311 @@
+name: Rescue Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag_name:
+        description: "Release tag to publish"
+        required: true
+        default: "v0.3.0"
+      source_run_id:
+        description: "Build Packages run id containing completed non-CUDA artifacts"
+        required: true
+        default: "26878136155"
+
+permissions:
+  actions: read
+  contents: write
+
+concurrency:
+  group: rescue-release-${{ inputs.tag_name }}
+  cancel-in-progress: false
+
+jobs:
+  windows-cuda:
+    name: Windows x64 CUDA ${{ matrix.cuda }}
+    runs-on: windows-2022
+    timeout-minutes: 360
+    env:
+      CCACHE_MAXSIZE: 5G
+      CCACHE_SLOPPINESS: time_macros
+    strategy:
+      fail-fast: false
+      matrix:
+        cuda: ["12.4", "13.1"]
+    steps:
+      - name: Clone release tag
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ inputs.tag_name }}
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version: "24"
+          cache: "npm"
+          cache-dependency-path: "tools/ui/package-lock.json"
+
+      - name: Install ccache
+        uses: ggml-org/ccache-action@v1.2.21
+        with:
+          key: release-windows-cuda-${{ matrix.cuda }}
+          variant: ccache
+          evict-old-files: 1d
+
+      - name: Cache CUDA Toolkit
+        id: cache-cuda
+        uses: actions/cache@v5
+        with:
+          path: C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v${{ matrix.cuda }}
+          key: cuda-windows-${{ matrix.cuda }}-${{ hashFiles('.github/actions/windows-setup-cuda/action.yml') }}
+
+      - name: Install CUDA Toolkit
+        if: steps.cache-cuda.outputs.cache-hit != 'true'
+        uses: ./.github/actions/windows-setup-cuda
+        with:
+          cuda_version: ${{ matrix.cuda }}
+
+      - name: Configure CUDA environment
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $cudaPath = "C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v${{ matrix.cuda }}"
+          $nvcc = Join-Path $cudaPath "bin\nvcc.exe"
+          if (-not (Test-Path $nvcc)) {
+            throw "CUDA Toolkit not found at $cudaPath"
+          }
+
+          Join-Path $cudaPath "bin" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+          $libNvvp = Join-Path $cudaPath "libnvvp"
+          if (Test-Path $libNvvp) {
+            $libNvvp | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+          }
+
+          "CUDA_PATH=$cudaPath" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          $versionEnv = "CUDA_PATH_V${{ matrix.cuda }}".Replace(".", "_")
+          "$versionEnv=$cudaPath" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+
+      - name: Install Ninja
+        run: choco install ninja -y
+
+      - name: Build CUDA backend
+        shell: cmd
+        run: |
+          call "C:\Program Files\Microsoft Visual Studio\2022\Enterprise\VC\Auxiliary\Build\vcvarsall.bat" x64
+          cmake -S . -B build -G "Ninja Multi-Config" ^
+            -DGGML_BACKEND_DL=ON ^
+            -DGGML_NATIVE=OFF ^
+            -DGGML_CPU=OFF ^
+            -DGGML_CUDA=ON ^
+            -DGGML_CUDA_FA=ON ^
+            -DGGML_CUDA_FA_ALL_QUANTS=ON ^
+            -DLLAMA_BUILD_BORINGSSL=ON ^
+            -DCMAKE_CUDA_COMPILER_LAUNCHER=ccache ^
+            -DGGML_CUDA_CUB_3DOT2=ON
+          set /A NINJA_JOBS=%NUMBER_OF_PROCESSORS%-1
+          cmake --build build --config Release -j %NINJA_JOBS% --target ggml-cuda
+
+      - name: ccache stats
+        if: always()
+        run: ccache --show-stats
+
+      - name: Pack CUDA backend
+        run: 7z a -snl "beellama-bin-win-cuda-${{ matrix.cuda }}-x64.zip" .\build\bin\Release\ggml-cuda.dll
+
+      - name: Upload CUDA backend
+        uses: actions/upload-artifact@v6
+        with:
+          path: beellama-bin-win-cuda-${{ matrix.cuda }}-x64.zip
+          name: beellama-bin-win-cuda-${{ matrix.cuda }}-x64.zip
+
+      - name: Pack CUDA runtime
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $dst = ".\build\bin\cudart"
+          New-Item -ItemType Directory -Force -Path $dst | Out-Null
+          $roots = @("${{ env.CUDA_PATH }}\bin", "${{ env.CUDA_PATH }}\lib", "${{ env.CUDA_PATH }}\bin\x64")
+          foreach ($root in $roots) {
+            if (Test-Path $root) {
+              Get-ChildItem -Path (Join-Path $root "*") -File -ErrorAction SilentlyContinue |
+                Where-Object { $_.Name -like "cudart64_*.dll" -or $_.Name -like "cublas64_*.dll" -or $_.Name -like "cublasLt64_*.dll" } |
+                Copy-Item -Destination $dst -Force
+            }
+          }
+          7z a "cudart-beellama-bin-win-cuda-${{ matrix.cuda }}-x64.zip" "$dst\*"
+
+      - name: Upload CUDA runtime
+        uses: actions/upload-artifact@v6
+        with:
+          path: cudart-beellama-bin-win-cuda-${{ matrix.cuda }}-x64.zip
+          name: cudart-beellama-bin-win-cuda-${{ matrix.cuda }}-x64.zip
+
+  publish:
+    name: Publish rescued release
+    needs: windows-cuda
+    runs-on: ubuntu-24.04
+    env:
+      TAG_NAME: ${{ inputs.tag_name }}
+      SOURCE_RUN_ID: ${{ inputs.source_run_id }}
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - name: Download rebuilt Windows CUDA artifacts
+        uses: actions/download-artifact@v7
+        with:
+          path: ./artifact
+          merge-multiple: true
+
+      - name: Download completed artifacts from source run
+        shell: bash
+        run: |
+          set -euo pipefail
+          artifacts=(
+            beellama-bin-macos-arm64.tar.gz
+            beellama-bin-ubuntu-rocm-7.2-x64.tar.gz
+            beellama-bin-ubuntu-sycl-x64.tar.gz
+            beellama-bin-ubuntu-vulkan-x64.tar.gz
+            beellama-bin-ubuntu-x64.tar.gz
+            beellama-bin-win-cpu-x64.zip
+            beellama-bin-win-hip-radeon-x64.zip
+            beellama-bin-win-sycl-x64.zip
+          )
+          for artifact in "${artifacts[@]}"; do
+            gh run download "${SOURCE_RUN_ID}" \
+              --repo "${GITHUB_REPOSITORY}" \
+              --name "${artifact}" \
+              --dir ./artifact
+          done
+
+      - name: Prepare release assets
+        shell: bash
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+
+          mkdir -p release
+
+          expected_artifacts=(
+            artifact/beellama-bin-macos-arm64.tar.gz
+            artifact/beellama-bin-ubuntu-rocm-7.2-x64.tar.gz
+            artifact/beellama-bin-ubuntu-sycl-x64.tar.gz
+            artifact/beellama-bin-ubuntu-vulkan-x64.tar.gz
+            artifact/beellama-bin-ubuntu-x64.tar.gz
+            artifact/beellama-bin-win-cpu-x64.zip
+            artifact/beellama-bin-win-hip-radeon-x64.zip
+            artifact/beellama-bin-win-sycl-x64.zip
+            artifact/beellama-bin-win-cuda-12.4-x64.zip
+            artifact/beellama-bin-win-cuda-13.1-x64.zip
+            artifact/cudart-beellama-bin-win-cuda-12.4-x64.zip
+            artifact/cudart-beellama-bin-win-cuda-13.1-x64.zip
+          )
+          for path in "${expected_artifacts[@]}"; do
+            if [[ ! -f "${path}" ]]; then
+              echo "Missing expected artifact: ${path}" >&2
+              exit 1
+            fi
+          done
+
+          cpu_zip="artifact/beellama-bin-win-cpu-x64.zip"
+          temp_dir="$(mktemp -d)"
+          unzip -q "${cpu_zip}" -d "${temp_dir}"
+          for target_zip in artifact/beellama-bin-win-*-x64.zip; do
+            if [[ "$(basename "${target_zip}")" == "beellama-bin-win-cpu-x64.zip" ]]; then
+              continue
+            fi
+            realpath_target_zip="$(realpath "${target_zip}")"
+            (cd "${temp_dir}" && zip -qr "${realpath_target_zip}" .)
+          done
+          rm -rf "${temp_dir}"
+
+          for zip_file in artifact/beellama-bin-win-*.zip; do
+            base_name="$(basename "${zip_file}" .zip)"
+            mv "${zip_file}" "release/beellama-${TAG_NAME}-${base_name#beellama-}.zip"
+          done
+
+          for zip_file in artifact/cudart-beellama-bin-win-cuda-*.zip; do
+            base_name="$(basename "${zip_file}" .zip)"
+            suffix="${base_name#cudart-beellama-bin-win-}"
+            mv "${zip_file}" "release/beellama-${TAG_NAME}-cudart-win-${suffix}.zip"
+          done
+
+          for tar_file in artifact/*.tar.gz; do
+            mv "${tar_file}" release/
+          done
+
+          sha256sum release/* > release/SHA256SUMS.txt
+          ls -lh release
+
+      - name: Write release notes
+        shell: bash
+        run: |
+          set -euo pipefail
+          release_url="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/releases/download/${TAG_NAME}"
+          changelog_url="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/blob/main/CHANGELOG.md"
+          image_repo="ghcr.io/${GITHUB_REPOSITORY,,}"
+          repo_name="${GITHUB_REPOSITORY#*/}"
+          repo_name="${repo_name,,}"
+          package_url="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/pkgs/container/${repo_name}"
+
+          docker_link() {
+            local tag="$1"
+            printf '[`%s:%s`](%s)' "${image_repo}" "${tag}" "${package_url}"
+          }
+
+          docker_server="$(docker_link "server-${TAG_NAME}")"
+          docker_cpu="$(docker_link "server-cpu-${TAG_NAME}")"
+          docker_cuda="$(docker_link "server-cuda-${TAG_NAME}")"
+          docker_cuda12="$(docker_link "server-cuda12-${TAG_NAME}")"
+          docker_cuda13="$(docker_link "server-cuda13-${TAG_NAME}")"
+          docker_rocm="$(docker_link "server-rocm-${TAG_NAME}")"
+          docker_vulkan="$(docker_link "server-vulkan-${TAG_NAME}")"
+          docker_sycl="$(docker_link "server-sycl-${TAG_NAME}")"
+
+          cat > release-notes.md << EOF
+          <details open>
+          <summary>Changelog</summary>
+
+          [CHANGELOG.md](${changelog_url})
+
+          </details>
+
+          **macOS:**
+          - [macOS Apple Silicon (arm64)](${release_url}/beellama-${TAG_NAME}-bin-macos-arm64.tar.gz)
+
+          **Linux:**
+          - [Ubuntu x64 (CPU)](${release_url}/beellama-${TAG_NAME}-bin-ubuntu-x64.tar.gz)
+          - [Ubuntu x64 (Vulkan)](${release_url}/beellama-${TAG_NAME}-bin-ubuntu-vulkan-x64.tar.gz)
+          - [Ubuntu x64 (ROCm 7.2)](${release_url}/beellama-${TAG_NAME}-bin-ubuntu-rocm-7.2-x64.tar.gz)
+          - [Ubuntu x64 (SYCL)](${release_url}/beellama-${TAG_NAME}-bin-ubuntu-sycl-x64.tar.gz)
+
+          **Windows:**
+          - [Windows x64 (CPU)](${release_url}/beellama-${TAG_NAME}-bin-win-cpu-x64.zip)
+          - [Windows x64 (SYCL)](${release_url}/beellama-${TAG_NAME}-bin-win-sycl-x64.zip)
+          - [Windows x64 (CUDA 12)](${release_url}/beellama-${TAG_NAME}-bin-win-cuda-12.4-x64.zip) - [CUDA 12.4 DLLs](${release_url}/beellama-${TAG_NAME}-cudart-win-cuda-12.4-x64.zip)
+          - [Windows x64 (CUDA 13)](${release_url}/beellama-${TAG_NAME}-bin-win-cuda-13.1-x64.zip) - [CUDA 13.1 DLLs](${release_url}/beellama-${TAG_NAME}-cudart-win-cuda-13.1-x64.zip)
+          - [Windows x64 (HIP)](${release_url}/beellama-${TAG_NAME}-bin-win-hip-radeon-x64.zip)
+
+          **Docker:**
+          - ${docker_server} / ${docker_cpu} (CPU, linux/amd64 + linux/arm64; usable on Apple Silicon Docker Desktop without Metal acceleration)
+          - ${docker_cuda} / ${docker_cuda12}
+          - ${docker_cuda13}
+          - ${docker_rocm}
+          - ${docker_vulkan}
+          - ${docker_sycl}
+          EOF
+
+      - name: Publish release
+        shell: bash
+        run: |
+          set -euo pipefail
+          mapfile -t release_files < <(find release -type f ! -name release-notes.md | sort)
+          if [[ "${#release_files[@]}" -eq 0 ]]; then
+            echo "No release files found" >&2
+            exit 1
+          fi
+
+          if gh release view "${TAG_NAME}" >/dev/null 2>&1; then
+            gh release upload "${TAG_NAME}" "${release_files[@]}" --clobber
+            gh release edit "${TAG_NAME}" --title "${TAG_NAME}" --notes-file release-notes.md
+          else
+            gh release create "${TAG_NAME}" "${release_files[@]}" --title "${TAG_NAME}" --notes-file release-notes.md --verify-tag
+          fi
