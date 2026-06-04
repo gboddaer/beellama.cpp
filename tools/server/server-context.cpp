@@ -917,9 +917,9 @@ struct server_slot : server_adaptive_dm_state {
         return task->need_embd() || (get_spec() && common_speculative_need_embd(get_spec()));
     }
 
-    bool need_embd_pre_norm() const {
+    bool need_embd_nextn() const {
         GGML_ASSERT(task);
-        return get_spec() && common_speculative_need_embd_pre_norm(get_spec());
+        return get_spec() && common_speculative_need_embd_nextn(get_spec());
     }
 
     // if the context does not have a memory module then all embeddings have to be computed within a single ubatch
@@ -5478,9 +5478,9 @@ private:
                             break;
                         }
 
-                        // embedding requires all tokens in the batch to be output;
-                        // MTP also wants logits at every prompt position so the
-                        // streaming hook can mirror t_h_pre_norm into ctx_dft.
+                        // embedding requests require all tokens in the batch to be output;
+                        // NextN/MTP hidden rows are captured separately and do not need
+                        // prompt logits for every token.
                         common_batch_add(batch,
                             cur_tok,
                             slot.prompt.tokens.pos_next(),

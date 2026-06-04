@@ -258,25 +258,26 @@ int main(int argc, char ** argv) {
     ok &= expect(cuda_argmax.find("argmax < 0") != std::string::npos &&
                  cuda_argmax.find("dst[nrows + row]") != std::string::npos,
         "CUDA reduced-logits argmax must not read rowx[-1] when every row candidate is invalid");
-    ok &= expect(context_cpp.find("cparams.ctx_type == LLAMA_CONTEXT_TYPE_MTP && has_token && has_embd") != std::string::npos,
+    ok &= expect(context_cpp.find("GGML_ASSERT(batch_inp.token || batch_inp.embd);") != std::string::npos,
         "decode must allow MTP draft batches to carry both token ids and target hidden embeddings");
     ok &= expect(context_cpp.find("/*.ctx_type =*/ cparams.ctx_type") != std::string::npos,
         "context creation must propagate ctx_type into memory creation so MTP uses its MTP-only KV cache");
     ok &= expect(context_cpp.find("graph_params(res, ubatch, mctx, ctx_type_to_graph_type(cparams.ctx_type))") != std::string::npos,
         "graph reservation must use the active context graph type so MTP reserves the MTP graph");
-    ok &= expect(context_cpp.find("auto * t_h_pre_norm = res->get_h_pre_norm();") != std::string::npos &&
+    ok &= expect(context_cpp.find("auto * t_h_nextn") != std::string::npos &&
                  context_cpp.find("n_tokens_prev") != std::string::npos &&
-                 context_cpp.find("ggml_backend_tensor_get_async(backend_h, t_h_pre_norm") != std::string::npos &&
-                 context_cpp.find("embd_pre_norm.size > 0 && cparams.embeddings_pre_norm_masked") != std::string::npos,
-        "decode must copy pre-norm hidden graph outputs for MTP target and draft contexts");
-    ok &= expect(speculative.find("target pre-norm embeddings are not available") != std::string::npos &&
-                 speculative.find("draft pre-norm embedding row") != std::string::npos,
-        "MTP speculation must fail cleanly if required pre-norm hidden rows are unavailable");
+                 context_cpp.find("ggml_backend_tensor_get_async(backend_h, t_h_nextn") != std::string::npos &&
+                 context_cpp.find("embd_nextn.size > 0") != std::string::npos,
+        "decode must copy nextn hidden graph outputs for MTP target and draft contexts");
+    ok &= expect(context_cpp.find("embd_nextn.size > 0 && cparams.embeddings_nextn_masked") != std::string::npos,
+        "output reordering must only swap masked nextn rows; unmasked nextn rows are indexed by raw token position");
+    ok &= expect(speculative.find("target nextn embeddings are not available") != std::string::npos &&
+                 speculative.find("draft nextn embedding row") != std::string::npos,
+        "MTP speculation must fail cleanly if required nextn hidden rows are unavailable");
     ok &= expect(context_cpp.find("get_tensor_data(gpu_layer->qkv") != std::string::npos, "conv rebuild must read QKV from GPU tape through placement-safe tensor access");
     ok &= expect(graph_cpp.find("t_logits_argmax = nullptr;") != std::string::npos, "graph reset must clear reduced logits output pointer");
-    ok &= expect(graph_cpp.find("params.cparams.embeddings_pre_norm && t_h_pre_norm != nullptr") != std::string::npos ||
-                 graph_cpp.find("t_h_pre_norm != nullptr && params.cparams.embeddings_pre_norm") != std::string::npos,
-        "pre-norm hidden graph output must be gated by embeddings_pre_norm so DFlash capture does not force an unused graph output");
+    ok &= expect(graph_cpp.find("if (t_h_nextn != nullptr)") != std::string::npos,
+        "nextn hidden graph output must be exposed when model graphs create it");
     ok &= expect(context_cpp.find("logits_argmax_buf.clear();") != std::string::npos, "decode must clear stale reduced logits ids");
     ok &= expect(context_cpp.find("logits_argmax_prob_buf.clear();") != std::string::npos, "decode must clear stale reduced logits probabilities");
     ok &= expect(graph_h.find("cparams.cb_eval              == other.cparams.cb_eval") == std::string::npos,
@@ -593,12 +594,12 @@ int main(int argc, char ** argv) {
     ok &= expect(context_cpp.find("std::swap(logits_argmax_prob_buf") != std::string::npos, "output reordering must include reduced logits probabilities");
     ok &= expect(qwen35.find("ggml_build_forward_expand(gf, ggml_cpy(ctx0, qkv_cont, qkv_dst))") != std::string::npos, "Qwen3.5 must graph-copy QKV into GPU tape");
     ok &= expect(qwen35moe.find("ggml_build_forward_expand(gf, ggml_cpy(ctx0, qkv_cont, qkv_dst))") != std::string::npos, "Qwen3.5-MoE must graph-copy QKV into GPU tape");
-    ok &= expect(qwen35.find("const bool need_full_h_pre_norm = cparams.embeddings_pre_norm && !cparams.embeddings_pre_norm_masked;") != std::string::npos &&
-                 qwen35.find("inp_out_ids && !need_full_h_pre_norm") != std::string::npos,
-        "Qwen3.5 prefill must gather final-layer output rows early unless full pre-norm embeddings are requested");
-    ok &= expect(qwen35moe.find("const bool need_full_h_pre_norm = cparams.embeddings_pre_norm && !cparams.embeddings_pre_norm_masked;") != std::string::npos &&
-                 qwen35moe.find("inp_out_ids && !need_full_h_pre_norm") != std::string::npos,
-        "Qwen3.5-MoE prefill must gather final-layer output rows early unless full pre-norm embeddings are requested");
+    ok &= expect(qwen35.find("inp_out_ids && cparams.embeddings_nextn_masked") != std::string::npos &&
+                 qwen35.find("res->t_h_nextn = cur;") != std::string::npos,
+        "Qwen3.5 prefill must gather final-layer output rows early when nextn output is masked");
+    ok &= expect(qwen35moe.find("inp_out_ids && cparams.embeddings_nextn_masked") != std::string::npos &&
+                 qwen35moe.find("res->t_h_nextn = cur;") != std::string::npos,
+        "Qwen3.5-MoE prefill must gather final-layer output rows early when nextn output is masked");
     ok &= expect(qwen35.find("const int64_t n_head_kv_il = hparams.n_head_kv(il);") != std::string::npos &&
                  qwen35.find("Kcur = ggml_reshape_3d(ctx0, Kcur, n_embd_head, n_head_kv_il, n_tokens);") != std::string::npos &&
                  qwen35.find("Vcur = ggml_reshape_3d(ctx0, Vcur, n_embd_head, n_head_kv_il, n_tokens);") != std::string::npos,

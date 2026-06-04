@@ -3,7 +3,7 @@
 #include "common.h"
 #include "ggml.h"
 #include "llama.h"
-#include "../src/llama-ext.h" // staging API: llama_set_embeddings_pre_norm / llama_get_embeddings_pre_norm_ith (used by MTP)
+#include "../src/llama-ext.h" // staging API: llama_set_embeddings_nextn / llama_get_embeddings_nextn_ith (used by MTP)
 #include "log.h"
 #include "ngram-cache.h"
 #include "ngram-map.h"
@@ -350,8 +350,8 @@ struct common_speculative_impl {
     // true if this implementation requires the target context to extract post-norm embeddings
     virtual bool need_embd() const = 0;
 
-    // true if this implementation requires the target context to extract pre-norm embeddings
-    virtual bool need_embd_pre_norm() const { return false; }
+    // true if this implementation requires the target context to extract nextn embeddings
+    virtual bool need_embd_nextn() const { return false; }
 
     virtual void set_seq_id(llama_seq_id /*seq_id*/) {}
 
@@ -739,8 +739,8 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             }
         }
 
-        llama_set_embeddings_pre_norm(ctx_tgt, true, /*masked*/ false);
-        llama_set_embeddings_pre_norm(ctx_dft, true, /*masked*/ true);
+        llama_set_embeddings_nextn(ctx_tgt, true, /*masked*/ false);
+        llama_set_embeddings_nextn(ctx_dft, true, /*masked*/ true);
 
         pending_h.assign(n_seq, std::vector<float>(n_embd, 0.0f));
 
@@ -835,9 +835,9 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         //                                                       ^--- this is a problem
         // TODO:this is generally true, but would be nice to assert it
         {
-            const float * h_tgt = llama_get_embeddings_pre_norm(ctx_tgt);
+            const float * h_tgt = llama_get_embeddings_nextn(ctx_tgt);
             if (h_tgt == nullptr) {
-                LOG_ERR("%s: target pre-norm embeddings are not available\n", __func__);
+                LOG_ERR("%s: target nextn embeddings are not available\n", __func__);
                 return false;
             }
             std::memcpy(batch.embd + (size_t) 1 * n_embd, h_tgt, row_bytes * (n_tokens-1));
@@ -873,9 +873,9 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             verify_h[seq_id].resize((size_t) n_rows * n_embd);
 
             for (int32_t i = 0; i < n_rows; ++i) {
-                const float * h = llama_get_embeddings_pre_norm_ith(ctx_tgt, i_batch_beg[seq_id] + i);
+                const float * h = llama_get_embeddings_nextn_ith(ctx_tgt, i_batch_beg[seq_id] + i);
                 if (h == nullptr) {
-                    LOG_ERR("%s: target pre-norm embedding row %d is not available\n",
+                    LOG_ERR("%s: target nextn embedding row %d is not available\n",
                             __func__, (int) (i_batch_beg[seq_id] + i));
                     return false;
                 }
@@ -939,9 +939,9 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                 auto * smpl = smpls[seq_id].get();
 
                 common_sampler_sample(smpl, ctx_dft, i_batch, true);
-                h_row = llama_get_embeddings_pre_norm_ith(ctx_dft, i_batch);
+                h_row = llama_get_embeddings_nextn_ith(ctx_dft, i_batch);
                 if (h_row == nullptr) {
-                    LOG_WRN("%s: draft pre-norm embedding row %d is not available; stopping MTP draft for seq_id=%d\n",
+                    LOG_WRN("%s: draft nextn embedding row %d is not available; stopping MTP draft for seq_id=%d\n",
                             __func__, i_batch, (int) seq_id);
                     drafting[seq_id] = false;
                     n_drafting--;
@@ -1027,7 +1027,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         return false;
     }
 
-    bool need_embd_pre_norm() const override {
+    bool need_embd_nextn() const override {
         return true;
     }
 };
@@ -4049,13 +4049,13 @@ bool common_speculative_need_embd(common_speculative * spec) {
     return false;
 }
 
-bool common_speculative_need_embd_pre_norm(common_speculative * spec) {
+bool common_speculative_need_embd_nextn(common_speculative * spec) {
     if (spec == nullptr) {
         return false;
     }
 
     for (auto & impl : spec->impls) {
-        if (impl->need_embd_pre_norm()) {
+        if (impl->need_embd_nextn()) {
             return true;
         }
     }

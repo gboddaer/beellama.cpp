@@ -376,10 +376,10 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
         //     count only the same type of previous layers to avoid this
         auto get_il_eff = [&](const size_t il){
             size_t ret = 0;
-            const bool il_is_recurrent = hparams.is_recurrent(il);
-            const bool il_is_swa       = hparams.is_swa(il);
+            const bool il_is_recr = hparams.is_recurrent(il);
+            const bool il_is_swa  = hparams.is_swa(il);
             for (size_t il_prev = 0; il_prev < il; il_prev++) {
-                ret += hparams.is_recurrent(il_prev) == il_is_recurrent && hparams.is_swa(il_prev) == il_is_swa;
+                ret += hparams.is_recurrent(il_prev) == il_is_recr && hparams.is_swa(il_prev) == il_is_swa;
             }
             return ret;
         };
@@ -1079,18 +1079,19 @@ void llama_model_base::load_hparams(llama_model_loader & ml) {
     std::fill(hparams.n_head_arr.begin(),    hparams.n_head_arr.end(),    0);
     std::fill(hparams.n_head_kv_arr.begin(), hparams.n_head_kv_arr.end(), 0);
     std::fill(hparams.n_ff_arr.begin(),      hparams.n_ff_arr.end(),      0);
-    std::fill(
-        hparams.recurrent_layer_arr.begin(),
-        hparams.recurrent_layer_arr.end(),
-        llm_arch_is_recurrent(ml.get_arch()));
 
     std::fill(hparams.rope_sections.begin(), hparams.rope_sections.end(), 0);
     std::fill(hparams.swa_layers.begin(), hparams.swa_layers.end(), 0);
+    std::fill(
+            hparams.recurrent_layer_arr.begin(),
+            hparams.recurrent_layer_arr.end(),
+            llm_arch_is_recurrent(ml.get_arch()));
 
     std::fill(hparams.xielu_alpha_n.begin(), hparams.xielu_alpha_n.end(), 0.0f);
     std::fill(hparams.xielu_alpha_p.begin(), hparams.xielu_alpha_p.end(), 0.0f);
-    std::fill(hparams.xielu_beta.begin(), hparams.xielu_beta.end(), 0.0f);
-    std::fill(hparams.xielu_eps.begin(), hparams.xielu_eps.end(), 0.0f);
+    std::fill(hparams.xielu_beta.begin(),    hparams.xielu_beta.end(), 0.0f);
+    std::fill(hparams.xielu_eps.begin(),     hparams.xielu_eps.end(), 0.0f);
+
     std::fill(hparams.swiglu_clamp_exp.begin(),   hparams.swiglu_clamp_exp.end(),   0.0f);
     std::fill(hparams.swiglu_clamp_shexp.begin(), hparams.swiglu_clamp_shexp.end(), 0.0f);
 

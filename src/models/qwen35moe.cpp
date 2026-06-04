@@ -24,6 +24,7 @@ void llama_model_qwen35moe::load_arch_hparams(llama_model_loader & ml) {
     // attention-only and must be flagged non-recurrent.
     {
         const uint32_t n_main = hparams.n_layer - hparams.nextn_predict_layers;
+
         uint32_t full_attn_interval = 4;
         ml.get_key(LLM_KV_FULL_ATTENTION_INTERVAL, full_attn_interval, false);
         for (uint32_t i = 0; i < hparams.n_layer; ++i) {
@@ -180,7 +181,6 @@ llama_model_qwen35moe::graph::graph(const llama_model & model, const llm_graph_p
 
     ggml_tensor * inp_pos     = build_inp_pos();
     ggml_tensor * inp_out_ids = build_inp_out_ids();
-    const bool need_full_h_pre_norm = cparams.embeddings_pre_norm && !cparams.embeddings_pre_norm_masked;
     const int64_t n_seq_tokens = ubatch.n_seq_tokens;
     const int64_t dflash_capture_n_seqs =
         ubatch.n_seqs_unq > 1 ? (int64_t) ubatch.n_seqs_unq : 1;
@@ -206,7 +206,7 @@ llama_model_qwen35moe::graph::graph(const llama_model & model, const llm_graph_p
             cur = build_layer_attn(inp->get_attn(), cur, inp_pos, sections, il);
         }
 
-        if (il == n_transformer_layers - 1 && inp_out_ids && !need_full_h_pre_norm) {
+        if (il == n_transformer_layers - 1 && inp_out_ids && cparams.embeddings_nextn_masked) {
             cur   = ggml_get_rows(ctx0, cur, inp_out_ids);
             inpSA = ggml_get_rows(ctx0, inpSA, inp_out_ids);
         }
@@ -311,15 +311,15 @@ llama_model_qwen35moe::graph::graph(const llama_model & model, const llm_graph_p
     }
     cur = inpL;
 
-    cb(cur, "h_pre_norm", -1);
-    res->t_h_pre_norm = cur;
+    // post-norm hidden state feeds both the LM head and the MTP seed below
+    cur = build_norm(cur, model.output_norm, nullptr, LLM_NORM_RMS, -1);
 
-    if (need_full_h_pre_norm && inp_out_ids) {
+    cb(cur, "h_nextn", -1);
+    res->t_h_nextn = cur;
+
+    if (!cparams.embeddings_nextn_masked && inp_out_ids) {
         cur = ggml_get_rows(ctx0, cur, inp_out_ids);
     }
-
-    // Final norm
-    cur = build_norm(cur, model.output_norm, nullptr, LLM_NORM_RMS, -1);
 
     cb(cur, "result_norm", -1);
     res->t_embd = cur;
@@ -895,17 +895,16 @@ llama_model_qwen35moe::graph_mtp::graph_mtp(const llama_model & model, const llm
     cur = ggml_add(ctx0, cur, ffn_residual);
     cb(cur, "mtp_post_ffn", il);
 
-    // Pre-norm hidden state: used by the AR draft loop to seed the next MTP step.
-    cb(cur, "h_pre_norm", -1);
-    res->t_h_pre_norm = cur;
-
-    cur   = ggml_get_rows(ctx0, cur, inp_out_ids);
-
     ggml_tensor * head_norm_w = layer.nextn.shared_head_norm
             ? layer.nextn.shared_head_norm
             : model.output_norm;
     GGML_ASSERT(head_norm_w && "QWEN35MOE MTP: missing both nextn.shared_head_norm and output_norm");
     cur = build_norm(cur, head_norm_w, nullptr, LLM_NORM_RMS, -1);
+
+    cb(cur, "h_nextn", -1);
+    res->t_h_nextn= cur;
+
+    cur = ggml_get_rows(ctx0, cur, inp_out_ids);
     cb(cur, "mtp_shared_head_norm", -1);
 
     ggml_tensor * head_w = layer.nextn.shared_head_head ? layer.nextn.shared_head_head : model.output;

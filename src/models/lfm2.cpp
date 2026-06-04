@@ -236,7 +236,7 @@ llama_model_lfm2::graph<iswa>::graph(const llama_model & model, const llm_graph_
         cb(cur, "model.layers.{}.operator_norm", il);
 
         cur = hparams.is_recurrent(il) ? build_shortconv_block(cur, inp_hybrid->get_recr(), il) :
-                                         build_attn_block(cur, inp_pos, inp_hybrid->get_attn(), il);
+                                    build_attn_block(cur, inp_pos, inp_hybrid->get_attn(), il);
 
         if (il == n_layer - 1 && inp_out_ids) {
             cur      = ggml_get_rows(ctx0, cur, inp_out_ids);
