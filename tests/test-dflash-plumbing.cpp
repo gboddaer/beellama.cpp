@@ -597,12 +597,16 @@ int main(int argc, char ** argv) {
     ok &= expect(context_cpp.find("std::swap(logits_argmax_prob_buf") != std::string::npos, "output reordering must include reduced logits probabilities");
     ok &= expect(qwen35.find("ggml_build_forward_expand(gf, ggml_cpy(ctx0, qkv_cont, qkv_dst))") != std::string::npos, "Qwen3.5 must graph-copy QKV into GPU tape");
     ok &= expect(qwen35moe.find("ggml_build_forward_expand(gf, ggml_cpy(ctx0, qkv_cont, qkv_dst))") != std::string::npos, "Qwen3.5-MoE must graph-copy QKV into GPU tape");
-    ok &= expect(qwen35.find("inp_out_ids && cparams.embeddings_nextn_masked") != std::string::npos &&
+    ok &= expect(qwen35.find("const bool need_full_h_nextn = cparams.embeddings_nextn && !cparams.embeddings_nextn_masked;") != std::string::npos &&
+                 qwen35.find("inp_out_ids && !need_full_h_nextn") != std::string::npos &&
+                 qwen35.find("if (need_full_h_nextn && inp_out_ids)") != std::string::npos &&
                  qwen35.find("res->t_h_nextn = cur;") != std::string::npos,
-        "Qwen3.5 prefill must gather final-layer output rows early when nextn output is masked");
-    ok &= expect(qwen35moe.find("inp_out_ids && cparams.embeddings_nextn_masked") != std::string::npos &&
+        "Qwen3.5 prefill must gather final-layer output rows early unless unmasked nextn output is requested");
+    ok &= expect(qwen35moe.find("const bool need_full_h_nextn = cparams.embeddings_nextn && !cparams.embeddings_nextn_masked;") != std::string::npos &&
+                 qwen35moe.find("inp_out_ids && !need_full_h_nextn") != std::string::npos &&
+                 qwen35moe.find("if (need_full_h_nextn && inp_out_ids)") != std::string::npos &&
                  qwen35moe.find("res->t_h_nextn = cur;") != std::string::npos,
-        "Qwen3.5-MoE prefill must gather final-layer output rows early when nextn output is masked");
+        "Qwen3.5-MoE prefill must gather final-layer output rows early unless unmasked nextn output is requested");
     ok &= expect(qwen35.find("const int64_t n_head_kv_il = hparams.n_head_kv(il);") != std::string::npos &&
                  qwen35.find("Kcur = ggml_reshape_3d(ctx0, Kcur, n_embd_head, n_head_kv_il, n_tokens);") != std::string::npos &&
                  qwen35.find("Vcur = ggml_reshape_3d(ctx0, Vcur, n_embd_head, n_head_kv_il, n_tokens);") != std::string::npos,
