@@ -1245,13 +1245,13 @@ int main(int argc, char ** argv) {
     ok &= expect(server_context.find("expanded recurrent state to %d cells before speculative GPU buffers") != std::string::npos, "server must expand recurrent backup cells before DFlash slot/GPU buffer init");
     ok &= expect(server_context.find("server_dflash_recurrent_rollback_plan speculative_recurrent_rollback_plan() const") != std::string::npos &&
                  server_context.find("params_base.speculative.type() != COMMON_SPECULATIVE_TYPE_DFLASH") != std::string::npos &&
-                 server_context.find("flat DFlash target architecture %s will use %u recurrent snapshots per visible slot") != std::string::npos &&
-                 server_context.find("ctx_tgt_seq_rm_type != COMMON_CONTEXT_SEQ_RM_TYPE_RS && params_base.speculative.type() == COMMON_SPECULATIVE_TYPE_DFLASH") != std::string::npos,
-        "server must use RS snapshots for flat DFlash when available and backup rollback only on non-RS DFlash contexts");
-    ok &= expect(common_h.find("t == COMMON_SPECULATIVE_TYPE_DRAFT_MTP ||") != std::string::npos &&
-                 common_h.find("t == COMMON_SPECULATIVE_TYPE_DFLASH && branch_budget == 0") != std::string::npos &&
+                 server_context.find("flat DFlash target architecture %s will use recurrent-only backup cells; keeping attention streams at n_parallel=%d") != std::string::npos &&
+                 server_context.find("llama_memory_seq_rm_recurrent(mem, seq_backup, -1, -1)") != std::string::npos,
+        "server must use recurrent-only backup cells for flat DFlash instead of RS snapshots or attention backup streams");
+    ok &= expect(common_h.find("return t == COMMON_SPECULATIVE_TYPE_DRAFT_MTP;") != std::string::npos &&
+                 common_h.find("t == COMMON_SPECULATIVE_TYPE_DFLASH && branch_budget == 0") == std::string::npos &&
                  common_cpp.find("const uint32_t n_rs_batch = cparams.n_rs_seq + 1") != std::string::npos,
-        "MTP and flat DFlash target contexts must enable bounded recurrent snapshots and reserve verifier batch width");
+        "MTP target contexts must enable bounded recurrent snapshots without applying that memory multiplier to flat DFlash");
     ok &= expect(server_context.find("cparams.n_rs_seq = 0") != std::string::npos,
         "MTP draft context creation must force n_rs_seq = 0 (upstream invariant: MTP heads have no delta-net layers)");
     ok &= expect(server_context.find("const bool slot_uses_fork_spec") != std::string::npos &&
@@ -2184,8 +2184,8 @@ int main(int argc, char ** argv) {
                  server_context.find("\"qwen35\"") != std::string::npos &&
                  server_context.find("\"gemma4\"") == std::string::npos &&
                  server_context.find("does not need recurrent rollback") != std::string::npos &&
-                 server_context.find("server_arch_name_supports_rs_rollback") != std::string::npos,
-        "DFlash recurrent rollback allocation must be gated by probed recurrent/hybrid and RS-capable target architecture");
+                 server_context.find("recurrent-only backup cells") != std::string::npos,
+        "DFlash recurrent rollback allocation must be gated by probed recurrent/hybrid target architecture");
     ok &= expect(server_context.find("DFlash target requires recurrent rollback, but neither recurrent snapshots nor backup cells are available") != std::string::npos,
         "DFlash startup must fail closed if a recurrent/hybrid target has no rollback mechanism");
     ok &= expect(server_context.find("params_base.kvarn.type == LLAMA_KVARN_TYPE_DISABLED") != std::string::npos &&

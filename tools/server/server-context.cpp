@@ -51,16 +51,10 @@ using json = nlohmann::ordered_json;
 
 server_dflash_recurrent_rollback_plan server_context_dflash_recurrent_rollback_plan(
         const common_params_speculative & speculative,
-        bool target_recurrent_or_hybrid,
-        bool target_supports_rs_rollback) {
+        bool target_recurrent_or_hybrid) {
     server_dflash_recurrent_rollback_plan plan;
 
     if (speculative.type() != COMMON_SPECULATIVE_TYPE_DFLASH || !target_recurrent_or_hybrid) {
-        return plan;
-    }
-
-    if (speculative.branch_budget == 0 && target_supports_rs_rollback) {
-        plan.uses_rs_snapshots = true;
         return plan;
     }
 
@@ -100,7 +94,6 @@ static bool dflash_shared_drafter_batch_disabled() {
 struct server_model_arch_probe {
     bool known = false;
     bool recurrent_or_hybrid = false;
-    bool supports_rs_rollback = false;
     std::string name;
 };
 
@@ -127,15 +120,6 @@ static bool server_arch_name_is_recurrent_or_hybrid(const std::string & name) {
     };
 
     return recurrent_or_hybrid.find(name) != recurrent_or_hybrid.end();
-}
-
-static bool server_arch_name_supports_rs_rollback(const std::string & name) {
-    static const std::set<std::string> rs_rollback = {
-        "qwen35",
-        "qwen35moe",
-    };
-
-    return rs_rollback.find(name) != rs_rollback.end();
 }
 
 static server_model_arch_probe server_probe_model_arch(const std::string & path_model) {
@@ -166,7 +150,6 @@ static server_model_arch_probe server_probe_model_arch(const std::string & path_
             result.known = true;
             result.name = arch_name;
             result.recurrent_or_hybrid = server_arch_name_is_recurrent_or_hybrid(result.name);
-            result.supports_rs_rollback = server_arch_name_supports_rs_rollback(result.name);
         }
     }
 
@@ -2138,21 +2121,17 @@ private:
 
         plan = server_context_dflash_recurrent_rollback_plan(
                 params_base.speculative,
-                arch.recurrent_or_hybrid,
-                arch.supports_rs_rollback);
+                arch.recurrent_or_hybrid);
 
         if (!arch.recurrent_or_hybrid) {
             SRV_INF("DFlash target architecture %s does not need recurrent rollback; keeping n_parallel=%d\n",
                     arch.name.c_str(), params_base.n_parallel);
-        } else if (plan.uses_rs_snapshots) {
-            SRV_INF("flat DFlash target architecture %s will use %u recurrent snapshots per visible slot; keeping n_parallel=%d\n",
-                    arch.name.c_str(), params_base.speculative.need_n_rs_seq(), params_base.n_parallel);
         } else if (plan.needs_attention_backup_streams) {
             SRV_WRN("DFlash DDTree target architecture %s needs attention backup streams for branch rollback\n",
                     arch.name.c_str());
         } else if (plan.needs_backup_sequences) {
-            SRV_WRN("DFlash target architecture %s lacks bounded recurrent snapshots; reserving recurrent-only backup cells\n",
-                    arch.name.c_str());
+            SRV_INF("flat DFlash target architecture %s will use recurrent-only backup cells; keeping attention streams at n_parallel=%d\n",
+                    arch.name.c_str(), params_base.n_parallel);
         }
 
         return plan;
@@ -2573,15 +2552,6 @@ private:
                 llama_n_rs_seq(ctx_tgt) == 0) {
             SRV_ERR("%s", "DFlash target requires recurrent rollback, but neither recurrent snapshots nor backup cells are available\n");
             return false;
-        }
-        if (params_base.speculative.type() == COMMON_SPECULATIVE_TYPE_DFLASH &&
-                recurrent_backup_sequences &&
-                !recurrent_backup_attention_streams &&
-                llama_n_rs_seq(ctx_tgt) > 0) {
-            SRV_INF("%s", "loaded DFlash target exposes recurrent snapshots; dropping conservative backup cells\n");
-            recurrent_backup_sequences = false;
-            recurrent_expanded = true;
-            n_seq_max_full = n_parallel_user;
         }
 
         n_ctx = llama_n_ctx(ctx_tgt);

@@ -494,16 +494,14 @@ struct common_params_speculative {
 
     uint32_t need_n_rs_seq() const {
         bool needs_rs_seq = std::any_of(types.begin(), types.end(), [&](auto t) {
-            return t == COMMON_SPECULATIVE_TYPE_DRAFT_MTP ||
-                   (t == COMMON_SPECULATIVE_TYPE_DFLASH && branch_budget == 0);
+            return t == COMMON_SPECULATIVE_TYPE_DRAFT_MTP;
         });
 
         if (!needs_rs_seq) {
             return 0u;
         }
 
-        const int32_t rs_n_max = std::max(draft.n_max, n_max);
-        return rs_n_max > 0 ? (uint32_t) rs_n_max : 0u;
+        return draft.n_max > 0 ? (uint32_t) draft.n_max : 0u;
     }
 };
 
