@@ -673,6 +673,17 @@ bool server_prompt_checkpoint_matches_restore_window(
         llama_pos                        pos_next,
         bool                             is_recurrent_or_hybrid);
 
+int server_prompt_effective_checkpoint_limit(
+        int  configured_checkpoints,
+        bool prompt_cache_boundary_required);
+
+bool server_prompt_checkpoint_creation_allowed(
+        bool boundary_only,
+        bool n_before_user_known,
+        bool is_on_user,
+        bool is_after_user,
+        bool near_prompt_end);
+
 server_prompt server_prompt_clone_with_checkpoint_budget(
         const server_prompt & prompt,
         size_t state_size,

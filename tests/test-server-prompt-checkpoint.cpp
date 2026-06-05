@@ -82,6 +82,37 @@ int main() {
                 /*is_recurrent_or_hybrid =*/ true));
     }
 
+    {
+        assert(server_prompt_effective_checkpoint_limit(
+                /*configured_checkpoints =*/ 0,
+                /*prompt_cache_boundary_required =*/ false) == 0);
+        assert(server_prompt_effective_checkpoint_limit(
+                /*configured_checkpoints =*/ 0,
+                /*prompt_cache_boundary_required =*/ true) == 1);
+        assert(server_prompt_effective_checkpoint_limit(
+                /*configured_checkpoints =*/ 32,
+                /*prompt_cache_boundary_required =*/ true) == 32);
+
+        assert(server_prompt_checkpoint_creation_allowed(
+                /*boundary_only =*/ true,
+                /*n_before_user_known =*/ true,
+                /*is_on_user =*/ true,
+                /*is_after_user =*/ false,
+                /*near_prompt_end =*/ false));
+        assert(!server_prompt_checkpoint_creation_allowed(
+                /*boundary_only =*/ true,
+                /*n_before_user_known =*/ true,
+                /*is_on_user =*/ false,
+                /*is_after_user =*/ true,
+                /*near_prompt_end =*/ true));
+        assert(server_prompt_checkpoint_creation_allowed(
+                /*boundary_only =*/ false,
+                /*n_before_user_known =*/ true,
+                /*is_on_user =*/ false,
+                /*is_after_user =*/ true,
+                /*near_prompt_end =*/ true));
+    }
+
     prompt.data.main.resize(64);
     prompt.data.drft.resize(32);
     prompt.clear();

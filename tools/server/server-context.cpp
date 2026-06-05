@@ -2235,6 +2235,23 @@ private:
         return cache_limit > 0 ? cache_limit / 2 : 0;
     }
 
+    bool prompt_cache_boundary_checkpoints_enabled(const server_slot & slot) const {
+        if (params_base.n_ctx_checkpoints > 0 || !prompt_cache) {
+            return false;
+        }
+
+        if (!slot.task ||
+                slot.task->type != SERVER_TASK_TYPE_COMPLETION ||
+                !slot.task->params.cache_prompt) {
+            return false;
+        }
+
+        return ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_FULL ||
+               ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_RS ||
+               n_swa > 0 ||
+               llama_model_is_hybrid(model_tgt);
+    }
+
     void erase_oldest_checkpoint(server_slot & slot, const char * reason) {
         const auto & cur = slot.prompt.checkpoints.front();
 
@@ -4037,7 +4054,16 @@ private:
     }
 
     // n_tokens_cur: the number of tokens added to the batch for the current slot
-    void create_checkpoint(server_slot & slot, const int64_t n_tokens_cur, llama_pos pos_min, llama_pos pos_max) {
+    void create_checkpoint(
+            server_slot & slot,
+            const int64_t n_tokens_cur,
+            llama_pos pos_min,
+            llama_pos pos_max,
+            int max_checkpoints) {
+        if (max_checkpoints <= 0) {
+            return;
+        }
+
         // Save DFlash ring buffer alongside the recurrent state checkpoint.
         const bool dflash_checkpoint_slot =
             slot.can_speculate() &&
@@ -4061,7 +4087,7 @@ private:
             return;
         }
 
-        while (slot.prompt.checkpoints.size() >= (size_t) params_base.n_ctx_checkpoints) {
+        while (slot.prompt.checkpoints.size() >= (size_t) max_checkpoints) {
             erase_oldest_checkpoint(slot, "count limit");
         }
 
@@ -4123,7 +4149,7 @@ private:
 
         SLT_INF(slot,
                 "created context checkpoint %d of %d (pos_min = %d, pos_max = %d, n_tokens = %" PRId64 ", size = %.3f MiB)\n",
-                (int) slot.prompt.checkpoints.size(), params_base.n_ctx_checkpoints, saved.pos_min,
+                (int) slot.prompt.checkpoints.size(), max_checkpoints, saved.pos_min,
                 saved.pos_max, saved.n_tokens, (float) saved.size() / 1024 / 1024);
     }
 
@@ -5627,7 +5653,22 @@ private:
                         alora_disabled_id = enabled_loras[0];
                     }
 
-                    bool do_checkpoint = params_base.n_ctx_checkpoints > 0;
+                    const bool checkpoint_memory_needs_restore =
+                        ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_FULL ||
+                        ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_RS ||
+                        n_swa > 0 ||
+                        llama_model_is_hybrid(model_tgt);
+
+                    const bool do_prompt_cache_boundary_checkpoint =
+                        prompt_cache_boundary_checkpoints_enabled(slot);
+                    const bool do_regular_context_checkpoint =
+                        params_base.n_ctx_checkpoints > 0;
+                    const int effective_checkpoint_limit =
+                        server_prompt_effective_checkpoint_limit(
+                                params_base.n_ctx_checkpoints,
+                                do_prompt_cache_boundary_checkpoint);
+
+                    bool do_checkpoint = effective_checkpoint_limit > 0;
 
                     // make checkpoints only for completion tasks
                     do_checkpoint = do_checkpoint && slot.task->type == SERVER_TASK_TYPE_COMPLETION;
@@ -5639,11 +5680,7 @@ private:
                     // checkpoints are created only if:
                     // - the model does not support partial sequence removal
                     // - the model uses SWA (and we are not using `swa_full`)
-                    do_checkpoint = do_checkpoint && (
-                            ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_FULL ||
-                            ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_RS ||
-                            n_swa > 0 ||
-                            llama_model_is_hybrid(model_tgt));
+                    do_checkpoint = do_checkpoint && checkpoint_memory_needs_restore;
 
                     bool has_mtmd = false;
 
@@ -5736,7 +5773,7 @@ private:
                         //  - 4 + n_ubatch
                         //  - 4
                         // ref: https://github.com/ggml-org/llama.cpp/pull/20288
-                        if (do_checkpoint) {
+                        if (do_regular_context_checkpoint && do_checkpoint) {
                             static const int checkpoint_offsets[] = {4 + n_ubatch, 4};
 
                             bool should_break = false;
@@ -5794,10 +5831,12 @@ private:
                             n_before_user_known &&
                             n_tokens_start > n_before_user;
 
-                        const bool is_allowed =
-                            !n_before_user_known ||
-                            is_on_user ||
-                            (is_after_user && near_prompt_end);
+                        const bool is_allowed = server_prompt_checkpoint_creation_allowed(
+                                do_prompt_cache_boundary_checkpoint,
+                                n_before_user_known,
+                                is_on_user,
+                                is_after_user,
+                                near_prompt_end);
 
                         if (do_checkpoint && !is_allowed) {
                             do_checkpoint = false;
@@ -5825,7 +5864,7 @@ private:
                     // note: we create the checkpoint before calling llama_decode(), so the current batch is not
                     //       yet processed and therefore it is not part of the checkpoint.
                     if (do_checkpoint) {
-                        create_checkpoint(slot, n_tokens_cur, pos_min, pos_max);
+                        create_checkpoint(slot, n_tokens_cur, pos_min, pos_max, effective_checkpoint_limit);
                     }
                 }
 

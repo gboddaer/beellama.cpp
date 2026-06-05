@@ -206,7 +206,7 @@ int main(int argc, char ** argv) {
             "server must discard stale DFlash ring state before processing a prompt with zero reusable prefix tokens");
     }
     {
-        const size_t checkpoint_start = server_context.find("bool do_checkpoint = params_base.n_ctx_checkpoints > 0;");
+        const size_t checkpoint_start = server_context.find("bool do_checkpoint = effective_checkpoint_limit > 0;");
         const size_t cache_prompt_gate = server_context.find("do_checkpoint = do_checkpoint && slot.task->params.cache_prompt;");
         const size_t checkpoint_memory_gate = server_context.find("// make a checkpoint of the parts of the memory that cannot be rolled back.");
 
@@ -217,6 +217,11 @@ int main(int argc, char ** argv) {
                      cache_prompt_gate < checkpoint_memory_gate,
             "server must not create context checkpoints for requests that explicitly disable prompt caching");
     }
+    ok &= expect(server_context.find("prompt_cache_boundary_checkpoints_enabled") != std::string::npos &&
+                 server_context.find("server_prompt_effective_checkpoint_limit(") != std::string::npos &&
+                 server_context.find("server_prompt_checkpoint_creation_allowed(") != std::string::npos &&
+                 server_context.find("do_regular_context_checkpoint && do_checkpoint") != std::string::npos,
+        "hybrid prompt cache must keep prompt-boundary checkpoints separate from regular context checkpoints");
     ok &= expect(server_context.find("mark_mtp_draft_context_seq_rm_supported") == std::string::npos,
         "server must not keep the stale MTP seq_rm helper now that upstream probes ctx_dft directly");
 
