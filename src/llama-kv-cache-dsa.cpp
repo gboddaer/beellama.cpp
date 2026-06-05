@@ -127,6 +127,11 @@ std::map<ggml_backend_buffer_type_t, size_t> llama_kv_cache_dsa::memory_breakdow
     return mb;
 }
 
+bool llama_kv_cache_dsa::requires_state_for_partial_restore() const {
+    return kv_mla->requires_state_for_partial_restore() ||
+           kv_lid->requires_state_for_partial_restore();
+}
+
 llama_memory_context_ptr llama_kv_cache_dsa::init_batch(
             llama_batch_allocr & balloc,
             uint32_t n_ubatch,

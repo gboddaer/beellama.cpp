@@ -158,6 +158,11 @@ struct llama_memory_i {
     // state write/read
     //
 
+    // Some compact attention memories cannot be recovered from a later live state
+    // by trimming arbitrary suffixes, so composite memories must include them
+    // even when LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY is requested.
+    virtual bool requires_state_for_partial_restore() const { return false; }
+
     virtual void state_write(llama_io_write_i & io, llama_seq_id seq_id = -1, llama_state_seq_flags flags = 0) const = 0;
     virtual void state_read (llama_io_read_i  & io, llama_seq_id seq_id = -1, llama_state_seq_flags flags = 0) = 0;
 

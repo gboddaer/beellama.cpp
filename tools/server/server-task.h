@@ -667,6 +667,12 @@ struct server_prompt {
 
 size_t server_prompt_checkpoints_size(const std::list<common_prompt_checkpoint> & checkpoints);
 
+bool server_prompt_checkpoint_matches_restore_window(
+        const common_prompt_checkpoint & checkpoint,
+        llama_pos                        pos_min_thold,
+        llama_pos                        pos_next,
+        bool                             is_recurrent_or_hybrid);
+
 server_prompt server_prompt_clone_with_checkpoint_budget(
         const server_prompt & prompt,
         size_t state_size,

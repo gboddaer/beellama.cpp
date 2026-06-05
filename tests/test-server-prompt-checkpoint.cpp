@@ -47,6 +47,41 @@ int main() {
         assert(server_prompt_checkpoints_size(budgeted.checkpoints) == 600);
     }
 
+    {
+        common_prompt_checkpoint ckpt;
+        ckpt.update_pos(17851, 17850, 17850);
+
+        assert(server_prompt_checkpoint_matches_restore_window(
+                ckpt,
+                /*pos_min_thold =*/ 17851,
+                /*pos_next =*/ 17851,
+                /*is_recurrent_or_hybrid =*/ false));
+        assert(!server_prompt_checkpoint_matches_restore_window(
+                ckpt,
+                /*pos_min_thold =*/ 17850,
+                /*pos_next =*/ 17851,
+                /*is_recurrent_or_hybrid =*/ false));
+
+        ckpt.update_pos(17851, 0, 17850);
+        assert(server_prompt_checkpoint_matches_restore_window(
+                ckpt,
+                /*pos_min_thold =*/ 0,
+                /*pos_next =*/ 17851,
+                /*is_recurrent_or_hybrid =*/ false));
+
+        ckpt.update_pos(17851, 17850, 17850);
+        assert(server_prompt_checkpoint_matches_restore_window(
+                ckpt,
+                /*pos_min_thold =*/ 0,
+                /*pos_next =*/ 17850,
+                /*is_recurrent_or_hybrid =*/ true));
+        assert(!server_prompt_checkpoint_matches_restore_window(
+                ckpt,
+                /*pos_min_thold =*/ 0,
+                /*pos_next =*/ 17849,
+                /*is_recurrent_or_hybrid =*/ true));
+    }
+
     prompt.data.main.resize(64);
     prompt.data.drft.resize(32);
     prompt.clear();

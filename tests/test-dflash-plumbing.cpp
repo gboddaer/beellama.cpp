@@ -2212,13 +2212,23 @@ int main(int argc, char ** argv) {
                  memory_hybrid_iswa.find("bool llama_memory_hybrid_iswa::can_seq_rm") != std::string::npos &&
                  memory_hybrid_iswa.find("mem_attn->can_seq_rm(seq_id, p0, p1)") != std::string::npos,
         "hybrid seq_rm must check recurrent and attention children before mutating either child");
+    const std::string kvarn_partial_restore = slice_between(
+            kv_cache_kvarn_cpp,
+            "bool llama_kv_cache_kvarn::requires_state_for_partial_restore() const",
+            "\n}\n");
+    ok &= expect(memory_h.find("virtual bool requires_state_for_partial_restore() const") != std::string::npos &&
+                 kvarn_partial_restore.find("return true;") != std::string::npos &&
+                 memory_hybrid.find("mem_attn->requires_state_for_partial_restore()") != std::string::npos &&
+                 kv_cache_iswa_cpp.find("kv_base->requires_state_for_partial_restore()") != std::string::npos,
+        "KVarN attention memory must be included in partial sequence state restores");
     ok &= expect(memory_recurrent_cpp.find("bool llama_memory_recurrent::can_seq_rm") != std::string::npos &&
                  memory_recurrent_cpp.find("rollback <= (llama_pos) n_rs_seq") != std::string::npos,
         "recurrent memory must expose the same bounded rollback capability used by seq_rm");
-    ok &= expect(server_context.find("const llama_pos checkpoint_trim_p0") != std::string::npos &&
-                 server_context.find("llama_memory_can_seq_rm(llama_get_memory(ctx_tgt), slot.id, checkpoint_trim_p0, -1)") != std::string::npos &&
-                 server_context.find("skipping context checkpoint") != std::string::npos,
-        "server prompt-cache restore must skip checkpoints whose final trim is unsupported by the target memory");
+    ok &= expect(server_context.find("const llama_pos checkpoint_trim_p0") == std::string::npos &&
+                 server_context.find("target memory cannot trim from") == std::string::npos &&
+                 server_context.find("draft memory cannot trim from") == std::string::npos &&
+                 server_context.find("server_prompt_checkpoint_matches_restore_window") != std::string::npos,
+        "server prompt-cache restore must not preflight checkpoints against the live memory state");
     ok &= expect(server_context.find("const llama_pos prompt_trim_p0 = slot.prompt.tokens.pos_next(n_past);") != std::string::npos &&
                  server_context.find("memory cannot trim cached suffix") != std::string::npos &&
                  server_context.find("slot.prompt.checkpoints.clear();") != std::string::npos,

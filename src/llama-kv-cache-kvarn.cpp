@@ -594,6 +594,10 @@ std::map<ggml_backend_buffer_type_t, size_t> llama_kv_cache_kvarn::memory_breakd
     return result;
 }
 
+bool llama_kv_cache_kvarn::requires_state_for_partial_restore() const {
+    return true;
+}
+
 bool llama_kv_cache_kvarn::has_pending_stream_copies() const {
     return !pending_stream_copies.empty();
 }

@@ -171,6 +171,11 @@ std::map<ggml_backend_buffer_type_t, size_t> llama_kv_cache_iswa::memory_breakdo
     return mb;
 }
 
+bool llama_kv_cache_iswa::requires_state_for_partial_restore() const {
+    return kv_base->requires_state_for_partial_restore() ||
+           kv_swa->requires_state_for_partial_restore();
+}
+
 llama_memory_context_ptr llama_kv_cache_iswa::init_batch(llama_batch_allocr & balloc, uint32_t n_ubatch, bool embd_all) {
     GGML_UNUSED(embd_all);
 
@@ -287,7 +292,9 @@ bool llama_kv_cache_iswa::get_can_shift() const {
 }
 
 void llama_kv_cache_iswa::state_write(llama_io_write_i & io, llama_seq_id seq_id, llama_state_seq_flags flags) const {
-    if ((flags & LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY) == 0) {
+    const bool include_base = (flags & LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY) == 0 ||
+                              kv_base->requires_state_for_partial_restore();
+    if (include_base) {
         kv_base->state_write(io, seq_id, flags);
     }
 
@@ -295,7 +302,9 @@ void llama_kv_cache_iswa::state_write(llama_io_write_i & io, llama_seq_id seq_id
 }
 
 void llama_kv_cache_iswa::state_read(llama_io_read_i & io, llama_seq_id seq_id, llama_state_seq_flags flags) {
-    if ((flags & LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY) == 0) {
+    const bool include_base = (flags & LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY) == 0 ||
+                              kv_base->requires_state_for_partial_restore();
+    if (include_base) {
         kv_base->state_read(io, seq_id, flags);
     }
 
