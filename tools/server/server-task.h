@@ -687,7 +687,8 @@ bool server_prompt_checkpoint_creation_allowed(
 server_prompt server_prompt_clone_with_checkpoint_budget(
         const server_prompt & prompt,
         size_t state_size,
-        size_t limit_size);
+        size_t limit_size,
+        size_t max_checkpoints);
 
 struct server_prompt_cache {
     server_prompt_cache(int32_t limit_size_mib, size_t limit_tokens) {

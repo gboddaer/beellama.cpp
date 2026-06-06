@@ -1,5 +1,7 @@
 #include "server-task.h"
 
+#include <limits>
+
 #include "build-info.h"
 #include "server-chat.h"
 #include "chat.h"
@@ -2537,31 +2539,42 @@ bool server_prompt_checkpoint_creation_allowed(
            (is_after_user && near_prompt_end);
 }
 
+static constexpr size_t SERVER_PROMPT_CACHE_MAX_CHECKPOINTS = 3;
+
 server_prompt server_prompt_clone_with_checkpoint_budget(
         const server_prompt & prompt,
         size_t state_size,
-        size_t limit_size) {
+        size_t limit_size,
+        size_t max_checkpoints) {
     server_prompt res;
     res.tokens = prompt.tokens.clone();
 
-    if (limit_size == 0) {
-        res.checkpoints = prompt.checkpoints;
+    if (max_checkpoints == 0 || prompt.checkpoints.empty()) {
         return res;
     }
 
-    if (state_size >= limit_size) {
+    const bool has_byte_limit = limit_size > 0;
+    if (has_byte_limit && state_size >= limit_size) {
         return res;
     }
 
-    size_t remaining = limit_size - state_size;
-    for (auto it = prompt.checkpoints.rbegin(); it != prompt.checkpoints.rend(); ++it) {
+    size_t remaining = has_byte_limit
+        ? limit_size - state_size
+        : std::numeric_limits<size_t>::max();
+
+    for (auto it = prompt.checkpoints.rbegin();
+         it != prompt.checkpoints.rend() && res.checkpoints.size() < max_checkpoints;
+         ++it) {
         const size_t ckpt_size = it->size();
         if (ckpt_size > remaining) {
             continue;
         }
 
         res.checkpoints.push_front(*it);
-        remaining -= ckpt_size;
+
+        if (has_byte_limit) {
+            remaining -= ckpt_size;
+        }
     }
 
     return res;
@@ -2637,10 +2650,20 @@ server_prompt * server_prompt_cache::alloc(const server_prompt & prompt, size_t 
         return nullptr;
     }
 
-    server_prompt cache_prompt = server_prompt_clone_with_checkpoint_budget(prompt, state_size, limit_size);
+    server_prompt cache_prompt = server_prompt_clone_with_checkpoint_budget(prompt, state_size, limit_size, SERVER_PROMPT_CACHE_MAX_CHECKPOINTS);
     if (cache_prompt.checkpoints.size() != prompt.checkpoints.size()) {
-        SRV_WRN(" - pruned prompt cache checkpoints from %zu to %zu to fit RAM limit\n",
-                prompt.checkpoints.size(), cache_prompt.checkpoints.size());
+        if (limit_size > 0) {
+            SRV_WRN(" - pruned prompt cache checkpoints from %zu to %zu (max = %zu, RAM limit = %.3f MiB)\n",
+                    prompt.checkpoints.size(),
+                    cache_prompt.checkpoints.size(),
+                    SERVER_PROMPT_CACHE_MAX_CHECKPOINTS,
+                    limit_size / (1024.0 * 1024.0));
+        } else {
+            SRV_WRN(" - pruned prompt cache checkpoints from %zu to %zu (max = %zu, no RAM limit)\n",
+                    prompt.checkpoints.size(),
+                    cache_prompt.checkpoints.size(),
+                    SERVER_PROMPT_CACHE_MAX_CHECKPOINTS);
+        }
     }
 
     states.push_back({

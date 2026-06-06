@@ -2260,17 +2260,6 @@ private:
         GGML_ABORT("failed to expand recurrent state after prompt cache restore; continuing would make scheduler reservation inconsistent\n");
     }
 
-    size_t prompt_cache_limit_bytes() const {
-        return params_base.cache_ram_mib > 0
-            ? (size_t) params_base.cache_ram_mib * 1024ull * 1024ull
-            : 0;
-    }
-
-    size_t context_checkpoint_budget_bytes() const {
-        const size_t cache_limit = prompt_cache_limit_bytes();
-        return cache_limit > 0 ? cache_limit / 2 : 0;
-    }
-
     bool prompt_cache_boundary_checkpoints_enabled(const server_slot & slot) const {
         if (params_base.n_ctx_checkpoints > 0 || !prompt_cache) {
             return false;
@@ -4124,23 +4113,9 @@ private:
             ? common_speculative_ring_state_size(slot.get_spec())
             : 0;
         const size_t new_size = cur_size_tgt + cur_size_dft + ring_size;
-        const size_t checkpoint_budget = context_checkpoint_budget_bytes();
-
-        if (checkpoint_budget > 0 && new_size > checkpoint_budget) {
-            SLT_WRN(slot,
-                    "skipping context checkpoint: state size %.3f MiB exceeds checkpoint budget %.3f MiB\n",
-                    new_size / (1024.0 * 1024.0), checkpoint_budget / (1024.0 * 1024.0));
-            return;
-        }
 
         while (slot.prompt.checkpoints.size() >= (size_t) max_checkpoints) {
             erase_oldest_checkpoint(slot, "count limit");
-        }
-
-        while (checkpoint_budget > 0 &&
-                !slot.prompt.checkpoints.empty() &&
-                server_prompt_checkpoints_size(slot.prompt.checkpoints) + new_size > checkpoint_budget) {
-            erase_oldest_checkpoint(slot, "RAM budget");
         }
 
         common_prompt_checkpoint cur;

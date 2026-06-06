@@ -23,28 +23,41 @@ int main() {
     assert(ckpt.ring_data.capacity() == 0);
 
     server_prompt prompt;
-    for (int i = 0; i < 3; ++i) {
+    for (int i = 0; i < 4; ++i) {
         auto & cur = prompt.checkpoints.emplace_back();
         cur.n_tokens = i + 1;
         cur.data_tgt.resize((size_t) (i + 1) * 100);
     }
 
     {
-        server_prompt budgeted = server_prompt_clone_with_checkpoint_budget(prompt, 250, 600);
+        server_prompt budgeted = server_prompt_clone_with_checkpoint_budget(prompt, 250, 600, 3);
         assert(budgeted.checkpoints.size() == 1);
         assert(budgeted.checkpoints.front().n_tokens == 3);
         assert(server_prompt_checkpoints_size(budgeted.checkpoints) == 300);
     }
 
     {
-        server_prompt budgeted = server_prompt_clone_with_checkpoint_budget(prompt, 600, 600);
+        server_prompt budgeted = server_prompt_clone_with_checkpoint_budget(prompt, 600, 600, 3);
         assert(budgeted.checkpoints.empty());
     }
 
     {
-        server_prompt budgeted = server_prompt_clone_with_checkpoint_budget(prompt, 0, 0);
+        server_prompt budgeted = server_prompt_clone_with_checkpoint_budget(prompt, 0, 0, 3);
         assert(budgeted.checkpoints.size() == 3);
-        assert(server_prompt_checkpoints_size(budgeted.checkpoints) == 600);
+        assert(budgeted.checkpoints.front().n_tokens == 2);
+        assert(budgeted.checkpoints.back().n_tokens == 4);
+        assert(server_prompt_checkpoints_size(budgeted.checkpoints) == 900);
+    }
+
+    {
+        server_prompt budgeted = server_prompt_clone_with_checkpoint_budget(prompt, 0, 0, 1);
+        assert(budgeted.checkpoints.size() == 1);
+        assert(budgeted.checkpoints.front().n_tokens == 4);
+    }
+
+    {
+        server_prompt budgeted = server_prompt_clone_with_checkpoint_budget(prompt, 0, 0, 0);
+        assert(budgeted.checkpoints.empty());
     }
 
     {
