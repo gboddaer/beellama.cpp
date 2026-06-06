@@ -214,7 +214,6 @@ jobs:
           restore-keys: |
             release-${{ needs.release-meta.outputs.ccache_ref }}-macos-arm64-
             release-macos-arm64-
-          evict-old-files: 1d
 
       - name: Build
         run: |
@@ -293,7 +292,6 @@ jobs:
           restore-keys: |
             release-${{ needs.release-meta.outputs.ccache_ref }}-${{ matrix.os }}-cpu-
             release-${{ matrix.os }}-cpu-
-          evict-old-files: 1d
 
       - name: Dependencies
         run: |
@@ -377,7 +375,6 @@ jobs:
           restore-keys: |
             release-${{ needs.release-meta.outputs.ccache_ref }}-ubuntu-vulkan-x64-
             release-ubuntu-vulkan-x64-
-          evict-old-files: 1d
 
       - name: Dependencies
         run: |
@@ -464,7 +461,6 @@ jobs:
           restore-keys: |
             release-${{ needs.release-meta.outputs.ccache_ref }}-ubuntu-rocm-${{ env.ROCM_VERSION }}-x64-
             release-ubuntu-rocm-${{ env.ROCM_VERSION }}-x64-
-          evict-old-files: 1d
 
       - name: Dependencies
         run: |
@@ -580,7 +576,6 @@ jobs:
           restore-keys: |
             release-${{ needs.release-meta.outputs.ccache_ref }}-ubuntu-sycl-${{ env.ONEAPI_INSTALLER_VERSION }}-x64-
             release-ubuntu-sycl-${{ env.ONEAPI_INSTALLER_VERSION }}-x64-
-          evict-old-files: 1d
 
       - name: Dependencies
         run: |
@@ -695,7 +690,6 @@ jobs:
             release-ubuntu-cuda-${{ matrix.cuda }}-x64-
           max-size: 5G
           sloppiness: time_macros
-          evict-old-files: 1d
 
       - name: Build
         run: |
@@ -771,7 +765,6 @@ jobs:
           restore-keys: |
             release-${{ needs.release-meta.outputs.ccache_ref }}-windows-cpu-x64-
             release-windows-cpu-x64-
-          evict-old-files: 1d
 
       - name: Install Ninja
         run: choco install ninja -y
@@ -873,7 +866,6 @@ jobs:
           restore-keys: |
             release-${{ needs.release-meta.outputs.ccache_ref }}-windows-sycl-${{ env.ONEAPI_INSTALLER_VERSION }}-x64-
             release-windows-sycl-${{ env.ONEAPI_INSTALLER_VERSION }}-x64-
-          evict-old-files: 1d
 
       - name: Install Ninja
         run: choco install ninja -y
@@ -999,7 +991,6 @@ jobs:
           restore-keys: |
             release-${{ needs.release-meta.outputs.ccache_ref }}-windows-vulkan-${{ env.VULKAN_VERSION }}-x64-
             release-windows-vulkan-${{ env.VULKAN_VERSION }}-x64-
-          evict-old-files: 1d
 
       - name: Install Ninja
         run: choco install ninja -y
@@ -1071,7 +1062,6 @@ jobs:
             release-windows-cuda-${{ matrix.cuda }}-
           max-size: 5G
           sloppiness: time_macros
-          evict-old-files: 1d
 
       - name: Install CUDA Toolkit
         uses: ./.github/actions/windows-setup-cuda
@@ -1196,7 +1186,6 @@ jobs:
           restore-keys: |
             release-${{ needs.release-meta.outputs.ccache_ref }}-windows-hip-${{ env.HIPSDK_INSTALLER_VERSION }}-x64-
             release-windows-hip-${{ env.HIPSDK_INSTALLER_VERSION }}-x64-
-          evict-old-files: 1d
 
       - name: Install ROCm
         run: |

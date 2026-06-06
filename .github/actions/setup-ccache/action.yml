@@ -16,10 +16,6 @@ inputs:
     description: ccache sloppiness setting (e.g. time_macros, file_macro).
     required: false
     default: ""
-  evict-old-files:
-    description: Age threshold for evicting stale cache entries (e.g. 1d, 3600s).
-    required: false
-    default: ""
   path:
     description: ccache directory path.
     required: false
@@ -63,21 +59,34 @@ runs:
           choco install ccache -y
         }
 
+    - name: Normalize ccache path
+      id: ccache-path
+      shell: bash
+      env:
+        INPUT_PATH: ${{ inputs.path }}
+      run: |
+        case "${INPUT_PATH}" in
+          /*|[A-Za-z]:/*|[A-Za-z]:\\*) CCACHE_DIR_ABS="${INPUT_PATH}" ;;
+          *) CCACHE_DIR_ABS="${GITHUB_WORKSPACE}/${INPUT_PATH}" ;;
+        esac
+        echo "path=${CCACHE_DIR_ABS}" >> "$GITHUB_OUTPUT"
+        echo "Resolved ccache path: ${CCACHE_DIR_ABS}"
+        mkdir -p "${CCACHE_DIR_ABS}"
+
     - name: Restore ccache
       id: restore-cache
       uses: actions/cache/restore@v4
       with:
-        path: ${{ inputs.path }}
+        path: ${{ steps.ccache-path.outputs.path }}
         key: ${{ inputs.key }}
         restore-keys: ${{ inputs.restore-keys }}
 
     - name: Configure ccache
       shell: bash
       env:
-        CCACHE_DIR: ${{ inputs.path }}
+        CCACHE_DIR: ${{ steps.ccache-path.outputs.path }}
         CCACHE_MAXSIZE: ${{ inputs.max-size }}
         CCACHE_SLOPPINESS: ${{ inputs.sloppiness }}
-        EVICT_AGE: ${{ inputs.evict-old-files }}
       run: |
         ccache --set-config=cache_dir="${CCACHE_DIR}"
         ccache --set-config=max_size="${CCACHE_MAXSIZE}"
@@ -86,10 +95,8 @@ runs:
           ccache --set-config=compiler_check=content
         fi
         ccache --set-config=sloppiness="${CCACHE_SLOPPINESS}"
-        if [ -n "${EVICT_AGE}" ]; then
-          ccache --evict-older-than "${EVICT_AGE}"
-        fi
         ccache -z
+        ccache --show-config | grep -E 'cache_dir|max_size'
         echo "CCACHE_DIR=${CCACHE_DIR}" >> "$GITHUB_ENV"
         echo "CCACHE_MAXSIZE=${CCACHE_MAXSIZE}" >> "$GITHUB_ENV"
 
