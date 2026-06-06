@@ -208,14 +208,12 @@ jobs:
           node-version: "24"
 
       - name: ccache
-        uses: ggml-org/ccache-action@v1.2.21
+        uses: ./.github/actions/setup-ccache
         with:
-          key: ccache-release-${{ needs.release-meta.outputs.ccache_ref }}-macos-arm64
+          key: release-${{ needs.release-meta.outputs.ccache_ref }}-macos-arm64
           restore-keys: |
-            ccache-release-${{ needs.release-meta.outputs.ccache_ref }}-macos-arm64-
-            ccache-release-macos-arm64-
-          append-timestamp: false
-          save: false
+            release-${{ needs.release-meta.outputs.ccache_ref }}-macos-arm64-
+            release-macos-arm64-
           evict-old-files: 1d
 
       - name: Build
@@ -241,8 +239,9 @@ jobs:
         if: always()
         uses: ./.github/actions/save-rolling-ccache
         with:
-          key: ccache-release-${{ needs.release-meta.outputs.ccache_ref }}-macos-arm64
+          key: release-${{ needs.release-meta.outputs.ccache_ref }}-macos-arm64
           ref: refs/heads/${{ needs.release-meta.outputs.ccache_ref }}
+          evict-old-files: 1d
 
       - name: Smoke package binaries
         run: |
@@ -288,14 +287,12 @@ jobs:
           node-version: "24"
 
       - name: ccache
-        uses: ggml-org/ccache-action@v1.2.21
+        uses: ./.github/actions/setup-ccache
         with:
-          key: ccache-release-${{ needs.release-meta.outputs.ccache_ref }}-${{ matrix.os }}-cpu
+          key: release-${{ needs.release-meta.outputs.ccache_ref }}-${{ matrix.os }}-cpu
           restore-keys: |
-            ccache-release-${{ needs.release-meta.outputs.ccache_ref }}-${{ matrix.os }}-cpu-
-            ccache-release-${{ matrix.os }}-cpu-
-          append-timestamp: false
-          save: false
+            release-${{ needs.release-meta.outputs.ccache_ref }}-${{ matrix.os }}-cpu-
+            release-${{ matrix.os }}-cpu-
           evict-old-files: 1d
 
       - name: Dependencies
@@ -333,8 +330,9 @@ jobs:
         if: always()
         uses: ./.github/actions/save-rolling-ccache
         with:
-          key: ccache-release-${{ needs.release-meta.outputs.ccache_ref }}-${{ matrix.os }}-cpu
+          key: release-${{ needs.release-meta.outputs.ccache_ref }}-${{ matrix.os }}-cpu
           ref: refs/heads/${{ needs.release-meta.outputs.ccache_ref }}
+          evict-old-files: 1d
 
       - name: Smoke package binaries
         run: |
@@ -373,14 +371,12 @@ jobs:
           node-version: "24"
 
       - name: ccache
-        uses: ggml-org/ccache-action@v1.2.21
+        uses: ./.github/actions/setup-ccache
         with:
-          key: ccache-release-${{ needs.release-meta.outputs.ccache_ref }}-ubuntu-vulkan-x64
+          key: release-${{ needs.release-meta.outputs.ccache_ref }}-ubuntu-vulkan-x64
           restore-keys: |
-            ccache-release-${{ needs.release-meta.outputs.ccache_ref }}-ubuntu-vulkan-x64-
-            ccache-release-ubuntu-vulkan-x64-
-          append-timestamp: false
-          save: false
+            release-${{ needs.release-meta.outputs.ccache_ref }}-ubuntu-vulkan-x64-
+            release-ubuntu-vulkan-x64-
           evict-old-files: 1d
 
       - name: Dependencies
@@ -414,8 +410,9 @@ jobs:
         if: always()
         uses: ./.github/actions/save-rolling-ccache
         with:
-          key: ccache-release-${{ needs.release-meta.outputs.ccache_ref }}-ubuntu-vulkan-x64
+          key: release-${{ needs.release-meta.outputs.ccache_ref }}-ubuntu-vulkan-x64
           ref: refs/heads/${{ needs.release-meta.outputs.ccache_ref }}
+          evict-old-files: 1d
 
       - name: Smoke package binaries
         run: |
@@ -461,14 +458,12 @@ jobs:
           tool-cache: true
 
       - name: ccache
-        uses: ggml-org/ccache-action@v1.2.21
+        uses: ./.github/actions/setup-ccache
         with:
-          key: ccache-release-${{ needs.release-meta.outputs.ccache_ref }}-ubuntu-rocm-${{ env.ROCM_VERSION }}-x64
+          key: release-${{ needs.release-meta.outputs.ccache_ref }}-ubuntu-rocm-${{ env.ROCM_VERSION }}-x64
           restore-keys: |
-            ccache-release-${{ needs.release-meta.outputs.ccache_ref }}-ubuntu-rocm-${{ env.ROCM_VERSION }}-x64-
-            ccache-release-ubuntu-rocm-${{ env.ROCM_VERSION }}-x64-
-          append-timestamp: false
-          save: false
+            release-${{ needs.release-meta.outputs.ccache_ref }}-ubuntu-rocm-${{ env.ROCM_VERSION }}-x64-
+            release-ubuntu-rocm-${{ env.ROCM_VERSION }}-x64-
           evict-old-files: 1d
 
       - name: Dependencies
@@ -522,8 +517,9 @@ jobs:
         if: always()
         uses: ./.github/actions/save-rolling-ccache
         with:
-          key: ccache-release-${{ needs.release-meta.outputs.ccache_ref }}-ubuntu-rocm-${{ env.ROCM_VERSION }}-x64
+          key: release-${{ needs.release-meta.outputs.ccache_ref }}-ubuntu-rocm-${{ env.ROCM_VERSION }}-x64
           ref: refs/heads/${{ needs.release-meta.outputs.ccache_ref }}
+          evict-old-files: 1d
 
       - name: Smoke package binaries
         run: |
@@ -578,14 +574,12 @@ jobs:
           sudo chown -R "${USER}:${USER}" /opt/intel
 
       - name: ccache
-        uses: ggml-org/ccache-action@v1.2.21
+        uses: ./.github/actions/setup-ccache
         with:
-          key: ccache-release-${{ needs.release-meta.outputs.ccache_ref }}-ubuntu-sycl-${{ env.ONEAPI_INSTALLER_VERSION }}-x64
+          key: release-${{ needs.release-meta.outputs.ccache_ref }}-ubuntu-sycl-${{ env.ONEAPI_INSTALLER_VERSION }}-x64
           restore-keys: |
-            ccache-release-${{ needs.release-meta.outputs.ccache_ref }}-ubuntu-sycl-${{ env.ONEAPI_INSTALLER_VERSION }}-x64-
-            ccache-release-ubuntu-sycl-${{ env.ONEAPI_INSTALLER_VERSION }}-x64-
-          append-timestamp: false
-          save: false
+            release-${{ needs.release-meta.outputs.ccache_ref }}-ubuntu-sycl-${{ env.ONEAPI_INSTALLER_VERSION }}-x64-
+            release-ubuntu-sycl-${{ env.ONEAPI_INSTALLER_VERSION }}-x64-
           evict-old-files: 1d
 
       - name: Dependencies
@@ -634,8 +628,9 @@ jobs:
         if: always()
         uses: ./.github/actions/save-rolling-ccache
         with:
-          key: ccache-release-${{ needs.release-meta.outputs.ccache_ref }}-ubuntu-sycl-${{ env.ONEAPI_INSTALLER_VERSION }}-x64
+          key: release-${{ needs.release-meta.outputs.ccache_ref }}-ubuntu-sycl-${{ env.ONEAPI_INSTALLER_VERSION }}-x64
           ref: refs/heads/${{ needs.release-meta.outputs.ccache_ref }}
+          evict-old-files: 1d
 
       - name: Smoke package binaries
         run: |
@@ -666,9 +661,6 @@ jobs:
     if: ${{ needs.release-meta.outputs.build_packages == 'true' }}
     runs-on: ubuntu-24.04
     container: nvidia/cuda:${{ matrix.cuda_container }}
-    env:
-      CCACHE_MAXSIZE: 5G
-      CCACHE_SLOPPINESS: time_macros
     strategy:
       fail-fast: false
       matrix:
@@ -695,14 +687,14 @@ jobs:
           node-version: "24"
 
       - name: ccache
-        uses: ggml-org/ccache-action@v1.2.21
+        uses: ./.github/actions/setup-ccache
         with:
-          key: ccache-release-${{ needs.release-meta.outputs.ccache_ref }}-ubuntu-cuda-${{ matrix.cuda }}-x64
+          key: release-${{ needs.release-meta.outputs.ccache_ref }}-ubuntu-cuda-${{ matrix.cuda }}-x64
           restore-keys: |
-            ccache-release-${{ needs.release-meta.outputs.ccache_ref }}-ubuntu-cuda-${{ matrix.cuda }}-x64-
-            ccache-release-ubuntu-cuda-${{ matrix.cuda }}-x64-
-          append-timestamp: false
-          save: false
+            release-${{ needs.release-meta.outputs.ccache_ref }}-ubuntu-cuda-${{ matrix.cuda }}-x64-
+            release-ubuntu-cuda-${{ matrix.cuda }}-x64-
+          max-size: 5G
+          sloppiness: time_macros
           evict-old-files: 1d
 
       - name: Build
@@ -732,8 +724,9 @@ jobs:
         if: always()
         uses: ./.github/actions/save-rolling-ccache
         with:
-          key: ccache-release-${{ needs.release-meta.outputs.ccache_ref }}-ubuntu-cuda-${{ matrix.cuda }}-x64
+          key: release-${{ needs.release-meta.outputs.ccache_ref }}-ubuntu-cuda-${{ matrix.cuda }}-x64
           ref: refs/heads/${{ needs.release-meta.outputs.ccache_ref }}
+          evict-old-files: 1d
 
       - name: Smoke package binaries
         run: |
@@ -772,15 +765,12 @@ jobs:
           node-version: "24"
 
       - name: ccache
-        uses: ggml-org/ccache-action@v1.2.21
+        uses: ./.github/actions/setup-ccache
         with:
-          key: ccache-release-${{ needs.release-meta.outputs.ccache_ref }}-windows-cpu-x64
+          key: release-${{ needs.release-meta.outputs.ccache_ref }}-windows-cpu-x64
           restore-keys: |
-            ccache-release-${{ needs.release-meta.outputs.ccache_ref }}-windows-cpu-x64-
-            ccache-release-windows-cpu-x64-
-          append-timestamp: false
-          save: false
-          variant: ccache
+            release-${{ needs.release-meta.outputs.ccache_ref }}-windows-cpu-x64-
+            release-windows-cpu-x64-
           evict-old-files: 1d
 
       - name: Install Ninja
@@ -810,8 +800,9 @@ jobs:
         if: always()
         uses: ./.github/actions/save-rolling-ccache
         with:
-          key: ccache-release-${{ needs.release-meta.outputs.ccache_ref }}-windows-cpu-x64
+          key: release-${{ needs.release-meta.outputs.ccache_ref }}-windows-cpu-x64
           ref: refs/heads/${{ needs.release-meta.outputs.ccache_ref }}
+          evict-old-files: 1d
 
       - name: Pack artifacts
         shell: pwsh
@@ -876,15 +867,12 @@ jobs:
           "LEVEL_ZERO_V1_SDK_PATH=$($sdkRoot.FullName)" | Out-File -FilePath $env:GITHUB_ENV -Append
 
       - name: ccache
-        uses: ggml-org/ccache-action@v1.2.21
+        uses: ./.github/actions/setup-ccache
         with:
-          key: ccache-release-${{ needs.release-meta.outputs.ccache_ref }}-windows-sycl-${{ env.ONEAPI_INSTALLER_VERSION }}-x64
+          key: release-${{ needs.release-meta.outputs.ccache_ref }}-windows-sycl-${{ env.ONEAPI_INSTALLER_VERSION }}-x64
           restore-keys: |
-            ccache-release-${{ needs.release-meta.outputs.ccache_ref }}-windows-sycl-${{ env.ONEAPI_INSTALLER_VERSION }}-x64-
-            ccache-release-windows-sycl-${{ env.ONEAPI_INSTALLER_VERSION }}-x64-
-          append-timestamp: false
-          save: false
-          variant: ccache
+            release-${{ needs.release-meta.outputs.ccache_ref }}-windows-sycl-${{ env.ONEAPI_INSTALLER_VERSION }}-x64-
+            release-windows-sycl-${{ env.ONEAPI_INSTALLER_VERSION }}-x64-
           evict-old-files: 1d
 
       - name: Install Ninja
@@ -921,8 +909,9 @@ jobs:
         if: always()
         uses: ./.github/actions/save-rolling-ccache
         with:
-          key: ccache-release-${{ needs.release-meta.outputs.ccache_ref }}-windows-sycl-${{ env.ONEAPI_INSTALLER_VERSION }}-x64
+          key: release-${{ needs.release-meta.outputs.ccache_ref }}-windows-sycl-${{ env.ONEAPI_INSTALLER_VERSION }}-x64
           ref: refs/heads/${{ needs.release-meta.outputs.ccache_ref }}
+          evict-old-files: 1d
 
       - name: Pack SYCL backend
         shell: pwsh
@@ -1004,15 +993,12 @@ jobs:
           "C:\VulkanSDK\${env:VULKAN_VERSION}\bin" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
 
       - name: ccache
-        uses: ggml-org/ccache-action@v1.2.21
+        uses: ./.github/actions/setup-ccache
         with:
-          key: ccache-release-${{ needs.release-meta.outputs.ccache_ref }}-windows-vulkan-${{ env.VULKAN_VERSION }}-x64
+          key: release-${{ needs.release-meta.outputs.ccache_ref }}-windows-vulkan-${{ env.VULKAN_VERSION }}-x64
           restore-keys: |
-            ccache-release-${{ needs.release-meta.outputs.ccache_ref }}-windows-vulkan-${{ env.VULKAN_VERSION }}-x64-
-            ccache-release-windows-vulkan-${{ env.VULKAN_VERSION }}-x64-
-          append-timestamp: false
-          save: false
-          variant: ccache
+            release-${{ needs.release-meta.outputs.ccache_ref }}-windows-vulkan-${{ env.VULKAN_VERSION }}-x64-
+            release-windows-vulkan-${{ env.VULKAN_VERSION }}-x64-
           evict-old-files: 1d
 
       - name: Install Ninja
@@ -1041,8 +1027,9 @@ jobs:
         if: always()
         uses: ./.github/actions/save-rolling-ccache
         with:
-          key: ccache-release-${{ needs.release-meta.outputs.ccache_ref }}-windows-vulkan-${{ env.VULKAN_VERSION }}-x64
+          key: release-${{ needs.release-meta.outputs.ccache_ref }}-windows-vulkan-${{ env.VULKAN_VERSION }}-x64
           ref: refs/heads/${{ needs.release-meta.outputs.ccache_ref }}
+          evict-old-files: 1d
 
       - name: Pack Vulkan backend
         run: |
@@ -1059,9 +1046,6 @@ jobs:
     needs: release-meta
     if: ${{ needs.release-meta.outputs.build_packages == 'true' }}
     runs-on: windows-2022
-    env:
-      CCACHE_MAXSIZE: 5G
-      CCACHE_SLOPPINESS: time_macros
     strategy:
       fail-fast: false
       matrix:
@@ -1078,16 +1062,15 @@ jobs:
         with:
           node-version: "24"
 
-      - name: Install ccache
-        uses: ggml-org/ccache-action@v1.2.21
+      - name: ccache
+        uses: ./.github/actions/setup-ccache
         with:
-          key: ccache-release-${{ needs.release-meta.outputs.ccache_ref }}-windows-cuda-${{ matrix.cuda }}
+          key: release-${{ needs.release-meta.outputs.ccache_ref }}-windows-cuda-${{ matrix.cuda }}
           restore-keys: |
-            ccache-release-${{ needs.release-meta.outputs.ccache_ref }}-windows-cuda-${{ matrix.cuda }}-
-            ccache-release-windows-cuda-${{ matrix.cuda }}-
-          append-timestamp: false
-          save: false
-          variant: ccache
+            release-${{ needs.release-meta.outputs.ccache_ref }}-windows-cuda-${{ matrix.cuda }}-
+            release-windows-cuda-${{ matrix.cuda }}-
+          max-size: 5G
+          sloppiness: time_macros
           evict-old-files: 1d
 
       - name: Install CUDA Toolkit
@@ -1145,8 +1128,9 @@ jobs:
         if: always()
         uses: ./.github/actions/save-rolling-ccache
         with:
-          key: ccache-release-${{ needs.release-meta.outputs.ccache_ref }}-windows-cuda-${{ matrix.cuda }}
+          key: release-${{ needs.release-meta.outputs.ccache_ref }}-windows-cuda-${{ matrix.cuda }}
           ref: refs/heads/${{ needs.release-meta.outputs.ccache_ref }}
+          evict-old-files: 1d
 
       - name: Pack CUDA backend
         run: 7z a -snl "beellama-bin-win-cuda-${{ matrix.cuda }}-x64.zip" .\build\bin\Release\ggml-cuda.dll
@@ -1206,14 +1190,12 @@ jobs:
           7z x data.tar
 
       - name: ccache
-        uses: ggml-org/ccache-action@v1.2.21
+        uses: ./.github/actions/setup-ccache
         with:
-          key: ccache-release-${{ needs.release-meta.outputs.ccache_ref }}-windows-hip-${{ env.HIPSDK_INSTALLER_VERSION }}-x64
+          key: release-${{ needs.release-meta.outputs.ccache_ref }}-windows-hip-${{ env.HIPSDK_INSTALLER_VERSION }}-x64
           restore-keys: |
-            ccache-release-${{ needs.release-meta.outputs.ccache_ref }}-windows-hip-${{ env.HIPSDK_INSTALLER_VERSION }}-x64-
-            ccache-release-windows-hip-${{ env.HIPSDK_INSTALLER_VERSION }}-x64-
-          append-timestamp: false
-          save: false
+            release-${{ needs.release-meta.outputs.ccache_ref }}-windows-hip-${{ env.HIPSDK_INSTALLER_VERSION }}-x64-
+            release-windows-hip-${{ env.HIPSDK_INSTALLER_VERSION }}-x64-
           evict-old-files: 1d
 
       - name: Install ROCm
@@ -1277,8 +1259,9 @@ jobs:
         if: always()
         uses: ./.github/actions/save-rolling-ccache
         with:
-          key: ccache-release-${{ needs.release-meta.outputs.ccache_ref }}-windows-hip-${{ env.HIPSDK_INSTALLER_VERSION }}-x64
+          key: release-${{ needs.release-meta.outputs.ccache_ref }}-windows-hip-${{ env.HIPSDK_INSTALLER_VERSION }}-x64
           ref: refs/heads/${{ needs.release-meta.outputs.ccache_ref }}
+          evict-old-files: 1d
 
       - name: Pack artifacts
         run: |

@@ -11,9 +11,24 @@ inputs:
     description: ccache directory to save.
     required: false
     default: .ccache
+  evict-old-files:
+    description: Age threshold for evicting stale cache entries before saving (e.g. 1d, 3600s). Empty to skip.
+    required: false
+    default: ""
 runs:
   using: composite
   steps:
+    - name: Evict old cache files
+      if: inputs.evict-old-files != ''
+      shell: bash
+      env:
+        CCACHE_DIR: ${{ inputs.path }}
+        EVICT_AGE: ${{ inputs.evict-old-files }}
+      run: |
+        if command -v ccache >/dev/null 2>&1; then
+          ccache --evict-older-than "${EVICT_AGE}"
+        fi
+
     - name: Delete previous cache
       uses: actions/github-script@v7
       env:
