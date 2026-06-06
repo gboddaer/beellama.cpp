@@ -639,7 +639,7 @@ void ggml_cuda_op_kvarn_store(ggml_backend_cuda_context & ctx, ggml_tensor * dst
 
     if (!force_low_shmem && smpbo >= KVAR_N_SHARED_BYTES) {
 #if !defined(GGML_USE_MUSA)
-        CUDA_CHECK(cudaFuncSetAttribute(kvarn_store_kernel_hishmem, cudaFuncAttributeMaxDynamicSharedMemorySize, KVAR_N_SHARED_BYTES));
+        CUDA_CHECK(cudaFuncSetAttribute(reinterpret_cast<const void*>(kvarn_store_kernel_hishmem), cudaFuncAttributeMaxDynamicSharedMemorySize, KVAR_N_SHARED_BYTES));
 #endif
         kvarn_store_kernel_hishmem<<<current->ne[1], KVAR_N_DIM, KVAR_N_SHARED_BYTES, ctx.stream()>>>(
             (const float *) current->data,
