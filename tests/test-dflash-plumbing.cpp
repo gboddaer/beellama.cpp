@@ -2255,12 +2255,17 @@ int main(int argc, char ** argv) {
     ok &= expect(kv_cache_kvarn_cpp.find("GGML_ABORT(\"KVarN does not support position shifts\")") != std::string::npos &&
                  kv_cache_kvarn_cpp.find("GGML_ABORT(\"KVarN does not support position division\")") != std::string::npos,
         "KVarN seq_add/seq_div must fail fast instead of logging and continuing");
-    ok &= expect(kv_cache_kvarn_cpp.find("constexpr uint32_t KVAR_N_STATE_VERSION = 2") != std::string::npos &&
+    ok &= expect(kv_cache_kvarn_cpp.find("constexpr uint32_t KVAR_N_STATE_VERSION = 3") != std::string::npos &&
                  kv_cache_kvarn_cpp.find("saved_streams") != std::string::npos &&
                  kv_cache_kvarn_cpp.find("metadata->get_stream_for_seq(seq_id)") != std::string::npos &&
                  kv_cache_kvarn_cpp.find("layer.k_records_stream[stream]") != std::string::npos &&
-                 kv_cache_kvarn_cpp.find("layer.v_stage_stream[stream]") != std::string::npos,
-        "KVarN sequence state must serialize stream-scoped tensors instead of whole-cache tensors");
+                 kv_cache_kvarn_cpp.find("layer.v_stage_stream[stream]") != std::string::npos &&
+                 kv_cache_kvarn_cpp.find("n_groups_used") != std::string::npos &&
+                 kv_cache_kvarn_cpp.find("write_kvarn_tensor_slice") != std::string::npos &&
+                 kv_cache_kvarn_cpp.find("read_kvarn_tensor_slice") != std::string::npos &&
+                 kv_cache_kvarn_cpp.find("ggml_backend_tensor_memset") != std::string::npos &&
+                 kv_cache_kvarn_cpp.find("const uint64_t size64 = size") != std::string::npos,
+        "KVarN sequence state must serialize stream-scoped tensors with group-range compression");
     ok &= expect(kv_cache_kvarn_cpp.find("pending_stream_copies") != std::string::npos &&
                  kv_cache_kvarn_cpp.find("llama_synchronize(lctx)") != std::string::npos &&
                  kv_cache_kvarn_cpp.find("copy_kvarn_stream") != std::string::npos,

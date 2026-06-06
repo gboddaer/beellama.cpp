@@ -1,5 +1,6 @@
 #include "llama-kv-cache-kvarn.h"
 
+#include "ggml-backend.h"
 #include "llama-context.h"
 #include "llama-hparams.h"
 #include "llama-impl.h"
@@ -11,13 +12,14 @@
 #include <limits>
 #include <map>
 #include <stdexcept>
+#include <vector>
 
 namespace {
 
 constexpr uint32_t KVAR_N_GROUP = 128;
 constexpr uint32_t KVAR_N_STAGE_GROUPS = 3;
 constexpr uint32_t KVAR_N_STATE_MAGIC = 0x4e52564b; // "KVRN"
-constexpr uint32_t KVAR_N_STATE_VERSION = 2;
+constexpr uint32_t KVAR_N_STATE_VERSION = 3;
 
 bool kvarn_backend_supports_native_ops(ggml_backend_dev_t dev) {
     if (dev == nullptr || ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_CPU) {
@@ -42,13 +44,37 @@ void write_kvarn_tensor(llama_io_write_i & io, ggml_tensor * tensor) {
     io.write_tensor(tensor, 0, size);
 }
 
+void write_kvarn_tensor_slice(llama_io_write_i & io, ggml_tensor * tensor, size_t offset, size_t size) {
+    GGML_ASSERT(offset + size <= (size_t) ggml_nbytes(tensor));
+    const uint64_t size64 = size;
+    io.write(&size64, sizeof(size64));
+    io.write_tensor(tensor, offset, size);
+}
+
 void read_kvarn_tensor(llama_io_read_i & io, ggml_tensor * tensor) {
     uint64_t size;
     io.read(&size, sizeof(size));
-    if (size != ggml_nbytes(tensor)) {
+    if (size != (uint64_t) ggml_nbytes(tensor)) {
         throw std::runtime_error("mismatched KVarN cache tensor size");
     }
     io.read_tensor(tensor, 0, size);
+}
+
+void read_kvarn_tensor_slice(llama_io_read_i & io, ggml_tensor * tensor, size_t offset, size_t size) {
+    GGML_ASSERT(offset + size <= (size_t) ggml_nbytes(tensor));
+    uint64_t saved_size;
+    io.read(&saved_size, sizeof(saved_size));
+    if (saved_size != size) {
+        throw std::runtime_error("mismatched KVarN cache tensor slice size");
+    }
+    io.read_tensor(tensor, offset, size);
+}
+
+void zero_kvarn_tensor_range(ggml_tensor * tensor, size_t offset, size_t size) {
+    if (size == 0) {
+        return;
+    }
+    ggml_backend_tensor_memset(tensor, 0, offset, size);
 }
 
 } // namespace
@@ -662,18 +688,36 @@ void llama_kv_cache_kvarn::state_write(llama_io_write_i & io, llama_seq_id seq_i
         io.write(&stream, sizeof(stream));
     }
 
+    // n_groups_used is single-valued across all saved streams. This is correct
+    // because when seq_id >= 0, saved_streams has exactly 1 entry (the stream
+    // for that sequence), so n_groups_used applies to that one stream only.
+    // When seq_id == -1, n_groups_used equals n_groups_per_stream (no compression).
+    // If multi-stream partial writes are ever added, n_groups_used must become
+    // per-stream.
+    uint32_t n_groups_used = n_groups_per_stream;
+    if (seq_id >= 0) {
+        const llama_pos pos_max = metadata->seq_pos_max(seq_id);
+        if (pos_max >= 0) {
+            // ceil((pos_max + 1) / KVAR_N_GROUP) — covers all groups that the
+            // materialize kernel might read. After restore the next store will
+            // compute live_group ≤ pos_max / KVAR_N_GROUP < n_groups_used, so
+            // every accessed group stays within the restored range.
+            n_groups_used = std::min(n_groups_per_stream, (uint32_t) ((pos_max + KVAR_N_GROUP) / KVAR_N_GROUP));
+        }
+    }
+    io.write(&n_groups_used, sizeof(n_groups_used));
+
     for (const auto & layer : layers) {
         io.write(&layer.il, sizeof(layer.il));
         for (const uint32_t stream : saved_streams) {
             io.write(&stream, sizeof(stream));
-            for (auto * tensor : {
-                    layer.k_records_stream[stream],
-                    layer.v_records_stream[stream],
-                    layer.k_stage_stream[stream],
-                    layer.v_stage_stream[stream],
-                }) {
-                write_kvarn_tensor(io, tensor);
-            }
+
+            const size_t k_records_used = n_groups_used * layer.k_records_stream[stream]->nb[2];
+            const size_t v_records_used = n_groups_used * layer.v_records_stream[stream]->nb[2];
+            write_kvarn_tensor_slice(io, layer.k_records_stream[stream], 0, k_records_used);
+            write_kvarn_tensor_slice(io, layer.v_records_stream[stream], 0, v_records_used);
+            write_kvarn_tensor(io, layer.k_stage_stream[stream]);
+            write_kvarn_tensor(io, layer.v_stage_stream[stream]);
         }
     }
 }
@@ -689,7 +733,7 @@ void llama_kv_cache_kvarn::state_read(llama_io_read_i & io, llama_seq_id seq_id,
     io.read(&version, sizeof(version));
     io.read(&type, sizeof(type));
     io.read(&n_layers, sizeof(n_layers));
-    if (magic != KVAR_N_STATE_MAGIC || (version != 1 && version != KVAR_N_STATE_VERSION) ||
+    if (magic != KVAR_N_STATE_MAGIC || version > KVAR_N_STATE_VERSION ||
         type != params.type || n_layers != layers.size()) {
         throw std::runtime_error("incompatible KVarN cache state");
     }
@@ -723,6 +767,14 @@ void llama_kv_cache_kvarn::state_read(llama_io_read_i & io, llama_seq_id seq_id,
         }
     }
 
+    uint32_t n_groups_used = n_groups_per_stream;
+    if (version >= 3) {
+        io.read(&n_groups_used, sizeof(n_groups_used));
+        if (n_groups_used == 0 || n_groups_used > n_groups_per_stream) {
+            throw std::runtime_error("invalid KVarN cache group count");
+        }
+    }
+
     const uint32_t seq_stream = seq_id == -1 ? 0 : metadata->get_stream_for_seq(seq_id);
     if (seq_id != -1 && seq_stream >= n_stream) {
         throw std::runtime_error("invalid KVarN sequence stream");
@@ -743,13 +795,30 @@ void llama_kv_cache_kvarn::state_read(llama_io_read_i & io, llama_seq_id seq_id,
             }
 
             const uint32_t stream_dst = seq_id == -1 ? stream : seq_stream;
-            for (auto * tensor : {
-                    layer.k_records_stream[stream_dst],
-                    layer.v_records_stream[stream_dst],
-                    layer.k_stage_stream[stream_dst],
-                    layer.v_stage_stream[stream_dst],
-                }) {
-                read_kvarn_tensor(io, tensor);
+
+            if (version >= 3) {
+                const size_t k_records_used = n_groups_used * layer.k_records_stream[stream_dst]->nb[2];
+                const size_t v_records_used = n_groups_used * layer.v_records_stream[stream_dst]->nb[2];
+                const size_t k_records_total = n_groups_per_stream * layer.k_records_stream[stream_dst]->nb[2];
+                const size_t v_records_total = n_groups_per_stream * layer.v_records_stream[stream_dst]->nb[2];
+
+                read_kvarn_tensor_slice(io, layer.k_records_stream[stream_dst], 0, k_records_used);
+                zero_kvarn_tensor_range(layer.k_records_stream[stream_dst], k_records_used, k_records_total - k_records_used);
+
+                read_kvarn_tensor_slice(io, layer.v_records_stream[stream_dst], 0, v_records_used);
+                zero_kvarn_tensor_range(layer.v_records_stream[stream_dst], v_records_used, v_records_total - v_records_used);
+
+                read_kvarn_tensor(io, layer.k_stage_stream[stream_dst]);
+                read_kvarn_tensor(io, layer.v_stage_stream[stream_dst]);
+            } else {
+                for (auto * tensor : {
+                        layer.k_records_stream[stream_dst],
+                        layer.v_records_stream[stream_dst],
+                        layer.k_stage_stream[stream_dst],
+                        layer.v_stage_stream[stream_dst],
+                    }) {
+                    read_kvarn_tensor(io, tensor);
+                }
             }
         }
     }
