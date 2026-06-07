@@ -358,7 +358,7 @@ cmake -B build -DGGML_METAL=ON -DCMAKE_BUILD_TYPE=Release
 cmake --build build -j
 ```
 
-`GGML_CUDA_FA_ALL_QUANTS=ON` is required for TurboQuant and TCQ cache types. Add `-DCMAKE_CUDA_ARCHITECTURES=86` for RTX 3090, or `-DCMAKE_CUDA_ARCHITECTURES=89` for RTX 4090, if cross-compiling or building in CI without a GPU.
+`GGML_CUDA_FA_ALL_QUANTS=ON` is required for TurboQuant and TCQ cache types. `GGML_CUDA_FA_HALF_QUANTS=ON` is an alternative that compiles only the useful K>=V half of the K/V pair matrix (compiling 91 FA vec K/V pairs instead of 169, reducing FA vec pair instances by ~46% vs ALL_QUANTS). These two flags are mutually exclusive.
 
 ### Other Backends
 

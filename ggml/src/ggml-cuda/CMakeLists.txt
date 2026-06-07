@@ -112,27 +112,93 @@ if (CUDAToolkit_FOUND)
     file(GLOB   SRCS "template-instances/mmf*.cu")
     list(APPEND GGML_SOURCES_CUDA ${SRCS})
 
+    macro(ggml_add_fattn_vec_pair OUT_VAR PREFIX K_TYPE V_TYPE)
+        set(_FILE "${PREFIX}/fattn-vec-instance-${K_TYPE}-${V_TYPE}.cu")
+        if (NOT EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/${_FILE}")
+            message(FATAL_ERROR "Missing FA vec template instance: ${_FILE}")
+        endif()
+        list(APPEND ${OUT_VAR} "${_FILE}")
+    endmacro()
+
+    if (GGML_CUDA_FA_ALL_QUANTS AND GGML_CUDA_FA_HALF_QUANTS)
+        message(FATAL_ERROR
+            "GGML_CUDA_FA_ALL_QUANTS and GGML_CUDA_FA_HALF_QUANTS are mutually exclusive. "
+            "Use GGML_CUDA_FA_ALL_QUANTS for the full K/V pair matrix, or GGML_CUDA_FA_HALF_QUANTS for only K>=V pairs.")
+    endif()
+
+    set(FA_VEC_PREFIX "template-instances")
+
     if (GGML_CUDA_FA_ALL_QUANTS)
-        file(GLOB   SRCS "template-instances/fattn-vec*.cu")
+        file(GLOB   SRCS "${FA_VEC_PREFIX}/fattn-vec-instance-*.cu")
         list(APPEND GGML_SOURCES_CUDA ${SRCS})
         add_compile_definitions(GGML_CUDA_FA_ALL_QUANTS)
+    elseif (GGML_CUDA_FA_HALF_QUANTS)
+        set(GGML_CUDA_FA_KV_TYPES_ORDERED
+            f16
+            bf16
+            q8_0
+            q6_0
+            q5_1
+            q5_0
+            turbo4_0
+            q4_1
+            q4_0
+            turbo3_tcq
+            turbo3_0
+            turbo2_tcq
+            turbo2_0
+        )
+
+        list(LENGTH GGML_CUDA_FA_KV_TYPES_ORDERED GGML_CUDA_FA_KV_TYPES_LEN)
+        math(EXPR GGML_CUDA_FA_KV_TYPES_LAST "${GGML_CUDA_FA_KV_TYPES_LEN} - 1")
+
+        foreach(KI RANGE 0 ${GGML_CUDA_FA_KV_TYPES_LAST})
+            list(GET GGML_CUDA_FA_KV_TYPES_ORDERED ${KI} K_TYPE)
+
+            foreach(VI RANGE ${KI} ${GGML_CUDA_FA_KV_TYPES_LAST})
+                list(GET GGML_CUDA_FA_KV_TYPES_ORDERED ${VI} V_TYPE)
+                ggml_add_fattn_vec_pair(GGML_SOURCES_CUDA "${FA_VEC_PREFIX}" "${K_TYPE}" "${V_TYPE}")
+            endforeach()
+        endforeach()
+
+        add_compile_definitions(GGML_CUDA_FA_HALF_QUANTS)
     else()
-        file(GLOB   SRCS "template-instances/fattn-vec*q4_0-q4_0.cu")
-        list(APPEND GGML_SOURCES_CUDA ${SRCS})
-        file(GLOB   SRCS "template-instances/fattn-vec*q8_0-q8_0.cu")
-        list(APPEND GGML_SOURCES_CUDA ${SRCS})
-        file(GLOB   SRCS "template-instances/fattn-vec*f16-f16.cu")
-        list(APPEND GGML_SOURCES_CUDA ${SRCS})
-        file(GLOB   SRCS "template-instances/fattn-vec*bf16-bf16.cu")
-        list(APPEND GGML_SOURCES_CUDA ${SRCS})
-        file(GLOB   SRCS "template-instances/fattn-vec*turbo2_0*.cu")
-        list(APPEND GGML_SOURCES_CUDA ${SRCS})
-        file(GLOB   SRCS "template-instances/fattn-vec*turbo3_0*.cu")
-        list(APPEND GGML_SOURCES_CUDA ${SRCS})
-        file(GLOB   SRCS "template-instances/fattn-vec*turbo*_tcq*.cu")
-        list(APPEND GGML_SOURCES_CUDA ${SRCS})
-        file(GLOB   SRCS "template-instances/fattn-vec*turbo4_0*.cu")
-        list(APPEND GGML_SOURCES_CUDA ${SRCS})
+        set(GGML_CUDA_FA_DEFAULT_KV_PAIRS
+            f16:f16
+            q4_0:q4_0
+            q8_0:q8_0
+            bf16:bf16
+            turbo2_0:turbo2_0
+            turbo3_0:turbo3_0
+            turbo4_0:turbo4_0
+            turbo3_tcq:turbo3_tcq
+            turbo2_tcq:turbo2_tcq
+            turbo2_0:q8_0
+            turbo3_0:q8_0
+            turbo4_0:q8_0
+            q8_0:turbo2_0
+            q8_0:turbo3_0
+            q8_0:turbo4_0
+            turbo4_0:turbo3_0
+            turbo3_0:turbo4_0
+            turbo2_0:turbo3_0
+            turbo3_0:turbo2_0
+            turbo3_tcq:q8_0
+            turbo2_tcq:q8_0
+            q8_0:turbo3_tcq
+            q8_0:turbo2_tcq
+            turbo3_tcq:turbo2_tcq
+            turbo2_tcq:turbo3_tcq
+            turbo4_0:turbo3_tcq
+            turbo3_0:turbo3_tcq
+        )
+
+        foreach(PAIR ${GGML_CUDA_FA_DEFAULT_KV_PAIRS})
+            string(REPLACE ":" ";" PARTS "${PAIR}")
+            list(GET PARTS 0 K_TYPE)
+            list(GET PARTS 1 V_TYPE)
+            ggml_add_fattn_vec_pair(GGML_SOURCES_CUDA "${FA_VEC_PREFIX}" "${K_TYPE}" "${V_TYPE}")
+        endforeach()
     endif()
 
     ggml_add_backend_library(ggml-cuda
