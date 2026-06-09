@@ -1260,6 +1260,25 @@ static inline bool ggml_cuda_fattn_pair_compiled(const ggml_type type_K_in, cons
 #endif
 }
 
+// Shape guard for the effective K/V pair after Turbo V decode-dequant.
+// Gemma-like D>=256 with classic_K/f16 (non-q8) is unsafe on the vec path.
+// Only applied when V was actually decoded from Turbo — explicit q5_0/f16
+// at D>=256 is unaffected. D=128 is safe on vec and not gated.
+static inline bool ggml_cuda_fattn_effective_vec_shape_unsafe(
+        const ggml_tensor * Q, const ggml_tensor * K, const ggml_tensor * V) {
+    const bool classic_non_q8_K =
+        K->type == GGML_TYPE_BF16 ||
+        K->type == GGML_TYPE_Q4_0 ||
+        K->type == GGML_TYPE_Q4_1 ||
+        K->type == GGML_TYPE_Q5_0 ||
+        K->type == GGML_TYPE_Q5_1 ||
+        K->type == GGML_TYPE_Q6_0;
+
+    return Q->ne[0] >= 256 &&
+           classic_non_q8_K &&
+           V->type == GGML_TYPE_F16;
+}
+
 static void ggml_cuda_flash_attn_ext_vec(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     ggml_tensor * Q = dst->src[0];
     ggml_tensor * K = dst->src[1];
@@ -1583,9 +1602,9 @@ enum best_fattn_kernel {
     BEST_FATTN_KERNEL_MMA_F16  = 400,
 };
 
-static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const ggml_tensor * dst) {
+static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const ggml_tensor * dst, const bool allow_vec = true) {
 #ifndef FLASH_ATTN_AVAILABLE
-    GGML_UNUSED(device); GGML_UNUSED(dst);
+    GGML_UNUSED(device); GGML_UNUSED(dst); GGML_UNUSED(allow_vec);
     return BEST_FATTN_KERNEL_NONE;
 #endif// FLASH_ATTN_AVAILABLE
 
@@ -1708,7 +1727,7 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
         K->type == GGML_TYPE_TURBO4_0 || V->type == GGML_TYPE_TURBO4_0 ||
         K->type == GGML_TYPE_TURBO3_TCQ || V->type == GGML_TYPE_TURBO3_TCQ ||
         K->type == GGML_TYPE_TURBO2_TCQ || V->type == GGML_TYPE_TURBO2_TCQ) {
-        if (Q->ne[0] <= 512 && Q->ne[0] % 64 == 0)
+        if (allow_vec && Q->ne[0] <= 512 && Q->ne[0] % 64 == 0)
             return BEST_FATTN_KERNEL_VEC;
         return BEST_FATTN_KERNEL_NONE;
     }
@@ -1720,21 +1739,21 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
     if (turing_mma_available(cc) && Q->ne[0] != 40 && Q->ne[0] != 72) {
         if (can_use_vector_kernel) {
             if (!ggml_is_quantized(K->type) && !ggml_is_quantized(V->type)) {
-                if (cc >= GGML_CUDA_CC_ADA_LOVELACE && Q->ne[1] == 1 && Q->ne[3] == 1 && !(gqa_ratio > 4 && K->ne[1] >= 8192)) {
+                if (allow_vec && cc >= GGML_CUDA_CC_ADA_LOVELACE && Q->ne[1] == 1 && Q->ne[3] == 1 && !(gqa_ratio > 4 && K->ne[1] >= 8192)) {
                     return BEST_FATTN_KERNEL_VEC;
                 }
             } else {
                 if (cc >= GGML_CUDA_CC_ADA_LOVELACE) {
-                    if (Q->ne[1] <= 2) {
+                    if (allow_vec && Q->ne[1] <= 2) {
                         return BEST_FATTN_KERNEL_VEC;
                     }
                 } else {
-                    if (Q->ne[1] == 1) {
+                    if (allow_vec && Q->ne[1] == 1) {
                         return BEST_FATTN_KERNEL_VEC;
                     }
                 }
             }
-            if (!gqa_opt_applies && Q->ne[1] == 1) {
+            if (allow_vec && !gqa_opt_applies && Q->ne[1] == 1) {
                 return BEST_FATTN_KERNEL_VEC;
             }
         }
@@ -1748,7 +1767,7 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
     }
 
     if (volta_mma_available(cc) && Q->ne[0] != 40 && Q->ne[0] != 72) {
-        if (can_use_vector_kernel && Q->ne[1] * gqa_ratio_eff <= 2) {
+        if (allow_vec && can_use_vector_kernel && Q->ne[1] * gqa_ratio_eff <= 2) {
             return BEST_FATTN_KERNEL_VEC;
         }
         if (Q->ne[1] * gqa_ratio_eff <= 16) {
@@ -1759,7 +1778,7 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
 
     // Use the WMMA kernel if possible:
     if (ggml_cuda_should_use_wmma_fattn(cc) && K->ne[1] % FATTN_KQ_STRIDE == 0 && Q->ne[0] != 40 && Q->ne[0] != 72 && Q->ne[0] != 192 && Q->ne[0] != 512 && Q->ne[0] != 576) {
-        if (can_use_vector_kernel && Q->ne[1] <= 2) {
+        if (allow_vec && can_use_vector_kernel && Q->ne[1] <= 2) {
             return BEST_FATTN_KERNEL_VEC;
         }
         return BEST_FATTN_KERNEL_WMMA_F16;
@@ -1786,13 +1805,13 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
     // If there are no tensor cores available, use the generic tile kernel:
     if (can_use_vector_kernel) {
         if (!ggml_is_quantized(K->type) && !ggml_is_quantized(V->type)) {
-            if (Q->ne[1] == 1) {
+            if (allow_vec && Q->ne[1] == 1) {
                 if (!gqa_opt_applies) {
                     return BEST_FATTN_KERNEL_VEC;
                 }
             }
         } else {
-            if (Q->ne[1] <= 2) {
+            if (allow_vec && Q->ne[1] <= 2) {
                 return BEST_FATTN_KERNEL_VEC;
             }
         }
@@ -1800,37 +1819,144 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
     return BEST_FATTN_KERNEL_TILE;
 }
 
-size_t ggml_cuda_flash_attn_ext_get_alloc_size(int device, const ggml_tensor * dst) {
-    GGML_ASSERT(dst->op == GGML_OP_FLASH_ATTN_EXT);
+struct ggml_cuda_fattn_route_plan {
+    ggml_type effective_type_K;
+    ggml_type effective_type_V;
+    bool decode_dequant;
+    bool decode_dequant_K;
+    bool decode_dequant_V;
+    bool need_generic_f16_K;
+    bool need_generic_f16_V;
+    best_fattn_kernel kernel;
+};
 
+static ggml_cuda_fattn_route_plan ggml_cuda_fattn_make_route_plan(const int device, const ggml_tensor * dst) {
+    GGML_ASSERT(dst != nullptr);
+    GGML_ASSERT(dst->src[0] != nullptr);
+    GGML_ASSERT(dst->src[1] != nullptr);
+    GGML_ASSERT(dst->src[2] != nullptr);
+
+    const ggml_tensor * Q = dst->src[0];
     const ggml_tensor * K = dst->src[1];
     const ggml_tensor * V = dst->src[2];
 
-    GGML_ASSERT(K != nullptr);
-    GGML_ASSERT(V != nullptr);
+    ggml_cuda_fattn_route_plan plan = {};
 
-    const best_fattn_kernel kernel = ggml_cuda_get_best_fattn_kernel(device, dst);
+    const bool turbo_kv =
+        ggml_cuda_fattn_is_turbo_kv_type(K->type) ||
+        ggml_cuda_fattn_is_turbo_kv_type(V->type);
 
-    bool need_f16_K = false;
-    bool need_f16_V = false;
+#if defined(GGML_USE_HIP)
+    const bool hip_native_tcq_decode =
+        K->type == GGML_TYPE_TURBO3_TCQ || K->type == GGML_TYPE_TURBO2_TCQ ||
+        V->type == GGML_TYPE_TURBO3_TCQ || V->type == GGML_TYPE_TURBO2_TCQ;
+#else
+    const bool hip_native_tcq_decode = false;
+#endif
 
-    switch (kernel) {
+    const bool turbo_decode_native = getenv("GGML_TURBO_DECODE_NATIVE") != nullptr;
+
+    const bool turbo_k_only = ggml_cuda_fattn_is_turbo_kv_type(K->type);
+    const bool turbo_v_only = ggml_cuda_fattn_is_turbo_kv_type(V->type);
+
+    // Decode-dequant eligibility matches v0.3.2 conditions:
+    // D <= 256: any turbo KV pair dequants to f16.
+    // D = 512: only f16/q8_0/turbo pairs dequant both sides (mixed pairs stay
+    // on native vec). D >= 256 mixed classic+Turbo shapes that dequant V to f16
+    // are blocked from the vec path by effective_vec_shape_unsafe below.
+    const bool k_f16_q8_or_turbo =
+        K->type == GGML_TYPE_F16 || K->type == GGML_TYPE_Q8_0 || turbo_k_only;
+    const bool v_f16_q8_or_turbo =
+        V->type == GGML_TYPE_F16 || V->type == GGML_TYPE_Q8_0 || turbo_v_only;
+
+    plan.decode_dequant =
+        !hip_native_tcq_decode &&
+        !turbo_decode_native &&
+        turbo_kv &&
+        (Q->ne[0] <= 256 || (Q->ne[0] <= 512 && k_f16_q8_or_turbo && v_f16_q8_or_turbo));
+
+    plan.decode_dequant_K =
+        plan.decode_dequant &&
+        (turbo_k_only || (K->type == GGML_TYPE_Q8_0 && Q->ne[0] > 256));
+
+    plan.decode_dequant_V =
+        plan.decode_dequant &&
+        (turbo_v_only || (V->type == GGML_TYPE_Q8_0 && Q->ne[0] > 256));
+
+    plan.effective_type_K = plan.decode_dequant_K ? GGML_TYPE_F16 : K->type;
+    plan.effective_type_V = plan.decode_dequant_V ? GGML_TYPE_F16 : V->type;
+
+    ggml_tensor K_eff = *K;
+    ggml_tensor V_eff = *V;
+
+    if (plan.decode_dequant_K) {
+        K_eff.type = GGML_TYPE_F16;
+        K_eff.nb[0] = sizeof(half);
+        K_eff.nb[1] = K->ne[0] * K->ne[2] * sizeof(half);
+        K_eff.nb[2] = K->ne[0] * sizeof(half);
+        K_eff.nb[3] = K->ne[0] * K->ne[1] * K->ne[2] * sizeof(half);
+    }
+
+    if (plan.decode_dequant_V) {
+        V_eff.type = GGML_TYPE_F16;
+        V_eff.nb[0] = sizeof(half);
+        V_eff.nb[1] = V->ne[0] * V->ne[2] * sizeof(half);
+        V_eff.nb[2] = V->ne[0] * sizeof(half);
+        V_eff.nb[3] = V->ne[0] * V->ne[1] * V->ne[2] * sizeof(half);
+    }
+
+    ggml_tensor dst_eff = *dst;
+    ggml_tensor * src_eff[GGML_MAX_SRC];
+    for (int i = 0; i < GGML_MAX_SRC; ++i) {
+        src_eff[i] = dst->src[i];
+    }
+    src_eff[1] = &K_eff;
+    src_eff[2] = &V_eff;
+    for (int i = 0; i < GGML_MAX_SRC; ++i) {
+        dst_eff.src[i] = src_eff[i];
+    }
+
+    // If V was decoded from Turbo to f16 and the effective pair is
+    // classic_K/f16 at D>=256, the vec path is unsafe. Only gate vec for
+    // Turbo-originated f16 V — explicit q5_0/f16 at D>=256 is unaffected.
+    // Disable vec so the existing kernel selector picks MMA_F16 or tile with
+    // generic f16 K conversion. D=128 is fine on vec and is not affected.
+    const bool unsafe_vec_after_turbo_v_decode =
+        plan.decode_dequant_V &&
+        ggml_cuda_fattn_effective_vec_shape_unsafe(Q, &K_eff, &V_eff);
+
+    plan.kernel = ggml_cuda_get_best_fattn_kernel(device, &dst_eff, !unsafe_vec_after_turbo_v_decode);
+
+    plan.need_generic_f16_K = false;
+    plan.need_generic_f16_V = false;
+    switch (plan.kernel) {
         case BEST_FATTN_KERNEL_TILE:
         case BEST_FATTN_KERNEL_WMMA_F16:
         case BEST_FATTN_KERNEL_MMA_F16:
-            need_f16_K = true;
-            need_f16_V = true;
+            plan.need_generic_f16_K = !plan.decode_dequant_K && plan.effective_type_K != GGML_TYPE_F16;
+            plan.need_generic_f16_V = !plan.decode_dequant_V && plan.effective_type_V != GGML_TYPE_F16;
             break;
         case BEST_FATTN_KERNEL_VEC:
-            need_f16_K = K->type == GGML_TYPE_F32;
-            need_f16_V = V->type == GGML_TYPE_F32;
+            plan.need_generic_f16_K = plan.effective_type_K == GGML_TYPE_F32;
+            plan.need_generic_f16_V = plan.effective_type_V == GGML_TYPE_F32;
             break;
         case BEST_FATTN_KERNEL_NONE:
             break;
     }
 
+    return plan;
+}
+
+size_t ggml_cuda_flash_attn_ext_get_alloc_size(int device, const ggml_tensor * dst) {
+    GGML_ASSERT(dst->op == GGML_OP_FLASH_ATTN_EXT);
+
+    const ggml_cuda_fattn_route_plan plan = ggml_cuda_fattn_make_route_plan(device, dst);
+
+    const bool alloc_f16_K = plan.need_generic_f16_K;
+    const bool alloc_f16_V = plan.need_generic_f16_V;
+
     const ggml_cuda_flash_attn_ext_f16_extra_data f16_extra =
-        ggml_cuda_flash_attn_ext_get_f16_extra_data(dst, need_f16_K, need_f16_V);
+        ggml_cuda_flash_attn_ext_get_f16_extra_data(dst, alloc_f16_K, alloc_f16_V);
 
     return f16_extra.end - (uintptr_t) dst->data;
 }
@@ -2011,32 +2137,18 @@ void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst
 
         cudaStream_t stream = ctx.stream();
 
-        // Dequant turbo K/V to fp16 for decode: MMA tensor cores on fp16 beat VEC scalar
-        // on turbo bits for dense models. Bandwidth savings from turbo's 3/16 footprint are
-        // negligible relative to FFN compute (~1% slower native on Qwen3.5-27B, 3090).
-        // Set GGML_TURBO_DECODE_NATIVE=1 to force native VEC path (may help bandwidth-limited configs).
-        static const bool turbo_decode_native = (getenv("GGML_TURBO_DECODE_NATIVE") != nullptr);
-        // Dequant turbo K/V to fp16 for D<=256 (any K/V combo), or D=512 only when BOTH
-        // K and V are turbo (Gemma 4 ISWA global layers with K=V — Bug A2). Mixed q8_0+turbo
-        // at D=512 stays on native VEC path because post-dequant q8_0 K + f16 V has no
-        // working VEC template at D=512.
-        const bool turbo_k_only = K->type == GGML_TYPE_TURBO2_0 || K->type == GGML_TYPE_TURBO3_0 || K->type == GGML_TYPE_TURBO4_0 || K->type == GGML_TYPE_TURBO3_TCQ || K->type == GGML_TYPE_TURBO2_TCQ;
-        const bool turbo_v_only = V->type == GGML_TYPE_TURBO2_0 || V->type == GGML_TYPE_TURBO3_0 || V->type == GGML_TYPE_TURBO4_0 || V->type == GGML_TYPE_TURBO3_TCQ || V->type == GGML_TYPE_TURBO2_TCQ;
-        // Mixed f16/q8_0 + turbo at D=512: dequant K (and turbo V) to f16 so FA dispatches as
-        // F16/F16 D=512 (which exists). Without this, the native VEC templates needed are
-        // either missing (F16↔turbo) or have buggy SASS on sm_120 PTX-JIT (Q8_0↔turbo4 etc).
-        const bool k_is_f16_q8_or_turbo = (K->type == GGML_TYPE_F16) || (K->type == GGML_TYPE_Q8_0) || turbo_k_only;
-        const bool v_is_f16_q8_or_turbo = (V->type == GGML_TYPE_F16) || (V->type == GGML_TYPE_Q8_0) || turbo_v_only;
-        const bool both_dequantable_512 = k_is_f16_q8_or_turbo && v_is_f16_q8_or_turbo;
-#if defined(GGML_USE_HIP)
-        const bool hip_native_tcq_decode =
-            K->type == GGML_TYPE_TURBO3_TCQ || K->type == GGML_TYPE_TURBO2_TCQ ||
-            V->type == GGML_TYPE_TURBO3_TCQ || V->type == GGML_TYPE_TURBO2_TCQ;
-#else
-        const bool hip_native_tcq_decode = false;
-#endif
-        const bool do_decode_dequant = !hip_native_tcq_decode && !turbo_decode_native && turbo_kv &&
-            (Q->ne[0] <= 256 || (Q->ne[0] <= 512 && both_dequantable_512));
+        // Build the unified route plan from raw K/V types. The same plan drives
+        // allocation, support checks, and execution. Mixed classic+Turbo at
+        // D<=128 stays on vec; at D>=256, the effective classic_K/f16 pair is
+        // routed through MMA/tile with generic f16 K conversion.
+        int device_dec;
+        CUDA_CHECK(cudaGetDevice(&device_dec));
+        const ggml_cuda_fattn_route_plan plan =
+            ggml_cuda_fattn_make_route_plan(device_dec, dst);
+
+        const bool do_decode_dequant = plan.decode_dequant;
+        const bool k_needs_dequant    = plan.decode_dequant_K;
+        const bool v_needs_dequant    = plan.decode_dequant_V;
 
         half * k_fp16_dec = nullptr;
         half * v_fp16_dec = nullptr;
@@ -2044,12 +2156,7 @@ void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst
         ggml_tensor * orig_k_decode = nullptr;
         ggml_tensor * orig_v_decode = nullptr;
 
-        int device_dec;
-        CUDA_CHECK(cudaGetDevice(&device_dec));
-
         if (do_decode_dequant) {
-            const bool k_needs_dequant = turbo_k_only || (K->type == GGML_TYPE_Q8_0 && Q->ne[0] > 256);
-            const bool v_needs_dequant = turbo_v_only || (V->type == GGML_TYPE_Q8_0 && Q->ne[0] > 256);
             if (k_needs_dequant) {
                 // Size the dequant buffer for the FULL cache (kv_size from the underlying root
                 // tensor), not just the current n_kv. This prevents per-token reallocations as
@@ -2204,15 +2311,7 @@ void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst
             dst->src[0] = &Q_rot_decode;
         }
 
-        const bool force_vec_for_raw_mixed_kv_pair =
-            Q->ne[1] > 1 &&
-            (ggml_cuda_fattn_is_turbo_kv_type(K->type) || ggml_cuda_fattn_is_turbo_kv_type(V->type)) &&
-            !turbo_prefill_mma_safe;
-
-        const best_fattn_kernel selected_kernel =
-            force_vec_for_raw_mixed_kv_pair
-                ? BEST_FATTN_KERNEL_VEC
-                : ggml_cuda_get_best_fattn_kernel(ggml_cuda_get_device(), dst);
+        const best_fattn_kernel selected_kernel = plan.kernel;
 
         switch (selected_kernel) {
             case BEST_FATTN_KERNEL_NONE:
@@ -2223,6 +2322,11 @@ void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst
                 ggml_cuda_flash_attn_ext_tile(ctx, dst);
                 break;
             case BEST_FATTN_KERNEL_VEC:
+                if (!ggml_cuda_fattn_pair_compiled(dst->src[1]->type, dst->src[2]->type)) {
+                    fprintf(stderr, "CUDA FA effective K/V pair was not compiled: K=%s V=%s\n",
+                        ggml_type_name(dst->src[1]->type), ggml_type_name(dst->src[2]->type));
+                    GGML_ABORT("CUDA FA effective K/V pair not compiled");
+                }
                 ggml_cuda_flash_attn_ext_vec(ctx, dst);
                 break;
             case BEST_FATTN_KERNEL_WMMA_F16:
@@ -2244,21 +2348,19 @@ void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst
 }
 
 bool ggml_cuda_flash_attn_ext_supported(int device, const ggml_tensor * dst) {
-    const ggml_tensor * K = dst->src[1];
-    const ggml_tensor * V = dst->src[2];
+    const ggml_cuda_fattn_route_plan plan = ggml_cuda_fattn_make_route_plan(device, dst);
 
-    const best_fattn_kernel kernel = ggml_cuda_get_best_fattn_kernel(device, dst);
-    if (kernel == BEST_FATTN_KERNEL_NONE) {
+    if (plan.kernel == BEST_FATTN_KERNEL_NONE) {
         return false;
     }
 
-    if (kernel == BEST_FATTN_KERNEL_VEC) {
-        return ggml_cuda_fattn_pair_compiled(K->type, V->type);
+    if (plan.kernel == BEST_FATTN_KERNEL_VEC) {
+        return ggml_cuda_fattn_pair_compiled(plan.effective_type_K, plan.effective_type_V);
     }
 
 #if defined(GGML_CUDA_FA_HALF_QUANTS)
-    if ((ggml_cuda_fattn_is_ranked_kv_type(K->type) || ggml_cuda_fattn_is_ranked_kv_type(V->type)) &&
-        !ggml_cuda_fattn_pair_compiled(K->type, V->type)) {
+    if ((ggml_cuda_fattn_is_ranked_kv_type(plan.effective_type_K) || ggml_cuda_fattn_is_ranked_kv_type(plan.effective_type_V)) &&
+        !ggml_cuda_fattn_pair_compiled(plan.effective_type_K, plan.effective_type_V)) {
         return false;
     }
 #endif
