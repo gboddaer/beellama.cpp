@@ -48,6 +48,32 @@ static int count_occurrences(const std::string & text, const std::string & needl
     return count;
 }
 
+// whitespace-insensitive containment check: collapses every run of whitespace
+// (spaces, tabs, newlines) to a single space in both haystack and needle, so
+// upstream reformatting (comment-field alignment, line wrapping) does not break
+// code invariants that only care about token sequence
+static std::string normalize_ws(const std::string & text) {
+    std::string out;
+    out.reserve(text.size());
+    bool in_ws = false;
+    for (char c : text) {
+        if (c == ' ' || c == '\t' || c == '\n' || c == '\r') {
+            in_ws = true;
+            continue;
+        }
+        if (in_ws && !out.empty()) {
+            out += ' ';
+        }
+        in_ws = false;
+        out += c;
+    }
+    return out;
+}
+
+static bool contains_ws(const std::string & text, const std::string & needle) {
+    return normalize_ws(text).find(normalize_ws(needle)) != std::string::npos;
+}
+
 static std::string slice_between(const std::string & text, const std::string & begin, const std::string & end) {
     const size_t b = text.find(begin);
     if (b == std::string::npos) {
@@ -278,7 +304,7 @@ int main(int argc, char ** argv) {
         "CUDA reduced-logits argmax must not read rowx[-1] when every row candidate is invalid");
     ok &= expect(context_cpp.find("GGML_ASSERT(batch_inp.token || batch_inp.embd);") != std::string::npos,
         "decode must allow MTP draft batches to carry both token ids and target hidden embeddings");
-    ok &= expect(context_cpp.find("/*.ctx_type =*/ cparams.ctx_type") != std::string::npos,
+    ok &= expect(contains_ws(context_cpp, "/*.ctx_type =*/ cparams.ctx_type"),
         "context creation must propagate ctx_type into memory creation so MTP uses its MTP-only KV cache");
     ok &= expect(context_cpp.find("graph_params(res, ubatch, mctx, ctx_type_to_graph_type(cparams.ctx_type))") != std::string::npos,
         "graph reservation must use the active context graph type so MTP reserves the MTP graph");
@@ -371,7 +397,7 @@ int main(int argc, char ** argv) {
         "CUDA FlashAttention all-quant dispatch must include D=512 TCQ mixed q8/turbo3 pairs");
     ok &= expect(cuda_fattn.find("hip_native_tcq_decode") != std::string::npos &&
                  cuda_fattn.find("#if defined(GGML_USE_HIP)") != std::string::npos &&
-                 cuda_fattn.find("!hip_native_tcq_decode && !turbo_decode_native && turbo_kv") != std::string::npos,
+                 contains_ws(cuda_fattn, "!hip_native_tcq_decode && !turbo_decode_native && turbo_kv"),
         "HIP TCQ decode must stay on the native VEC path instead of dequantizing into generic tile/MMA FlashAttention");
     ok &= expect(cuda_fattn.find("turbo_mma_fused && turbo_mma_supported && Q->ne[1] <= 4") != std::string::npos &&
                  cuda_fattn.find("K->type == GGML_TYPE_TURBO4_0 ||") != std::string::npos &&
@@ -1252,7 +1278,7 @@ int main(int argc, char ** argv) {
                  common_h.find("t == COMMON_SPECULATIVE_TYPE_DFLASH && branch_budget == 0") == std::string::npos &&
                  common_cpp.find("const uint32_t n_rs_batch = cparams.n_rs_seq + 1") != std::string::npos,
         "MTP target contexts must enable bounded recurrent snapshots without applying that memory multiplier to flat DFlash");
-    ok &= expect(server_context.find("cparams.n_rs_seq = 0") != std::string::npos,
+    ok &= expect(contains_ws(server_context, "cparams.n_rs_seq = 0"),
         "MTP draft context creation must force n_rs_seq = 0 (upstream invariant: MTP heads have no delta-net layers)");
     ok &= expect(server_context.find("const bool slot_uses_fork_spec") != std::string::npos &&
                  server_context.find("server_speculative_uses_fork_slot_impls(params_base.speculative)") != std::string::npos,
@@ -2152,7 +2178,7 @@ int main(int argc, char ** argv) {
     ok &= expect(llama_h.find("ggml_backend_dev_t output_device;") != std::string::npos &&
                  common_h.find("ggml_backend_dev_t output_device = nullptr;") != std::string::npos &&
                  common_cpp.find("mparams.output_device = params.output_device;") != std::string::npos &&
-                 model_cpp.find("/*.output_device                =*/ nullptr") != std::string::npos &&
+                 contains_ws(model_cpp, "/*.output_device =*/ nullptr") &&
                  model_cpp.find("pimpl->dev_output = params.output_device") != std::string::npos,
         "model loading must allow DFlash to pin the shared output tensor before target load");
     ok &= expect(server_context.find("server_dflash_single_explicit_draft_device(params_base") != std::string::npos &&
@@ -2245,7 +2271,7 @@ int main(int argc, char ** argv) {
                  server_context.find("draft memory cannot trim from") == std::string::npos &&
                  server_context.find("server_prompt_checkpoint_matches_restore_window") != std::string::npos,
         "server prompt-cache restore must not preflight checkpoints against the live memory state");
-    ok &= expect(server_context.find("const bool has_new_tokens = n_past < slot.task->n_tokens();") != std::string::npos &&
+    ok &= expect(server_context.find("const bool has_new_tokens = (n_past < slot.task->n_tokens());") != std::string::npos &&
                  server_context.find("pos_next - n_swa - (has_new_tokens ? 0 : 1)") != std::string::npos,
         "server prompt-cache checkpoint threshold must account for newly appended suffix tokens");
     ok &= expect(server_context.find("const llama_pos prompt_trim_p0 = slot.prompt.tokens.pos_next(n_past);") != std::string::npos &&
@@ -2304,8 +2330,8 @@ int main(int argc, char ** argv) {
     ok &= expect(llama_kvarn_h.find("LLAMA_API") == std::string::npos,
         "internal C++ KVarN helper declarations must not be exported from the public DLL ABI");
     ok &= expect(kv_cache_iswa_cpp.find("KVarN enabled for non-SWA layers; SWA layers use compact normal KV cache") != std::string::npos &&
-                 kv_cache_iswa_cpp.find("make_cache(size_base, 0, LLAMA_SWA_TYPE_NONE, filter_base, use_kvarn)") != std::string::npos &&
-                 kv_cache_iswa_cpp.find("make_cache(size_swa, hparams.n_swa, hparams.swa_type, filter_swa, false)") != std::string::npos &&
+                 kv_cache_iswa_cpp.find("make_cache(size_base, 0, LLAMA_SWA_TYPE_NONE, filter_base, mem_other_base, use_kvarn)") != std::string::npos &&
+                 kv_cache_iswa_cpp.find("make_cache(size_swa, hparams.n_swa, hparams.swa_type, filter_swa, mem_other_swa, false)") != std::string::npos &&
                  kv_cache_iswa_cpp.find("KVarN requires full-size SWA cache for now") == std::string::npos,
         "ISWA with KVarN must keep SWA layers on compact normal KV instead of expanding SWA to full-size KVarN");
     ok &= expect(context_cpp.find("params.kvarn.type != LLAMA_KVARN_K4V2_G128") != std::string::npos &&

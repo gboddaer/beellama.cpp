@@ -477,6 +477,10 @@ extern "C" {
         // BeeLlama fork-specific structured KVarN KV cache configuration.
         // Kept separate from type_k/type_v because KVarN stores joint 128-token K/V tiles.
         struct llama_kvarn_params kvarn;
+
+        // a source/target/parent context
+        // can be utilized in various ways, for example by sharing results or llama_memory between 2 contexts
+        struct llama_context * ctx_other;
     };
 
     struct llama_model_tensor_override {

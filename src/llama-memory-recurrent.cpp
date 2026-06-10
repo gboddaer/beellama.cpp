@@ -47,7 +47,7 @@ llama_memory_recurrent::llama_memory_recurrent(
                  uint32_t   n_seq_max,
                  uint32_t   n_rs_seq,
     const layer_filter_cb & filter) : hparams(model.hparams), n_seq_max(n_seq_max) {
-    const int32_t n_layer = hparams.n_layer;
+    const int32_t n_layer = hparams.n_layer();
 
     head = 0;
     size = mem_size;
@@ -574,7 +574,7 @@ bool llama_memory_recurrent::build_recurrent_copy_plan() {
         return true;
     };
 
-    for (uint32_t il = 0; il < hparams.n_layer; ++il) {
+    for (uint32_t il = 0; il < hparams.n_layer_all; ++il) {
         if (!add_tensor(r_l[il], hparams.n_embd_r()) ||
             !add_tensor(s_l[il], hparams.n_embd_s())) {
             copy_plan_entries.clear();
@@ -626,7 +626,7 @@ void llama_memory_recurrent::copy_cell(int32_t i_src, int32_t i_dst) {
     }
 
     llama_memory_recurrent_copy_profile profile;
-    profile.layers_scanned = hparams.n_layer;
+    profile.layers_scanned = hparams.n_layer_all;
     const bool profile_timing = dflash_profile_enabled(DFLASH_PROFILE_COPY);
 
     // CUDA's generic buffer copy path synchronizes every tensor copy. DFlash
@@ -699,7 +699,7 @@ void llama_memory_recurrent::copy_cell(int32_t i_src, int32_t i_dst) {
     }
 
     // create one shared ggml context for all view pairs
-    const uint32_t n_recur = hparams.n_layer;
+    const uint32_t n_recur = hparams.n_layer_all;
     ggml_init_params params = {
         /*.mem_size   =*/ size_t(4 * n_recur * ggml_tensor_overhead()),
         /*.mem_buffer =*/ NULL,
@@ -735,7 +735,7 @@ void llama_memory_recurrent::copy_cell(int32_t i_src, int32_t i_dst) {
         profile.fallback_copies++;
     };
 
-    for (uint32_t il = 0; il < hparams.n_layer; ++il) {
+    for (uint32_t il = 0; il < hparams.n_layer_all; ++il) {
         copy_tensor_row(r_l[il], hparams.n_embd_r());
         copy_tensor_row(s_l[il], hparams.n_embd_s());
     }
@@ -767,7 +767,7 @@ bool llama_memory_recurrent::resize(uint32_t new_mem_size) {
         return true;
     }
 
-    const int32_t n_layer = hparams.n_layer;
+    const int32_t n_layer = hparams.n_layer_all;
     const uint32_t old_size = size;
     const uint32_t n_copy = std::min(old_size, new_mem_size);
 
@@ -1392,7 +1392,7 @@ void llama_memory_recurrent::state_write_meta(llama_io_write_i & io, const std::
 
 void llama_memory_recurrent::state_write_data(llama_io_write_i & io, const std::vector<std::pair<uint32_t, uint32_t>> & cell_ranges) const {
     const uint32_t s_trans = 0;
-    const uint32_t n_layer = hparams.n_layer;
+    const uint32_t n_layer = hparams.n_layer();
 
     io.write(&s_trans, sizeof(s_trans));
     io.write(&n_layer, sizeof(n_layer));
@@ -1576,8 +1576,8 @@ bool llama_memory_recurrent::state_read_data(llama_io_read_i & io, uint32_t cell
     io.read(&s_trans, sizeof(s_trans));
     io.read(&n_layer, sizeof(n_layer));
 
-    if (n_layer != hparams.n_layer) {
-        LLAMA_LOG_ERROR("%s: mismatched layer count (%u instead of %u)\n", __func__, n_layer, hparams.n_layer);
+    if (n_layer != hparams.n_layer()) {
+        LLAMA_LOG_ERROR("%s: mismatched layer count (%u instead of %u)\n", __func__, n_layer, hparams.n_layer());
         return false;
     }
     if (cell_count > size) {

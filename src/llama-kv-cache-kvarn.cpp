@@ -278,7 +278,9 @@ llama_kv_cache_kvarn::llama_kv_cache_kvarn(
         n_pad,
         n_swa,
         swa_type,
+        nullptr,
         [](int32_t) { return false; },
+        nullptr,
         nullptr)) {
     GGML_ASSERT(n_stream > 0);
     GGML_ASSERT(kv_size % KVAR_N_GROUP == 0);
@@ -318,7 +320,7 @@ llama_kv_cache_kvarn::llama_kv_cache_kvarn(
     const int64_t n_stage_tokens = int64_t(KVAR_N_GROUP) * KVAR_N_STAGE_GROUPS * n_stream;
     size_t raw_bytes = 0;
 
-    for (uint32_t il = 0; il < hparams.n_layer; ++il) {
+    for (uint32_t il = 0; il < hparams.n_layer_all; ++il) {
         if (!hparams.has_kv(il)) {
             continue;
         }
@@ -428,7 +430,7 @@ llama_kv_cache_kvarn::llama_kv_cache_kvarn(
     }
 
     if (reuse) {
-        for (uint32_t il = 0; il < hparams.n_layer; ++il) {
+        for (uint32_t il = 0; il < hparams.n_layer_all; ++il) {
             const int32_t il_reuse = reuse(il);
             if (il_reuse < 0) {
                 continue;

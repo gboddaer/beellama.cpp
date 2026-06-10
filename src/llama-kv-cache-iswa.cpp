@@ -24,8 +24,10 @@ llama_kv_cache_iswa::llama_kv_cache_iswa(
                  uint32_t   n_seq_max,
                  uint32_t   n_ubatch,
                  uint32_t   n_pad,
+           llama_memory_t   mem_other,
     const layer_filter_cb & filter,
     const  layer_reuse_cb & reuse,
+    const  layer_share_cb & share,
           llama_kvarn_params kvarn) : hparams(model.hparams), unified(unified) {
 
     // chain filters
@@ -64,8 +66,9 @@ llama_kv_cache_iswa::llama_kv_cache_iswa(
         LLAMA_LOG_INFO("%s: KVarN enabled for non-SWA layers; SWA layers use compact normal KV cache\n", __func__);
     }
 
-    auto make_cache = [&](uint32_t size, uint32_t n_swa, llama_swa_type swa_type, const layer_filter_cb & layer_filter, bool enable_kvarn) -> std::unique_ptr<llama_memory_i> {
+    auto make_cache = [&](uint32_t size, uint32_t n_swa, llama_swa_type swa_type, const layer_filter_cb & layer_filter, llama_memory_t cache_mem_other, bool enable_kvarn) -> std::unique_ptr<llama_memory_i> {
         if (enable_kvarn) {
+            // note: structured KVarN caches do not participate in cross-context sharing (mem_other/share)
             return std::make_unique<llama_kv_cache_kvarn>(
                     model,
                     hparams,
@@ -84,16 +87,26 @@ llama_kv_cache_iswa::llama_kv_cache_iswa(
         return std::make_unique<llama_kv_cache>(
                 model, hparams, type_k, type_v,
                 v_trans, offload, unified, size, n_seq_max, n_pad,
-                n_swa, swa_type, layer_filter, reuse);
+                n_swa, swa_type, cache_mem_other, layer_filter, reuse, share);
     };
 
     LLAMA_LOG_INFO("%s: creating non-SWA KV cache, size = %u cells\n", __func__, size_base);
 
-    kv_base = make_cache(size_base, 0, LLAMA_SWA_TYPE_NONE, filter_base, use_kvarn);
+    llama_memory_t mem_other_base = nullptr;
+    if (mem_other) {
+        mem_other_base = static_cast<llama_kv_cache_iswa *>(mem_other)->get_base();
+    }
+
+    llama_memory_t mem_other_swa = nullptr;
+    if (mem_other) {
+        mem_other_swa = static_cast<llama_kv_cache_iswa *>(mem_other)->get_swa();
+    }
+
+    kv_base = make_cache(size_base, 0, LLAMA_SWA_TYPE_NONE, filter_base, mem_other_base, use_kvarn);
 
     LLAMA_LOG_INFO("%s: creating     SWA KV cache, size = %u cells\n", __func__, size_swa);
 
-    kv_swa = make_cache(size_swa, hparams.n_swa, hparams.swa_type, filter_swa, false);
+    kv_swa = make_cache(size_swa, hparams.n_swa, hparams.swa_type, filter_swa, mem_other_swa, false);
 }
 
 void llama_kv_cache_iswa::clear(bool data) {

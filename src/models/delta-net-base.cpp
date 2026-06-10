@@ -440,7 +440,7 @@ std::pair<ggml_tensor *, ggml_tensor *> llm_build_delta_net_base::build_delta_ne
         n_seq_tokens <= ggml_nelements(tree_parent_ids)) {
         int recurrent_idx = 0;
         for (int i = 0; i < il; ++i) {
-            if (hparams.is_recurrent(i)) {
+            if (hparams.is_recr(i)) {
                 ++recurrent_idx;
             }
         }
