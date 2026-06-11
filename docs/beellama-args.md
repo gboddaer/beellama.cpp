@@ -207,7 +207,7 @@ Do not assume enum compatibility with TheTom's public TurboQuant fork. Bee uses 
 
 KVarN pseudo types are accepted only on the target `--cache-type-k` / `--cache-type-v` path. Draft cache arguments intentionally reject them. If only one side is specified, Bee mirrors that KVarN bit width to the other side; all K/V pairs over `2`, `3`, `4`, `5`, `6`, and `8` bits are selectable. KVarN still requires a supported attention/cache path, non-unified KV streams, 128-slice-compatible key/value head dimensions, and backend native KVarN ops unless `--kv-kvarn-fallback` is enabled.
 
-Layers that cannot use structured KVarN records (for example iSWA sliding-window layers, whose rolling eviction is incompatible with KVarN 128-token tile groups) fall back to a normal KV cache whose type matches the requested bit width: `kvarn2` → `turbo2`, `kvarn3` → `turbo3`, `kvarn4` → `q4_0`, `kvarn5` → `q5_0`, `kvarn6` → `q6_0`, `kvarn8` → `q8_0`. This keeps total KV memory at the requested bit level instead of silently storing the fallback layers in `f16`.
+Layers that cannot use structured KVarN records (for example iSWA sliding-window layers, whose rolling eviction is incompatible with KVarN 128-token tile groups) fall back to a normal KV cache whose type matches the requested bit width: `kvarn2` → `q2_0`, `kvarn3` → `q3_0`, `kvarn4` → `q4_0`, `kvarn5` → `q5_0`, `kvarn6` → `q6_0`, `kvarn8` → `q8_0`. This keeps total KV memory at the requested bit level instead of silently storing the fallback layers in `f16`.
 
 ## Model Weight Quantization
 

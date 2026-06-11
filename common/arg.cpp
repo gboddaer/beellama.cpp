@@ -472,8 +472,8 @@ static llama_kvarn_type kvarn_type_from_bits(int32_t key_bits, int32_t value_bit
 // f16 so the fallback layers do not dominate memory use
 static ggml_type kvarn_fallback_cache_type(int32_t bits) {
     switch (bits) {
-        case 2:  return GGML_TYPE_TURBO2_0;
-        case 3:  return GGML_TYPE_TURBO3_0;
+        case 2:  return GGML_TYPE_Q2_0;
+        case 3:  return GGML_TYPE_Q3_0;
         case 4:  return GGML_TYPE_Q4_0;
         case 5:  return GGML_TYPE_Q5_0;
         case 6:  return GGML_TYPE_Q6_0;

@@ -458,6 +458,11 @@ int main(int argc, char ** argv) {
     ok &= expect(arg_cpp.find("GGML_TYPE_Q6_0") != std::string::npos &&
                  llama_bench.find("GGML_TYPE_Q6_0") != std::string::npos,
         "CLI and benchmark cache-type parsers must expose q6_0");
+    ok &= expect(arg_cpp.find("case 2:  return GGML_TYPE_Q2_0;") != std::string::npos &&
+                 arg_cpp.find("case 3:  return GGML_TYPE_Q3_0;") != std::string::npos &&
+                 llama_bench.find("case 2:  return GGML_TYPE_Q2_0;") != std::string::npos &&
+                 llama_bench.find("case 3:  return GGML_TYPE_Q3_0;") != std::string::npos,
+        "KVarN 2/3-bit fallback cache types must use q2_0/q3_0 in CLI and benchmark");
     ok &= expect(cuda_common.find("ggml_cuda_type_traits<GGML_TYPE_Q6_0>") != std::string::npos &&
                  cuda_dequantize.find("dequantize_q6_0") != std::string::npos &&
                  cuda_cpy_utils.find("quantize_f32_q6_0_block") != std::string::npos &&
