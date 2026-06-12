@@ -6608,6 +6608,7 @@ struct ggml_tensor * ggml_kvarn_materialize(
     ggml_set_op_params_i32(result, 1, value ? 1 : 0);
     ggml_set_op_params_i32(result, 2, stream_start);
     ggml_set_op_params_i32(result, 3, n_stream);
+    ggml_set_op_params_i32(result, 4, -1);
     return result;
 }
 

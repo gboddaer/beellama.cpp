@@ -129,6 +129,7 @@ public:
             ggml_tensor * current,
             ggml_tensor * indices,
             int32_t il,
+            const llama_kv_cache::slot_info & sinfo,
             bool value) const;
     ggml_tensor * materialize(
             ggml_context * ctx,

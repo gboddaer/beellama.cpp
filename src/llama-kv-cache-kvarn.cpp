@@ -77,6 +77,44 @@ void zero_kvarn_tensor_range(ggml_tensor * tensor, size_t offset, size_t size) {
     ggml_backend_tensor_memset(tensor, 0, offset, size);
 }
 
+int32_t kvarn_contiguous_tokens_per_stream_hint(const llama_kv_cache::slot_info & sinfo) {
+    if (sinfo.empty() || sinfo.idxs.empty() || sinfo.idxs[0].empty()) {
+        return 0;
+    }
+
+    const size_t n_tokens = sinfo.idxs[0].size();
+    if (n_tokens > (size_t) std::numeric_limits<int32_t>::max()) {
+        return 0;
+    }
+
+    for (const auto & idxs : sinfo.idxs) {
+        if (idxs.size() != n_tokens || idxs.empty()) {
+            return 0;
+        }
+        const uint32_t first = idxs[0];
+        for (size_t i = 1; i < idxs.size(); ++i) {
+            if (idxs[i] != first + (uint32_t) i) {
+                return 0;
+            }
+        }
+    }
+
+    return (int32_t) n_tokens;
+}
+
+int32_t kvarn_single_stream_live_group_hint(const llama_kv_cache::slot_info & sinfo) {
+    if (sinfo.empty() || sinfo.idxs.size() != 1 || sinfo.idxs[0].empty()) {
+        return -1;
+    }
+
+    uint32_t max_idx = 0;
+    for (const uint32_t idx : sinfo.idxs[0]) {
+        max_idx = std::max(max_idx, idx);
+    }
+
+    return (int32_t) (max_idx / KVAR_N_GROUP);
+}
+
 } // namespace
 
 llama_kv_cache_kvarn_context::llama_kv_cache_kvarn_context(
@@ -170,7 +208,7 @@ ggml_tensor * llama_kv_cache_kvarn_context::cpy_k(
         ggml_tensor * k_cur,
         ggml_tensor * k_idxs,
         int32_t il) const {
-    auto * result = cache->store(ctx, k_cur, k_idxs, il, false);
+    auto * result = cache->store(ctx, k_cur, k_idxs, il, current_sinfo(), false);
     stored_k[cache->mapped_layer_id(il)] = result;
     return result;
 }
@@ -180,7 +218,7 @@ ggml_tensor * llama_kv_cache_kvarn_context::cpy_v(
         ggml_tensor * v_cur,
         ggml_tensor * v_idxs,
         int32_t il) const {
-    auto * result = cache->store(ctx, v_cur, v_idxs, il, true);
+    auto * result = cache->store(ctx, v_cur, v_idxs, il, current_sinfo(), true);
     stored_v[cache->mapped_layer_id(il)] = result;
     return result;
 }
@@ -843,6 +881,7 @@ ggml_tensor * llama_kv_cache_kvarn::store(
         ggml_tensor * current,
         ggml_tensor * indices,
         int32_t il,
+        const llama_kv_cache::slot_info & sinfo,
         bool value) const {
     const auto & layer = layer_for(il);
     if (!ggml_is_contiguous(current)) {
@@ -857,7 +896,7 @@ ggml_tensor * llama_kv_cache_kvarn::store(
         current = ggml_reshape_3d(ctx, current, KVAR_N_GROUP, layer.n_head_kv * slices, current->ne[2]);
     }
 
-    return ggml_kvarn_store(
+    ggml_tensor * result = ggml_kvarn_store(
         ctx,
         current,
         indices,
@@ -866,6 +905,8 @@ ggml_tensor * llama_kv_cache_kvarn::store(
         value ? params.value_bits : params.key_bits,
         params.sinkhorn_iters,
         value);
+    result->op_params[3] = kvarn_contiguous_tokens_per_stream_hint(sinfo);
+    return result;
 }
 
 ggml_tensor * llama_kv_cache_kvarn::materialize(
@@ -889,6 +930,7 @@ ggml_tensor * llama_kv_cache_kvarn::materialize(
         stream_count,
         value ? params.value_bits : params.key_bits,
         value);
+    result->op_params[4] = kvarn_single_stream_live_group_hint(sinfo);
 
     const uint32_t slices = value ? layer.v_slices : layer.k_slices;
     if (slices > 1) {

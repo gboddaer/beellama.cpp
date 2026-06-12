@@ -236,6 +236,18 @@ static ggml_backend_t init_test_backend(enum ggml_backend_dev_type device_type, 
     return backend;
 }
 
+static void set_kvarn_store_legacy_env(bool enabled) {
+#ifdef _WIN32
+    _putenv_s("GGML_KVARN_STORE_LEGACY", enabled ? "1" : "");
+#else
+    if (enabled) {
+        setenv("GGML_KVARN_STORE_LEGACY", "1", 1);
+    } else {
+        unsetenv("GGML_KVARN_STORE_LEGACY");
+    }
+#endif
+}
+
 static void test_cache_ops(enum ggml_backend_dev_type device_type, bool required, int bits) {
     ggml_backend_t backend = init_test_backend(device_type, required);
     if (backend == nullptr) {
@@ -448,6 +460,98 @@ static void test_cache_ops_multi_stream(enum ggml_backend_dev_type device_type, 
     ggml_backend_free(backend);
 }
 
+static std::vector<uint8_t> test_store_records(
+        ggml_backend_t backend,
+        int            bits,
+        bool           value,
+        bool           legacy) {
+    ggml_init_params params = {
+        /*.mem_size   =*/ 8 * 1024 * 1024,
+        /*.mem_buffer =*/ nullptr,
+        /*.no_alloc   =*/ true,
+    };
+    ggml_context * ctx = ggml_init(params);
+    require(ctx != nullptr, "failed to initialize legacy parity context");
+
+    constexpr int n_stream = 2;
+    constexpr int n_heads = 2;
+    constexpr int n_tokens_per_stream = 385;
+    constexpr int start_idx = 64;
+    constexpr int n_groups_per_stream = 4;
+    constexpr int n_tokens = n_tokens_per_stream * n_stream;
+    const int record_bytes = int(llama_kvarn_packed_bytes(128 * 128, bits) + 3 * 128 * sizeof(ggml_fp16_t));
+
+    ggml_tensor * current = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 128, n_heads, n_tokens);
+    ggml_tensor * indices = ggml_new_tensor_1d(ctx, GGML_TYPE_I64, n_tokens);
+    ggml_tensor * stage = ggml_new_tensor_3d(ctx, GGML_TYPE_F16, 128, n_heads, 384 * n_stream);
+    ggml_tensor * records = ggml_new_tensor_3d(ctx, GGML_TYPE_I8, record_bytes, n_heads, n_groups_per_stream * n_stream);
+
+    ggml_tensor * stored = ggml_kvarn_store(ctx, current, indices, stage, records, bits, 16, value);
+    stored->op_params[3] = n_tokens_per_stream;
+
+    ggml_cgraph * graph = ggml_new_graph(ctx);
+    ggml_build_forward_expand(graph, stored);
+
+    ggml_backend_buffer_t buffer = ggml_backend_alloc_ctx_tensors(ctx, backend);
+    require(buffer != nullptr, "failed to allocate legacy parity tensors");
+
+    std::vector<float> input(128 * n_heads * n_tokens);
+    for (int s = 0; s < n_stream; ++s) {
+        for (int t = 0; t < n_tokens_per_stream; ++t) {
+            for (int h = 0; h < n_heads; ++h) {
+                for (int d = 0; d < 128; ++d) {
+                    input[((s * n_tokens_per_stream + t) * n_heads + h) * 128 + d] =
+                        std::sin(float(d) * 0.071f + float(h) * 0.13f + float(s) * 0.31f) +
+                        std::cos(float(t) * 0.037f + float(h) * 0.11f + float(s) * 0.23f) +
+                        float((d * 13 + h * 7 + t * 17 + s * 19) % 31 - 15) * 0.01f;
+                }
+            }
+        }
+    }
+
+    std::vector<int64_t> idx(n_tokens);
+    for (int s = 0; s < n_stream; ++s) {
+        for (int t = 0; t < n_tokens_per_stream; ++t) {
+            idx[s * n_tokens_per_stream + t] = int64_t(s * n_groups_per_stream * 128 + start_idx + t);
+        }
+    }
+    std::vector<uint8_t> zeros(std::max(ggml_nbytes(stage), ggml_nbytes(records)), 0);
+
+    ggml_backend_tensor_set(current, input.data(), 0, ggml_nbytes(current));
+    ggml_backend_tensor_set(indices, idx.data(), 0, ggml_nbytes(indices));
+    ggml_backend_tensor_set(stage, zeros.data(), 0, ggml_nbytes(stage));
+    ggml_backend_tensor_set(records, zeros.data(), 0, ggml_nbytes(records));
+
+    set_kvarn_store_legacy_env(legacy);
+    require(ggml_backend_graph_compute(backend, graph) == GGML_STATUS_SUCCESS, "legacy parity graph compute failed");
+    set_kvarn_store_legacy_env(false);
+
+    std::vector<uint8_t> record_data(ggml_nbytes(records));
+    ggml_backend_tensor_get(records, record_data.data(), 0, record_data.size());
+
+    ggml_backend_buffer_free(buffer);
+    ggml_free(ctx);
+    return record_data;
+}
+
+static void test_store_legacy_parity_gpu() {
+    ggml_backend_t backend = init_test_backend(GGML_BACKEND_DEVICE_TYPE_GPU, false);
+    if (backend == nullptr) {
+        return;
+    }
+
+    for (int bits : { 2, 3, 4, 5, 6, 8 }) {
+        for (bool value : { false, true }) {
+            const std::vector<uint8_t> modern = test_store_records(backend, bits, value, false);
+            const std::vector<uint8_t> legacy = test_store_records(backend, bits, value, true);
+            require(modern == legacy, "KVarN CUDA store records differ from legacy path");
+        }
+    }
+
+    set_kvarn_store_legacy_env(false);
+    ggml_backend_free(backend);
+}
+
 int main() {
     ggml_backend_load_all();
 
@@ -477,6 +581,7 @@ int main() {
     }
     test_cache_ops_multi_stream(GGML_BACKEND_DEVICE_TYPE_CPU, true, 6);
     test_cache_ops_multi_stream(GGML_BACKEND_DEVICE_TYPE_GPU, false, 6);
+    test_store_legacy_parity_gpu();
 
     std::printf("test-kvarn: all tests OK\n");
     return 0;

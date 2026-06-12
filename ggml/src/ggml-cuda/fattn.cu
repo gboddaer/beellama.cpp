@@ -1,5 +1,6 @@
 #include "common.cuh"
 #include "fattn-common.cuh"
+#include "fattn-kvarn.cuh"
 #include "fattn-mma-f16.cuh"
 #include "fattn-mma-turbo.cuh"
 #include "fattn-tile.cuh"

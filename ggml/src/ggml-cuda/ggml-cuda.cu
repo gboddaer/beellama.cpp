@@ -4052,6 +4052,101 @@ static bool ggml_cuda_can_fuse(const struct ggml_cgraph *                cgraph,
     return false;
 }
 
+static bool ggml_cuda_is_kvarn_fattn_passthrough(const ggml_tensor * node) {
+    return node != nullptr &&
+        (node->op == GGML_OP_RESHAPE ||
+         node->op == GGML_OP_PERMUTE ||
+         node->op == GGML_OP_VIEW ||
+         node->op == GGML_OP_TRANSPOSE);
+}
+
+static const ggml_tensor * ggml_cuda_kvarn_fattn_unwrap(const ggml_tensor * node) {
+    while (ggml_cuda_is_kvarn_fattn_passthrough(node)) {
+        node = node->src[0];
+    }
+    return node;
+}
+
+static int ggml_cuda_try_fuse_kvarn_fattn(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, int i) {
+    static const bool debug = [] {
+        const char * env = std::getenv("GGML_KVARN_FUSED_DEBUG");
+        return env != nullptr && env[0] != '\0' && env[0] != '0';
+    }();
+    static int debug_lines = 0;
+
+    ggml_tensor * k_mat = cgraph->nodes[i];
+    if (k_mat->op != GGML_OP_KVARN_MATERIALIZE || ggml_get_op_params_i32(k_mat, 1) != 0) {
+        return 0;
+    }
+
+    ggml_tensor * v_mat = nullptr;
+    for (int j = i + 1; j < cgraph->n_nodes && j <= i + 32; ++j) {
+        ggml_tensor * node = cgraph->nodes[j];
+        if (debug && debug_lines < 80) {
+            fprintf(stderr,
+                "GGML_KVARN_FUSED_DEBUG: scan base=%d j=%d op=%s name=%s src1=%s src2=%s\n",
+                i, j, ggml_op_name(node->op), node->name,
+                node->src[1] ? ggml_op_name(node->src[1]->op) : "-",
+                node->src[2] ? ggml_op_name(node->src[2]->op) : "-");
+            ++debug_lines;
+        }
+        if (ggml_is_empty(node) || node->op == GGML_OP_NONE || ggml_cuda_is_kvarn_fattn_passthrough(node)) {
+            continue;
+        }
+
+        if (node->op == GGML_OP_KVARN_MATERIALIZE) {
+            if (ggml_get_op_params_i32(node, 1) != 1) {
+                if (debug && debug_lines < 80) {
+                    fprintf(stderr, "GGML_KVARN_FUSED_DEBUG: reject non-V materialize at %d\n", j);
+                    ++debug_lines;
+                }
+                return 0;
+            }
+            if (v_mat != nullptr && v_mat != node) {
+                if (debug && debug_lines < 80) {
+                    fprintf(stderr, "GGML_KVARN_FUSED_DEBUG: reject second V materialize at %d\n", j);
+                    ++debug_lines;
+                }
+                return 0;
+            }
+            v_mat = node;
+            continue;
+        }
+
+        if (node->op != GGML_OP_FLASH_ATTN_EXT) {
+            if (debug && debug_lines < 80) {
+                fprintf(stderr, "GGML_KVARN_FUSED_DEBUG: reject intervening compute op %s at %d\n", ggml_op_name(node->op), j);
+                ++debug_lines;
+            }
+            return 0;
+        }
+        if (v_mat == nullptr ||
+                ggml_cuda_kvarn_fattn_unwrap(node->src[1]) != k_mat ||
+                ggml_cuda_kvarn_fattn_unwrap(node->src[2]) != v_mat ||
+                !ggml_cuda_flash_attn_ext_kvarn_supported(node)) {
+            if (debug && debug_lines < 80) {
+                fprintf(stderr,
+                    "GGML_KVARN_FUSED_DEBUG: reject FA at %d v_mat=%p unwrapK=%p k=%p unwrapV=%p v=%p supported=%d\n",
+                    j, (void *) v_mat,
+                    (void *) ggml_cuda_kvarn_fattn_unwrap(node->src[1]), (void *) k_mat,
+                    (void *) ggml_cuda_kvarn_fattn_unwrap(node->src[2]), (void *) v_mat,
+                    (int) ggml_cuda_flash_attn_ext_kvarn_supported(node));
+                ++debug_lines;
+            }
+            return 0;
+        }
+
+        if (debug && debug_lines < 80) {
+            fprintf(stderr, "GGML_KVARN_FUSED_DEBUG: fused KVarN FA at base=%d fa=%d\n", i, j);
+            ++debug_lines;
+        }
+        ggml_cuda_flash_attn_ext_kvarn(*cuda_ctx, node);
+        return j - i;
+    }
+
+    return 0;
+}
+
 // try and fuse nodes and return the number of nodes to skip
 static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, int i) {
 
@@ -4061,6 +4156,13 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
     }
 
     ggml_tensor * node = cgraph->nodes[i];
+
+    if (node->op == GGML_OP_KVARN_MATERIALIZE) {
+        const int nodes_to_skip = ggml_cuda_try_fuse_kvarn_fattn(cuda_ctx, cgraph, i);
+        if (nodes_to_skip != 0) {
+            return nodes_to_skip;
+        }
+    }
 
     //topk-moe
     if (cgraph->nodes[i]->op == GGML_OP_UNARY || cgraph->nodes[i]->op == GGML_OP_SOFT_MAX ||

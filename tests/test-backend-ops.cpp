@@ -7282,6 +7282,7 @@ struct test_kvarn_roundtrip : public test_case {
         ggml_set_name(records, "records");
 
         ggml_tensor * stored = ggml_kvarn_store(ctx, current, indices, stage, records, bits, 16, value);
+        stored->op_params[3] = n_tokens;
         ggml_tensor * out = ggml_kvarn_materialize(ctx, records, stored, indices, start_idx + n_tokens, 0, n_stream, bits, value);
         ggml_set_name(out, "out");
         return out;
@@ -7327,6 +7328,7 @@ struct test_kvarn_store_only : public test_case {
         ggml_set_name(records, "records");
 
         ggml_tensor * out = ggml_kvarn_store(ctx, current, indices, stage, records, bits, 16, value);
+        out->op_params[3] = n_tokens;
         ggml_set_name(out, "out");
         return out;
     }
@@ -7934,6 +7936,8 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     }
     for (bool value : {false, true}) {
         test_cases.emplace_back(new test_kvarn_roundtrip(4, 1, 385, 0, 2, value));
+        test_cases.emplace_back(new test_kvarn_roundtrip(4, 1, 385, 64, 2, value));
+        test_cases.emplace_back(new test_kvarn_roundtrip(4, 1, 385, 256, 1, value));
         test_cases.emplace_back(new test_kvarn_store_only(4, 1, 512, 1, value));
     }
 
