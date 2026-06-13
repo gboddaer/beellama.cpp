@@ -584,12 +584,89 @@ int main(int argc, char ** argv) {
                  cuda_template_generator.find("GGML_TYPE_Q3_0") != std::string::npos &&
                  cuda_template_generator.find("GGML_TYPE_Q2_1") != std::string::npos &&
                  cuda_cmake.find("turbo4_tcq") != std::string::npos &&
-                 cuda_cmake.find("GGML_CUDA_FA_HALF_PAIR_COUNT EQUAL 208") != std::string::npos &&
+                 cuda_cmake.find("GGML_CUDA_FA_HALF_PAIR_COUNT EQUAL 217") != std::string::npos &&
                  cuda_dispatch_generator.find("GGML_TYPE_TURBO4_TCQ") != std::string::npos &&
                  cuda_dispatch_generator.find("assert len(TYPES) == 19") != std::string::npos &&
                  cuda_dispatch_generator.find("assert all_count == 361") != std::string::npos &&
-                 cuda_dispatch_generator.find("assert half_count == 208") != std::string::npos,
+                 cuda_dispatch_generator.find("assert half_count == 217") != std::string::npos,
         "CUDA FlashAttention generators and CMake must include turbo4_tcq and the new q KV types in ALL/HALF matrices");
+    {
+        const std::string half_order =
+            "q5_0\n"
+            "            q4_1\n"
+            "            turbo4_tcq\n"
+            "            turbo4_0\n"
+            "            q4_0\n"
+            "            q3_1\n"
+            "            turbo3_tcq\n"
+            "            turbo3_0\n"
+            "            q3_0\n"
+            "            q2_1\n"
+            "            turbo2_tcq\n"
+            "            turbo2_0\n"
+            "            q2_0";
+        const std::string generator_half_order =
+            "GGML_TYPE_Q5_0\",       \"q5_0\"),\n"
+            "    (\"GGML_TYPE_Q4_1\",       \"q4_1\"),\n"
+            "    (\"GGML_TYPE_TURBO4_TCQ\", \"turbo4_tcq\"),\n"
+            "    (\"GGML_TYPE_TURBO4_0\",   \"turbo4_0\"),\n"
+            "    (\"GGML_TYPE_Q4_0\",       \"q4_0\"),\n"
+            "    (\"GGML_TYPE_Q3_1\",       \"q3_1\"),\n"
+            "    (\"GGML_TYPE_TURBO3_TCQ\", \"turbo3_tcq\"),\n"
+            "    (\"GGML_TYPE_TURBO3_0\",   \"turbo3_0\"),\n"
+            "    (\"GGML_TYPE_Q3_0\",       \"q3_0\"),\n"
+            "    (\"GGML_TYPE_Q2_1\",       \"q2_1\"),\n"
+            "    (\"GGML_TYPE_TURBO2_TCQ\", \"turbo2_tcq\"),\n"
+            "    (\"GGML_TYPE_TURBO2_0\",   \"turbo2_0\"),\n"
+            "    (\"GGML_TYPE_Q2_0\",       \"q2_0\")";
+        const std::string template_generator_half_order =
+            "\"GGML_TYPE_Q5_0\",\n"
+            "    \"GGML_TYPE_Q4_1\",\n"
+            "    \"GGML_TYPE_TURBO4_TCQ\",\n"
+            "    \"GGML_TYPE_TURBO4_0\",\n"
+            "    \"GGML_TYPE_Q4_0\",\n"
+            "    \"GGML_TYPE_Q3_1\",\n"
+            "    \"GGML_TYPE_TURBO3_TCQ\",\n"
+            "    \"GGML_TYPE_TURBO3_0\",\n"
+            "    \"GGML_TYPE_Q3_0\",\n"
+            "    \"GGML_TYPE_Q2_1\",\n"
+            "    \"GGML_TYPE_TURBO2_TCQ\",\n"
+            "    \"GGML_TYPE_TURBO2_0\",\n"
+            "    \"GGML_TYPE_Q2_0\"";
+        const std::string cuda_fattn_half_dispatch = slice_between(
+            cuda_fattn,
+            "#elif defined(GGML_CUDA_FA_HALF_QUANTS)\n    FATTN_VEC_CASES_ALL_D_512(GGML_TYPE_F16, GGML_TYPE_F16)",
+            "#else\n    FATTN_VEC_CASES_ALL_D_512(GGML_TYPE_F16, GGML_TYPE_F16)");
+
+        ok &= expect(cuda_cmake.find(half_order) != std::string::npos &&
+                     cuda_cmake.find("function(ggml_cuda_fa_kv_rank OUT TYPE)") != std::string::npos &&
+                     cuda_cmake.find("TYPE STREQUAL \"q4_1\" OR TYPE STREQUAL \"turbo4_tcq\" OR TYPE STREQUAL \"turbo4_0\"") != std::string::npos &&
+                     cuda_cmake.find("TYPE STREQUAL \"q3_1\" OR TYPE STREQUAL \"turbo3_tcq\" OR TYPE STREQUAL \"turbo3_0\"") != std::string::npos &&
+                     cuda_cmake.find("TYPE STREQUAL \"q2_1\" OR TYPE STREQUAL \"turbo2_tcq\" OR TYPE STREQUAL \"turbo2_0\"") != std::string::npos &&
+                     cuda_dispatch_generator.find("HALF_RANKS = {") != std::string::npos &&
+                     cuda_dispatch_generator.find("\"GGML_TYPE_Q4_1\": 7") != std::string::npos &&
+                     cuda_dispatch_generator.find("\"GGML_TYPE_TURBO4_TCQ\": 7") != std::string::npos &&
+                     cuda_dispatch_generator.find("\"GGML_TYPE_TURBO4_0\": 7") != std::string::npos &&
+                     cuda_dispatch_generator.find(generator_half_order) != std::string::npos &&
+                     cuda_template_generator.find(template_generator_half_order) != std::string::npos,
+            "CUDA FlashAttention HALF ranking must treat Turbo/TurboTCQ as pseudo-equal to the _1 member of each bit tier");
+        ok &= expect(cuda_fattn_half_dispatch.find("FATTN_VEC_CASES_ALL_D_512(GGML_TYPE_Q4_1, GGML_TYPE_TURBO4_TCQ)") != std::string::npos &&
+                     cuda_fattn_half_dispatch.find("FATTN_VEC_CASES_ALL_D_512(GGML_TYPE_TURBO4_TCQ, GGML_TYPE_Q4_1)") != std::string::npos &&
+                     cuda_fattn_half_dispatch.find("FATTN_VEC_CASES_ALL_D_512(GGML_TYPE_Q4_1, GGML_TYPE_TURBO4_0)") != std::string::npos &&
+                     cuda_fattn_half_dispatch.find("FATTN_VEC_CASES_ALL_D_512(GGML_TYPE_TURBO4_0, GGML_TYPE_Q4_1)") != std::string::npos &&
+                     cuda_fattn_half_dispatch.find("FATTN_VEC_CASES_ALL_D_512(GGML_TYPE_TURBO4_0, GGML_TYPE_TURBO4_TCQ)") != std::string::npos &&
+                     cuda_fattn_half_dispatch.find("FATTN_VEC_CASES_ALL_D_512(GGML_TYPE_TURBO4_TCQ, GGML_TYPE_TURBO4_0)") != std::string::npos &&
+                     cuda_fattn_half_dispatch.find("FATTN_VEC_CASES_ALL_D_512(GGML_TYPE_Q4_0, GGML_TYPE_TURBO4_TCQ)") == std::string::npos &&
+                     cuda_fattn_half_dispatch.find("FATTN_VEC_CASES_ALL_D_512(GGML_TYPE_Q4_0, GGML_TYPE_TURBO4_0)") == std::string::npos &&
+                     cuda_fattn_half_dispatch.find("FATTN_VEC_CASES_ALL_D_512(GGML_TYPE_TURBO4_TCQ, GGML_TYPE_Q4_0)") != std::string::npos &&
+                     cuda_fattn_half_dispatch.find("FATTN_VEC_CASES_ALL_D_512(GGML_TYPE_Q3_1, GGML_TYPE_TURBO3_TCQ)") != std::string::npos &&
+                     cuda_fattn_half_dispatch.find("FATTN_VEC_CASES_ALL_D_512(GGML_TYPE_TURBO3_TCQ, GGML_TYPE_Q3_1)") != std::string::npos &&
+                     cuda_fattn_half_dispatch.find("FATTN_VEC_CASES_ALL_D_512(GGML_TYPE_Q3_0, GGML_TYPE_TURBO3_TCQ)") == std::string::npos &&
+                     cuda_fattn_half_dispatch.find("FATTN_VEC_CASES_ALL_D_512(GGML_TYPE_Q2_1, GGML_TYPE_TURBO2_TCQ)") != std::string::npos &&
+                     cuda_fattn_half_dispatch.find("FATTN_VEC_CASES_ALL_D_512(GGML_TYPE_TURBO2_TCQ, GGML_TYPE_Q2_1)") != std::string::npos &&
+                     cuda_fattn_half_dispatch.find("FATTN_VEC_CASES_ALL_D_512(GGML_TYPE_Q2_0, GGML_TYPE_TURBO2_TCQ)") == std::string::npos,
+            "CUDA FlashAttention HALF dispatch must compile pseudo-equal qX_1/Turbo pairs both ways and exclude qX_0-to-Turbo K<V pairs");
+    }
     {
         const std::string cuda_cmake_default_pairs = slice_between(
             cuda_cmake,
