@@ -205,6 +205,14 @@ int main(int argc, char ** argv) {
     const std::string vulkan_shader_gen = read_file(root + "/ggml/src/ggml-vulkan/vulkan-shaders/vulkan-shaders-gen.cpp");
     const std::string vulkan_kvarn_store = read_file(root + "/ggml/src/ggml-vulkan/vulkan-shaders/kvarn_store.comp");
     const std::string vulkan_kvarn_materialize = read_file(root + "/ggml/src/ggml-vulkan/vulkan-shaders/kvarn_materialize.comp");
+    const std::string readme_md = read_file(root + "/README.md");
+    const std::string agents_md = read_file(root + "/AGENTS.md");
+    const std::string claude_md = read_file(root + "/CLAUDE.md");
+    const std::string docs_build_md = read_file(root + "/docs/build.md");
+    const std::string quickstart_qwen36_md = read_file(root + "/docs/quickstart-qwen36-dflash.md");
+    const std::string quickstart_gemma4_md = read_file(root + "/docs/quickstart-gemma-4-31b-dflash.md");
+    const std::string release_workflow = read_file(root + "/.github/workflows/release.yml");
+    const std::string release_dispatch_workflow = read_file(root + "/.github/workflows/release-dispatch.yml");
 
     ok &= expect(dflash_profile_parse_env(nullptr) == 0, "DFlash profile parser must treat missing env as disabled");
     ok &= expect(dflash_profile_parse_env("0") == 0, "DFlash profile parser must treat 0 as disabled");
@@ -634,6 +642,24 @@ int main(int argc, char ** argv) {
                      !cmake_has_default_pair("q8_0:q3_0") &&
                      !cmake_has_default_pair("q6_0:q3_0"),
             "CUDA FlashAttention default build must cap fp at q5 and q8/q6 at q4 without f16/bf16 asymmetry");
+
+        const std::string user_docs = readme_md + "\n" + agents_md + "\n" + claude_md + "\n" +
+            docs_build_md + "\n" + quickstart_qwen36_md + "\n" + quickstart_gemma4_md;
+        ok &= expect(release_workflow.find("-DGGML_CUDA_FA_HALF_QUANTS=ON") == std::string::npos &&
+                     release_workflow.find("-DGGML_CUDA_FA_ALL_QUANTS=ON") == std::string::npos &&
+                     release_dispatch_workflow.find("-DGGML_CUDA_FA_HALF_QUANTS=ON") == std::string::npos &&
+                     release_dispatch_workflow.find("-DGGML_CUDA_FA_ALL_QUANTS=ON") == std::string::npos,
+            "Release workflows must use default CUDA FA quant compilation");
+        ok &= expect(quickstart_qwen36_md.find("-DGGML_CUDA_FA_HALF_QUANTS=ON") == std::string::npos &&
+                     quickstart_gemma4_md.find("-DGGML_CUDA_FA_HALF_QUANTS=ON") == std::string::npos,
+            "DFlash quickstart build commands must use default CUDA FA quant compilation");
+        ok &= expect(user_docs.find("standard q cache types or KVarN") != std::string::npos &&
+                     user_docs.find("TurboQuant/TCQ has not shown a benchmark advantage") != std::string::npos &&
+                     user_docs.find("K<V") != std::string::npos &&
+                     user_docs.find("K>>>V") != std::string::npos &&
+                     user_docs.find("GGML_CUDA_FA_HALF_QUANTS=ON") != std::string::npos &&
+                     user_docs.find("GGML_CUDA_FA_ALL_QUANTS=ON") != std::string::npos,
+            "User-facing docs must recommend default CUDA FA q/KVarN compilation while documenting HALF/ALL escape hatches");
     }
     ok &= expect(arch_cpp.find("{ LLM_ARCH_DFLASH,") != std::string::npos,
         "upstream dflash architecture must be registered separately");

@@ -57,7 +57,7 @@ Building from source with `-DGGML_NATIVE=ON` may result in a tiny bit better per
 
 ```powershell
 cmake -B build -DGGML_CUDA=ON -DGGML_NATIVE=ON ^
-  -DGGML_CUDA_FA=ON -DGGML_CUDA_FA_HALF_QUANTS=ON ^
+  -DGGML_CUDA_FA=ON ^
   -DCMAKE_BUILD_TYPE=Release
 cmake --build build --config Release --parallel
 ```
@@ -66,12 +66,12 @@ cmake --build build --config Release --parallel
 
 ```bash
 cmake -B build -DGGML_CUDA=ON -DGGML_NATIVE=ON \
-  -DGGML_CUDA_FA=ON -DGGML_CUDA_FA_HALF_QUANTS=ON \
+  -DGGML_CUDA_FA=ON \
   -DCMAKE_BUILD_TYPE=Release
 cmake --build build -j
 ```
 
-`GGML_CUDA_FA_HALF_QUANTS=ON` is the recommended CUDA FlashAttention build mode for DFlash/TurboQuant quickstarts because it compiles the Turbo/TCQ-capable 208-pair half-matrix plus f16 fallback pairs needed by TurboQuant/TCQ dequant paths. If you are staying on standard q cache types or KVarN fallback types, the no-flag default compiles the smaller 62-pair q/KVarN-fallback set. Use `GGML_CUDA_FA_ALL_QUANTS=ON` only if you need the full 361-pair K/V matrix or arbitrary asymmetric cache-type combinations. These flags are mutually exclusive.
+The no-flag CUDA FlashAttention default is recommended for these quickstarts because it compiles the much faster 62-pair q/KVarN-fallback set for standard q cache types or KVarN. TurboQuant/TCQ has not shown a benchmark advantage over standard q or KVarN cache types in current fork benchmarks, so Turbo/TCQ FA pairs are not compiled by default. The pair policy keeps K>=V because K loses precision faster under quantization and K<V pairs are inefficient, but avoids K>>>V because large K/V tier gaps are unbalanced. Use `GGML_CUDA_FA_HALF_QUANTS=ON` only when you want TurboQuant/TCQ or high-delta K>=V experiments, and `GGML_CUDA_FA_ALL_QUANTS=ON` only if you need the full 361-pair K/V matrix. These flags are mutually exclusive.
 
 **macOS (Metal).**
 
@@ -94,9 +94,9 @@ Three practical combos make sense right now. Pick one based on whether you want 
 |-------|--------|---------|---------|---------|----------|
 | **Balanced** | Q4_K_S | IQ4_XS or Q4_K_M or Q5_K_M | q5_0 | q4_1 | Current default on 24 GB cards; strongest overall quality/speed/VRAM trade from the live launcher config |
 | **Precision** | UD-Q4_K_XL | IQ4_XS or Q4_K_M or Q5_K_M | q5_0 | q4_1 | Higher target quality when you can afford it; limited VRAM headroom for context on 24 GB cards |
-| **VRAM** | IQ4_XS or Q3_K_M or Q3_K_S | IQ4_XS or Q4_K_M | q4_0 | q4_0 (or turbo3_tcq for tighter VRAM) | Lower VRAM, more context headroom, or heavier background VRAM pressure |
+| **VRAM** | IQ4_XS or Q3_K_M or Q3_K_S | IQ4_XS or Q4_K_M | q4_0 | q4_0 or kvarn4 | Lower VRAM, more context headroom, or heavier background VRAM pressure |
 
-The precision combo gives the best model quality. The `q5_0` K cache plus `q4_1` V cache is the current default, as my recent long-context KV quant benchmarks showed it is a better quality/size trade than the older TurboQuant recommendation.
+The precision combo gives the best model quality. The `q5_0` K cache plus `q4_1` V cache is the current default, as my recent long-context KV quant benchmarks showed it is a better quality/size trade than the older compact-cache suggestion. For lower-memory runs, use standard q or KVarN cache types first.
 
 As for heavier drafters like Q8, from my testing it was always a net negative for tok/s, probably due to combination of the model being much larger, and quantization not mattering as much for drafting as all the model needs to do is guess 8-16 tokens at a time. But if someone will provide benchmarks that prove otherwise or point out it's due to an incorrect implementation in the code, I'll be happy to change the stance.
 
@@ -209,16 +209,16 @@ Use a lighter target and lighter cache. A practical starting point is:
 --cache-type-v q4_0
 ```
 
-If you need even more KV headroom on CUDA, try:
+If you need even more KV headroom on CUDA, try KVarN fallback at the same bit tier before dropping model quality:
 
 ```text
---cache-type-k turbo3_tcq
---cache-type-v q4_1
+--cache-type-k kvarn4
+--cache-type-v kvarn4
 --reasoning off
 --ctx-size 50000
 ```
 
-That mirrors the current `Start-Gemma4-31B-DFlash-NoReason.ps1` launcher, which trades some context behavior and quality for lower VRAM pressure.
+That keeps the quickstart on the default FA build. TurboQuant/TCQ is now a targeted HALF-build experiment path rather than the recommended default.
 
 ### Optionally: use `--spec-draft-hf` instead of a local file
 
@@ -232,7 +232,7 @@ This downloads the draft model from Hugging Face on first run and caches it loca
 
 ## What the flags do
 
-For full command-line tuning, including upstream llama.cpp args, DFlash args, TurboQuant/TCQ cache choices, context checkpoints, prompt-cache RAM, and chat/reasoning controls, read [beellama-args.md](beellama-args.md).
+For full command-line tuning, including upstream llama.cpp args, DFlash args, KV cache choices, context checkpoints, prompt-cache RAM, and chat/reasoning controls, read [beellama-args.md](beellama-args.md).
 
 ### DFlash flags
 
@@ -283,7 +283,7 @@ For full command-line tuning, including upstream llama.cpp args, DFlash args, Tu
 
 ### NVIDIA CUDA (Windows, Linux)
 
-Full DFlash acceleration: GPU cross-attention ring buffer, device-to-device hidden-state capture and replay, GPU tape path for Gemma 4. All TurboQuant and TCQ cache types are available.
+Full DFlash acceleration: GPU cross-attention ring buffer, device-to-device hidden-state capture and replay, GPU tape path for Gemma 4. Standard q and KVarN cache choices in this guide work with the default FA build. TurboQuant and TCQ cache types require HALF or ALL FA builds when FlashAttention needs their vec pairs.
 
 ### Apple Metal (macOS)
 
@@ -291,7 +291,7 @@ DFlash runs through the CPU ring buffer path - functional but slower than CUDA -
 
 ### AMD ROCm
 
-DFlash falls back to the CPU ring buffer path. Standard cache types such as `q5_0` and `q4_1` are the recommended starting point. The ROCm build compiles TurboQuant from the same CUDA source files (via HIP), so TurboQuant and TCQ cache types may work, but compilation success under HIPCC is not guaranteed. If TCQ types fail, stay on standard cache types or try non-TCQ TurboQuant. Build with `-DGGML_HIP=ON` instead of `-DGGML_CUDA=ON`.
+DFlash falls back to the CPU ring buffer path. Standard q cache types or KVarN, such as `q5_0` and `q4_1`, are the recommended starting point. The ROCm build compiles TurboQuant from the same CUDA source files (via HIP), so TurboQuant and TCQ cache types may work, but compilation success under HIPCC is not guaranteed. If TCQ types fail, stay on standard cache types or KVarN. Build with `-DGGML_HIP=ON` instead of `-DGGML_CUDA=ON`.
 
 ### Vulkan
 
@@ -317,7 +317,7 @@ Tree verification (`--spec-branch-budget` > 0) is automatically disabled when th
 The default command targets 24 GB VRAM with `Q4_K_S`. If you are running out of memory, adjust in this order:
 
 1. **Reduce `--ctx-size`.** Each unit of context costs VRAM for both the target model's KV cache and the DFlash cross-attention buffer. Dropping from `102400` to `65536` or `32768` frees significant memory.
-2. **Switch cache types.** Replace `q5_0` / `q4_1` with `q4_0` / `q4_0` first. On CUDA, `turbo3_tcq` for both K and V squeezes further; `turbo2_tcq` is the last resort. On Metal, use `turbo3` for both K and V if `q4_0` is too large.
+2. **Switch cache types.** Replace `q5_0` / `q4_1` with `q4_0` / `q4_0` first. On CUDA, try `kvarn4` for both K and V if q4 cache is still too large, then consider q3/KVarN3 only after checking quality. TurboQuant/TCQ requires a HALF or ALL FA build and is not the recommended default path.
 3. **Drop the target quantization.** Move from `Q4_K_S` to `IQ4_XS`, then to `Q3_K_M` or `Q3_K_S` if needed.
 4. **Reduce `--spec-dflash-cross-ctx`.** Lowering from `1024` to `512` saves VRAM at the cost of less context for the drafter's cross-attention.
 5. **Lower `--cache-ram`.** The prompt-cache RAM subsystem defaults to 8192 MiB. If system RAM is tight, lower it to 4096 or 2048 to reduce the RAM ceiling:
@@ -354,6 +354,6 @@ Adaptive draft is highly configurable, so if you want to tinker with it, check o
 
 **Slow DFlash on macOS.** The CPU ring path is slower than the CUDA GPU ring. This is a platform limitation, not a configuration issue. Reducing `--spec-dflash-cross-ctx` to `512` lowers CPU ring overhead.
 
-**TCQ cache types fail on non-CUDA backends.** `turbo2_tcq` and `turbo3_tcq` are CUDA-only. Use standard cache types such as `q5_0`, `q4_0`, `q8_0`, or `f16` instead. On Metal, non-TCQ TurboQuant is limited to `turbo3` and `turbo4`; on ROCm, non-TCQ TurboQuant may work if the HIP build succeeds.
+**TCQ cache types fail on non-CUDA backends.** `turbo2_tcq` and `turbo3_tcq` are CUDA-only, and CUDA FlashAttention needs a HALF or ALL FA build for Turbo/TCQ vec pairs. Use standard cache types such as `q5_0`, `q4_0`, `q8_0`, `f16`, or KVarN instead. On Metal, non-TCQ TurboQuant is limited to `turbo3` and `turbo4`; on ROCm, non-TCQ TurboQuant may work if the HIP build succeeds.
 
 **DFlash seems disabled.** Check the server log for `dflash:` or `speculative` lines. If DFlash is active, you will see draft acceptance rates and timing. If you see no DFlash output, verify that `--spec-type dflash` is set and the draft model loaded successfully. A DFlash draft GGUF auto-detects as `dflash` even without `--spec-type`, but setting it explicitly avoids ambiguity.

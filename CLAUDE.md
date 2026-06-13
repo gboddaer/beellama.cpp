@@ -37,7 +37,7 @@ cmake -B build -DGGML_METAL=ON -DCMAKE_BUILD_TYPE=Release
 cmake --build build -j
 ```
 
-Without `GGML_CUDA_FA_HALF_QUANTS` or `GGML_CUDA_FA_ALL_QUANTS`, the CUDA FlashAttention build compiles Bee's q/KVarN-fallback default: 62 K>=V vec pairs with fp cache types capped at q5 and q8/q6 capped at q4. This default leaves TurboQuant/TCQ FA pairs out; use `GGML_CUDA_FA_HALF_QUANTS=ON` for the larger 208-pair Turbo/TCQ-capable half-matrix, or `GGML_CUDA_FA_ALL_QUANTS=ON` for the full 361-pair matrix. These two flags are mutually exclusive. Add `-DCMAKE_CUDA_ARCHITECTURES=86` for RTX 3090, or `-DCMAKE_CUDA_ARCHITECTURES=89` for RTX 4090, if cross-compiling or building in CI without a GPU.
+Without `GGML_CUDA_FA_HALF_QUANTS` or `GGML_CUDA_FA_ALL_QUANTS`, the CUDA FlashAttention build compiles Bee's recommended default for standard q cache types or KVarN fallback: 62 K>=V vec pairs with fp cache types capped at q5 and q8/q6 capped at q4. This default is much faster to compile than the 208-pair HALF or 361-pair ALL modes and leaves TurboQuant/TCQ FA pairs out because TurboQuant/TCQ has not shown a benchmark advantage over standard q or KVarN cache types in current fork benchmarks. The pair policy keeps K>=V because K loses precision faster under quantization and K<V pairs are inefficient, but avoids K>>>V because large K/V tier gaps are unbalanced. Use `GGML_CUDA_FA_HALF_QUANTS=ON` for TurboQuant/TCQ or high-delta K>=V experiments, or `GGML_CUDA_FA_ALL_QUANTS=ON` for the full 361-pair matrix. These two flags are mutually exclusive. Add `-DCMAKE_CUDA_ARCHITECTURES=86` for RTX 3090, or `-DCMAKE_CUDA_ARCHITECTURES=89` for RTX 4090, if cross-compiling or building in CI without a GPU.
 
 Key binaries: `build/bin/llama-server`, `build/bin/llama-cli`, `build/bin/llama-bench`, `build/bin/llama-perplexity`.
 
@@ -93,13 +93,13 @@ build/bin/llama-perplexity -m model.gguf -f test.txt -c 4096
 # Decode speed
 build/bin/llama-bench -m model.gguf -p 0 -n 64 -t 1
 
-# Server with DFlash + TurboQuant
+# Server with DFlash + recommended q cache
 build/bin/llama-server -m target.gguf --spec-type dflash \
   --spec-draft-model drafter.gguf \
   --spec-draft-n-max 8 \
   --spec-branch-budget 0 \
   --spec-dflash-cross-ctx 512 \
-  --flash-attn on --cache-type-k turbo4 --cache-type-v turbo3_tcq \
+  --flash-attn on --cache-type-k q5_0 --cache-type-v q4_1 \
   --port 8080
 ```
 

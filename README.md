@@ -259,6 +259,8 @@ Target model: [Gemma 4 31B Q4_K_S](https://huggingface.co/unsloth/gemma-4-31b-it
 
 K and V cache types are set independently with `--cache-type-k` and `--cache-type-v`. For the preset rationale and benchmark details, see [KV Cache Quantization Benchmarks for Long Context](https://anbeeld.com/articles/kv-cache-quantization-benchmarks-for-long-context).
 
+Current benchmarked presets recommend standard q cache types or KVarN fallback cache types. TurboQuant/TCQ has not shown a benchmark advantage over standard q or KVarN cache types at the recommended cache footprints, so the default CUDA FlashAttention build does not compile Turbo/TCQ pairs.
+
 ### Preset Ladder
 
 | K / V | % of bf16 size | 99.9% precision | What it is for |
@@ -273,8 +275,8 @@ K and V cache types are set independently with `--cache-type-k` and `--cache-typ
 | **q5_0 / q4_1** | **32.8** | **92.65%** | **Best default if VRAM-constrained** |
 | q5_0 / q4_0 | 31.3 | 91.39% | If q5_0 / q4_1 misses the fit by a narrow margin |
 | q4_0 / q4_0 | 28.1 | 88.87% | Memory saving with visible precision loss |
-| q4_0 / turbo3_tcq | 24.2 | 84.93% | Smaller than q4, cleaner than symmetric turbo3_tcq |
-| **turbo3_tcq / turbo3_tcq** | **20.3** | **81.56%** | **Viable extreme-compression mode** |
+| q4_0 / turbo3_tcq | 24.2 | 84.93% | Legacy Turbo/TCQ comparison point; requires a HALF or ALL FA build |
+| turbo3_tcq / turbo3_tcq | 20.3 | 81.56% | Legacy extreme-compression comparison point, not the recommended default |
 | turbo2_tcq / turbo2_tcq | 14.1 | 54.38% | Last resort: not for code, JSON, math, or tool calls |
 
 *99.9% precision = `100 · exp(−(quantKLD − bf16KLD))` at the 99.9% KL-divergence tail.*
@@ -290,10 +292,10 @@ K and V cache types are set independently with `--cache-type-k` and `--cache-typ
 | q4_1 | upstream | 5 | 3.2× | Smaller than q5_0, but weaker in the tail. Prefer q5_0 for K |
 | q4_0 | upstream | 4.5 | 3.56× | Default high compression type, decent at its size |
 | turbo4 | fork | 4.125 | 3.88× | Barely smaller than q4_0, slower, worse tail |
-| turbo3_tcq | fork | 3.25 | 4.92× | Viable compact mode, 82% precision at KLD 99.9%. CUDA-only |
-| turbo3 | fork | 3.125 | 5.12× | Weaker than turbo3_tcq. Use only when TCQ is unavailable |
-| turbo2_tcq | fork | 2.25 | 7.11× | Last resort, 54% precision at KLD 99.9%. CUDA-only |
-| turbo2 | fork | 2.125 | 7.53× | Extreme quality risk. Use only when TCQ is unavailable |
+| turbo3_tcq | fork | 3.25 | 4.92× | CUDA-only comparison point; no current benchmark advantage over q/KVarN presets |
+| turbo3 | fork | 3.125 | 5.12× | Weaker than turbo3_tcq. Use only for targeted experiments |
+| turbo2_tcq | fork | 2.25 | 7.11× | CUDA-only last resort, 54% precision at KLD 99.9% |
+| turbo2 | fork | 2.125 | 7.53× | Extreme quality risk. Use only for targeted experiments |
 
 ## Installation
 
@@ -358,7 +360,7 @@ cmake -B build -DGGML_METAL=ON -DCMAKE_BUILD_TYPE=Release
 cmake --build build -j
 ```
 
-Without `GGML_CUDA_FA_HALF_QUANTS` or `GGML_CUDA_FA_ALL_QUANTS`, the CUDA FlashAttention build compiles Bee's q/KVarN-fallback default: 62 K>=V vec pairs with fp cache types capped at q5 and q8/q6 capped at q4. This default leaves TurboQuant/TCQ FA pairs out; use `GGML_CUDA_FA_HALF_QUANTS=ON` for the larger 208-pair Turbo/TCQ-capable half-matrix, or `GGML_CUDA_FA_ALL_QUANTS=ON` for the full 361-pair matrix. These flags are mutually exclusive.
+Without `GGML_CUDA_FA_HALF_QUANTS` or `GGML_CUDA_FA_ALL_QUANTS`, the CUDA FlashAttention build compiles Bee's recommended default for standard q cache types or KVarN fallback: 62 K>=V vec pairs with fp cache types capped at q5 and q8/q6 capped at q4. This default is much faster to compile than the 208-pair HALF or 361-pair ALL modes and leaves TurboQuant/TCQ FA pairs out because TurboQuant/TCQ has not shown a benchmark advantage over standard q or KVarN cache types in current fork benchmarks. The pair policy keeps K>=V because K loses precision faster under quantization and K<V pairs are inefficient, but avoids K>>>V because large K/V tier gaps are unbalanced. Use `GGML_CUDA_FA_HALF_QUANTS=ON` for TurboQuant/TCQ or high-delta K>=V experiments, or `GGML_CUDA_FA_ALL_QUANTS=ON` for the full 361-pair matrix. These flags are mutually exclusive.
 
 ### Other Backends
 
@@ -382,13 +384,13 @@ llama-server -m model.gguf -c 16384 -np 4
 llama-server -m model.gguf -md draft.gguf
 ```
 
-### DFlash And TurboQuant Together
+### DFlash With Recommended KV Cache
 
 ```sh
 llama-server -m target.gguf --spec-type dflash \
   --spec-draft-model drafter.gguf \
   --spec-draft-ngl all \
-  --flash-attn on --cache-type-k turbo4 --cache-type-v turbo3_tcq
+  --flash-attn on --cache-type-k q5_0 --cache-type-v q4_1
 ```
 
 ## Documentation
