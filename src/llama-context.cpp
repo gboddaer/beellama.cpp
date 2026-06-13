@@ -8393,7 +8393,7 @@ llama_context * llama_init_from_model(
                 /*.attention_supported =*/ attention_supported,
                 /*.head_dims_supported =*/ head_dims_supported,
                 /*.n_seq_max           =*/ std::max(1u, params.n_seq_max),
-                /*.kv_unified          =*/ false,
+                /*.kv_unified          =*/ params.kv_unified,
             };
 
             if (const char * reason = llama_kvarn_validate_runtime(params.kvarn, requirements)) {
@@ -8406,10 +8406,6 @@ llama_context * llama_init_from_model(
                         __func__, llama_kvarn_type_name(params.kvarn.type), reason);
                 params.kvarn = llama_kvarn_default_params();
             } else {
-                if (params.kv_unified) {
-                    LLAMA_LOG_WARN("%s: KVarN requires non-unified KV streams; forcing kv_unified=false\n", __func__);
-                    params.kv_unified = false;
-                }
                 if (params.flash_attn_type != LLAMA_FLASH_ATTN_TYPE_ENABLED) {
                     LLAMA_LOG_WARN("%s: KVarN requires Flash Attention; enabling it\n", __func__);
                     params.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_ENABLED;
@@ -9440,6 +9436,18 @@ bool llama_memory_can_shift(llama_memory_t mem) {
     }
 
     return mem->get_can_shift();
+}
+
+uint32_t llama_memory_kv_n_stream(llama_memory_t mem) {
+    return mem ? mem->get_kv_n_stream() : 0;
+}
+
+uint32_t llama_context_kv_n_stream(const llama_context * ctx) {
+    return ctx ? llama_memory_kv_n_stream(llama_get_memory(ctx)) : 0;
+}
+
+bool llama_memory_state_seq_restore_requires_exclusive_kv_stream(llama_memory_t mem) {
+    return mem && mem->state_seq_restore_requires_exclusive_kv_stream();
 }
 
 static llama_memory_recurrent * get_recurrent_mem(llama_memory_t mem) {

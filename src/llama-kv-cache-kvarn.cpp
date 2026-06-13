@@ -651,6 +651,10 @@ bool llama_kv_cache_kvarn::requires_state_for_partial_restore() const {
     return true;
 }
 
+bool llama_kv_cache_kvarn::state_seq_restore_requires_exclusive_kv_stream() const {
+    return get_kv_n_stream() == 1;
+}
+
 bool llama_kv_cache_kvarn::has_pending_stream_copies() const {
     return !pending_stream_copies.empty();
 }

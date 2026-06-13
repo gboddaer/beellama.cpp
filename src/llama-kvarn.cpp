@@ -165,10 +165,6 @@ const char * llama_kvarn_validate_runtime(
     if (!requirements.head_dims_supported) {
         return "KVarN requires key and value head dimensions to be 128-slice-compatible";
     }
-    if (requirements.kv_unified) {
-        return "KVarN requires non-unified KV streams";
-    }
-
     return nullptr;
 }
 

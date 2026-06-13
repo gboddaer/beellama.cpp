@@ -911,6 +911,17 @@ extern "C" {
     // Check if the memory supports shifting
     LLAMA_API bool llama_memory_can_shift(llama_memory_t mem);
 
+    // Returns the actual number of physical KV attention streams used by the memory object.
+    // A value of 1 means all sequences share one physical KV stream.
+    LLAMA_API uint32_t llama_memory_kv_n_stream(llama_memory_t mem);
+
+    // Convenience query for a context. Returns 0 if the context has no KV attention memory.
+    LLAMA_API uint32_t llama_context_kv_n_stream(const struct llama_context * ctx);
+
+    // Returns true when restoring a per-sequence state can overwrite physical KV data
+    // that may also contain cells for other sequences in the same stream.
+    LLAMA_API bool llama_memory_state_seq_restore_requires_exclusive_kv_stream(llama_memory_t mem);
+
     // Expand the recurrent state to new_n_seq_max cells (for deferred backup allocation).
     // Returns true on success. No-op if the memory is already large enough or has no recurrent component.
     LLAMA_API bool llama_memory_recurrent_expand(llama_memory_t mem, uint32_t new_n_seq_max);

@@ -7346,6 +7346,60 @@ struct test_kvarn_store_only : public test_case {
     }
 };
 
+struct test_kvarn_irregular_roundtrip : public test_case {
+    int bits;
+    int n_heads;
+    int n_kv;
+    std::vector<int64_t> indices;
+    std::string pattern;
+    bool value;
+
+    test_kvarn_irregular_roundtrip(
+            int bits,
+            int n_heads,
+            int n_kv,
+            std::vector<int64_t> indices,
+            const std::string & pattern,
+            bool value)
+        : bits(bits), n_heads(n_heads), n_kv(n_kv), indices(std::move(indices)), pattern(pattern), value(value) {}
+
+    std::string vars() override {
+        return VARS_TO_STR6(bits, n_heads, n_kv, pattern, value, indices.size());
+    }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        const int n_tokens = (int) indices.size();
+        const int groups_per_stream = std::max(4, (n_kv + 127) / 128);
+        ggml_tensor * current = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 128, n_heads, n_tokens);
+        ggml_tensor * idxs    = ggml_new_tensor_1d(ctx, GGML_TYPE_I64, n_tokens);
+        ggml_tensor * stage   = ggml_new_tensor_3d(ctx, GGML_TYPE_F16, 128, n_heads, 384);
+        ggml_tensor * records = ggml_new_tensor_3d(ctx, GGML_TYPE_I8, test_kvarn_record_bytes(bits), n_heads, groups_per_stream);
+
+        ggml_set_name(current, "current");
+        ggml_set_name(idxs, "indices");
+        ggml_set_name(stage, "stage");
+        ggml_set_name(records, "records");
+
+        ggml_tensor * stored = ggml_kvarn_store(ctx, current, idxs, stage, records, bits, 16, value);
+        stored->op_params[3] = n_tokens;
+        ggml_tensor * out = ggml_kvarn_materialize(ctx, records, stored, idxs, n_kv, 0, 1, bits, value);
+        ggml_set_name(out, "out");
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        const int n_tokens = (int) indices.size();
+        test_kvarn_init_current(ggml_get_tensor(ctx, "current"), n_tokens, 1, n_heads);
+        ggml_backend_tensor_set(ggml_get_tensor(ctx, "indices"), indices.data(), 0, indices.size() * sizeof(int64_t));
+        test_kvarn_zero_tensor(ggml_get_tensor(ctx, "stage"));
+        test_kvarn_zero_tensor(ggml_get_tensor(ctx, "records"));
+    }
+
+    double max_nmse_err() override {
+        return 5e-4;
+    }
+};
+
 struct test_kvarn_materialize_only : public test_case {
     int bits;
     int n_heads;
@@ -7939,6 +7993,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_kvarn_roundtrip(4, 1, 385, 64, 2, value));
         test_cases.emplace_back(new test_kvarn_roundtrip(4, 1, 385, 256, 1, value));
         test_cases.emplace_back(new test_kvarn_roundtrip(4, 1, 16, 504, 1, value));
+        test_cases.emplace_back(new test_kvarn_irregular_roundtrip(4, 1, 512, { 0, 3, 1, 4, 2, 5, 129, 128, 257, 256 }, "unified-interleaved", value));
         test_cases.emplace_back(new test_kvarn_store_only(4, 1, 512, 1, value));
     }
 

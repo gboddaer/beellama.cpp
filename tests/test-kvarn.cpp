@@ -114,8 +114,8 @@ static void test_runtime_validation() {
 
     requirements = supported;
     requirements.kv_unified = true;
-    require(llama_kvarn_validate_runtime(llama_kvarn_params_for_type(LLAMA_KVARN_K4V2_G128), requirements) != nullptr,
-            "unified single-sequence runtime accepted");
+    require(llama_kvarn_validate_runtime(llama_kvarn_params_for_type(LLAMA_KVARN_K4V2_G128), requirements) == nullptr,
+            "unified single-sequence runtime rejected");
 
     requirements = supported;
     requirements.n_seq_max = 2;
@@ -124,8 +124,8 @@ static void test_runtime_validation() {
             "non-unified multi-sequence runtime rejected");
 
     requirements.kv_unified = true;
-    require(llama_kvarn_validate_runtime(llama_kvarn_params_for_type(LLAMA_KVARN_K4V2_G128), requirements) != nullptr,
-            "unified multi-sequence runtime accepted");
+    require(llama_kvarn_validate_runtime(llama_kvarn_params_for_type(LLAMA_KVARN_K4V2_G128), requirements) == nullptr,
+            "unified multi-sequence runtime rejected");
 }
 
 static void test_remove_policy() {

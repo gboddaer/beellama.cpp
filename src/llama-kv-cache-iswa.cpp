@@ -304,6 +304,11 @@ bool llama_kv_cache_iswa::get_can_shift() const {
            kv_base->get_kv_size() == kv_swa->get_kv_size();
 }
 
+bool llama_kv_cache_iswa::state_seq_restore_requires_exclusive_kv_stream() const {
+    return kv_base->state_seq_restore_requires_exclusive_kv_stream() ||
+           kv_swa->state_seq_restore_requires_exclusive_kv_stream();
+}
+
 void llama_kv_cache_iswa::state_write(llama_io_write_i & io, llama_seq_id seq_id, llama_state_seq_flags flags) const {
     const bool include_base = (flags & LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY) == 0 ||
                               kv_base->requires_state_for_partial_restore();

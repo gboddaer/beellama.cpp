@@ -2685,7 +2685,13 @@ server_prompt * server_prompt_cache::alloc(const server_prompt & prompt, size_t 
     return &states.back();
 }
 
-bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tokens_new, llama_context * ctx_tgt, llama_context * ctx_dft, int32_t id_slot) {
+bool server_prompt_cache::load(
+        server_prompt & prompt,
+        const server_tokens & tokens_new,
+        llama_context * ctx_tgt,
+        llama_context * ctx_dft,
+        int32_t id_slot,
+        bool allow_state_restore) {
     const int lcp_best = prompt.tokens.get_common_prefix(tokens_new);
 
     float f_keep_best = prompt.tokens.size() > 0 ? float(lcp_best) / prompt.tokens.size() : -1.0f; // empty slot: any cache entry wins
@@ -2716,6 +2722,12 @@ bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tok
     }
 
     if (it_best != states.end()) {
+        if (!allow_state_restore) {
+            SRV_INF(" - found better prompt with f_keep = %.3f, sim = %.3f but skipped state restore because the KV stream is shared with another live slot\n",
+                    f_keep_best, sim_best);
+            return true;
+        }
+
         SRV_INF(" - found better prompt with f_keep = %.3f, sim = %.3f\n", f_keep_best, sim_best);
 
         const int64_t t_load_start = ggml_time_us();

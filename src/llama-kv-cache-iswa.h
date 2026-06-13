@@ -73,6 +73,7 @@ public:
     // state write/load
 
     bool requires_state_for_partial_restore() const override;
+    bool state_seq_restore_requires_exclusive_kv_stream() const override;
     void state_write(llama_io_write_i & io, llama_seq_id seq_id = -1, llama_state_seq_flags flags = 0) const override;
     void state_read (llama_io_read_i  & io, llama_seq_id seq_id = -1, llama_state_seq_flags flags = 0) override;
 

@@ -173,6 +173,10 @@ struct llama_memory_i {
     // even when LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY is requested.
     virtual bool requires_state_for_partial_restore() const { return false; }
 
+    // Some structured shared-stream memories cannot restore a per-sequence state
+    // without rewriting physical stream data that may also belong to other sequences.
+    virtual bool state_seq_restore_requires_exclusive_kv_stream() const { return false; }
+
     virtual void state_write(llama_io_write_i & io, llama_seq_id seq_id = -1, llama_state_seq_flags flags = 0) const = 0;
     virtual void state_read (llama_io_read_i  & io, llama_seq_id seq_id = -1, llama_state_seq_flags flags = 0) = 0;
 

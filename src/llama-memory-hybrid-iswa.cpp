@@ -226,6 +226,11 @@ bool llama_memory_hybrid_iswa::requires_state_for_partial_restore() const {
            mem_recr->requires_state_for_partial_restore();
 }
 
+bool llama_memory_hybrid_iswa::state_seq_restore_requires_exclusive_kv_stream() const {
+    return mem_attn->state_seq_restore_requires_exclusive_kv_stream() ||
+           mem_recr->state_seq_restore_requires_exclusive_kv_stream();
+}
+
 void llama_memory_hybrid_iswa::state_write(llama_io_write_i & io, llama_seq_id seq_id, llama_state_seq_flags flags) const {
     mem_attn->state_write(io, seq_id, flags);
     mem_recr->state_write(io, seq_id, flags);

@@ -1458,7 +1458,7 @@ int main(int argc, char ** argv) {
         "server speculative backup cleanup must track the actual backup seq_id");
     ok &= expect(server_context.find("if (has_draft_backup && seq_id_backup >= 0)") != std::string::npos,
         "server slot release must clean up leaked speculative backup sequences");
-    ok &= expect(server_context.find("params_base.kv_unified && task.n_tokens() > 0") != std::string::npos &&
+    ok &= expect(server_context.find("uses_shared_kv_pool() && task.n_tokens() > 0") != std::string::npos &&
                  server_context.find("cells_committed += std::max((int64_t) s.prompt.n_tokens(), (int64_t) s.task->n_tokens())") != std::string::npos &&
                  server_context.find("cells_available < (int64_t) task.n_tokens()") != std::string::npos,
         "unified KV scheduling must account for active slot cell commitments before launch");
@@ -2322,9 +2322,9 @@ int main(int argc, char ** argv) {
         "ordinary non-DFlash draft models must create and wire a draft context for upstream draft-simple speculation");
     ok &= expect(speculative.find("llama_memory_seq_rm(llama_get_memory(ctx_dft), seq_id, pos_min_by_seq[seq_id], -1);") != std::string::npos,
         "ordinary draft-simple process must roll draft KV back before replaying overlapping verifier batches");
-    ok &= expect(server_cpp.find("params.kvarn.type != LLAMA_KVARN_TYPE_DISABLED") != std::string::npos &&
-                 server_cpp.find("n_parallel is set to auto with KVarN; KVarN requires non-unified KV") != std::string::npos,
-        "server auto n_parallel must use non-unified streams for multi-sequence KVarN");
+    ok &= expect(server_cpp.find("n_parallel is set to auto, using n_parallel = 4 and kv_unified = true") != std::string::npos &&
+                 server_cpp.find("KVarN requires non-unified KV") == std::string::npos,
+        "server auto n_parallel must allow unified KV for KVarN");
     ok &= expect(server_context.find("server_probe_model_arch") != std::string::npos &&
                  server_context.find("gguf_find_key(ctx_gguf, \"general.architecture\")") != std::string::npos &&
                  server_context.find("params_base.speculative.type() != COMMON_SPECULATIVE_TYPE_DFLASH") != std::string::npos &&
@@ -2336,9 +2336,9 @@ int main(int argc, char ** argv) {
         "DFlash recurrent rollback allocation must be gated by probed recurrent/hybrid target architecture");
     ok &= expect(server_context.find("DFlash target requires recurrent rollback, but neither recurrent snapshots nor backup cells are available") != std::string::npos,
         "DFlash startup must fail closed if a recurrent/hybrid target has no rollback mechanism");
-    ok &= expect(server_context.find("params_base.kvarn.type == LLAMA_KVARN_TYPE_DISABLED") != std::string::npos &&
-                 server_context.find("KVarN requires non-unified KV; DDTree backup streams will share the configured total KV context") != std::string::npos,
-        "DFlash DDTree backup auto-unification must not override KVarN non-unified streams");
+    ok &= expect(server_context.find("auto-enabled kv-unified: DDTree backup uses internal attention streams") != std::string::npos &&
+                 server_context.find("KVarN requires non-unified KV") == std::string::npos,
+        "DFlash DDTree backup auto-unification must allow unified KV for KVarN");
     ok &= expect(server_context.find("server_context_n_ctx_for_internal_seqs(") == std::string::npos &&
                  server_context.find("expanded target n_ctx from %d to %d") == std::string::npos &&
                  server_context.find("recurrent_backup_attention_streams") != std::string::npos &&
@@ -2385,6 +2385,23 @@ int main(int argc, char ** argv) {
                  memory_hybrid.find("mem_attn->requires_state_for_partial_restore()") != std::string::npos &&
                  kv_cache_iswa_cpp.find("kv_base->requires_state_for_partial_restore()") != std::string::npos,
         "KVarN attention memory must be included in partial sequence state restores");
+    ok &= expect(llama_h.find("llama_context_kv_n_stream") != std::string::npos &&
+                 llama_h.find("llama_memory_state_seq_restore_requires_exclusive_kv_stream") != std::string::npos &&
+                 context_cpp.find("return mem ? mem->get_kv_n_stream() : 0;") != std::string::npos &&
+                 memory_h.find("virtual bool state_seq_restore_requires_exclusive_kv_stream() const") != std::string::npos &&
+                 kv_cache_kvarn_cpp.find("bool llama_kv_cache_kvarn::state_seq_restore_requires_exclusive_kv_stream() const") != std::string::npos &&
+                 kv_cache_kvarn_cpp.find("return get_kv_n_stream() == 1;") != std::string::npos &&
+                 memory_hybrid.find("mem_attn->state_seq_restore_requires_exclusive_kv_stream()") != std::string::npos &&
+                 kv_cache_iswa_cpp.find("kv_base->state_seq_restore_requires_exclusive_kv_stream()") != std::string::npos,
+        "KVarN unified state restore must be exposed as a memory capability and forwarded through composite memories");
+    ok &= expect(server_context.find("bool uses_shared_kv_pool() const") != std::string::npos &&
+                 server_context.find("return llama_context_kv_n_stream(ctx_tgt) == 1;") != std::string::npos &&
+                 server_context.find("bool prompt_cache_state_restore_allowed(const server_slot & slot) const") != std::string::npos &&
+                 server_context.find("llama_memory_state_seq_restore_requires_exclusive_kv_stream(llama_get_memory(ctx_tgt))") != std::string::npos &&
+                 server_context.find("other.prompt.n_tokens() > 0") != std::string::npos &&
+                 server_task.find("allow_state_restore") != std::string::npos &&
+                 server_task.find("skipped state restore because the KV stream is shared with another live slot") != std::string::npos,
+        "server prompt-cache restore must be gated by the actual memory restore capability");
     ok &= expect(memory_recurrent_cpp.find("bool llama_memory_recurrent::can_seq_rm") != std::string::npos &&
                  memory_recurrent_cpp.find("rollback <= (llama_pos) n_rs_seq") != std::string::npos,
         "recurrent memory must expose the same bounded rollback capability used by seq_rm");

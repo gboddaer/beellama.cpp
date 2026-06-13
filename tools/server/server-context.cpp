@@ -914,8 +914,8 @@ struct server_slot : server_adaptive_dm_state {
         return true;
     }
 
-    bool prompt_load(server_prompt_cache & prompt_cache, const server_tokens & tokens) {
-        bool res = prompt_cache.load(prompt, tokens, ctx_tgt, ctx_dft, id);
+    bool prompt_load(server_prompt_cache & prompt_cache, const server_tokens & tokens, bool allow_state_restore) {
+        bool res = prompt_cache.load(prompt, tokens, ctx_tgt, ctx_dft, id, allow_state_restore);
         if (!res) {
             SLT_WRN(*this, "%s", "failed to load prompt from cache\n");
         }
@@ -2265,6 +2265,28 @@ private:
         GGML_ABORT("failed to expand recurrent state after prompt cache restore; continuing would make scheduler reservation inconsistent\n");
     }
 
+    bool uses_shared_kv_pool() const {
+        return llama_context_kv_n_stream(ctx_tgt) == 1;
+    }
+
+    bool prompt_cache_state_restore_allowed(const server_slot & slot) const {
+        if (!llama_memory_state_seq_restore_requires_exclusive_kv_stream(llama_get_memory(ctx_tgt))) {
+            return true;
+        }
+
+        for (const auto & other : slots) {
+            if (other.id == slot.id) {
+                continue;
+            }
+
+            if (other.prompt.n_tokens() > 0) {
+                return false;
+            }
+        }
+
+        return true;
+    }
+
     bool prompt_cache_boundary_checkpoints_enabled(const server_slot & slot) const {
         if (params_base.n_ctx_checkpoints > 0 || !prompt_cache) {
             return false;
@@ -2516,12 +2538,9 @@ private:
             if (recurrent_backup_attention_streams) {
                 params_base.n_parallel = n_seq_max_full;
 
-                if (!params_base.kv_unified && n_parallel_user == 1 &&
-                        params_base.kvarn.type == LLAMA_KVARN_TYPE_DISABLED) {
+                if (!params_base.kv_unified && n_parallel_user == 1) {
                     params_base.kv_unified = true;
                     SRV_INF("%s", "auto-enabled kv-unified: DDTree backup uses internal attention streams\n");
-                } else if (!params_base.kv_unified && n_parallel_user == 1) {
-                    SRV_WRN("%s", "KVarN requires non-unified KV; DDTree backup streams will share the configured total KV context\n");
                 }
             }
         }
@@ -3097,7 +3116,7 @@ private:
                 SRV_WRN("%s", "--cache-idle-slots requires --cache-ram, disabling\n");
                 params_base.cache_idle_slots = false;
             } else {
-                if (params_base.kv_unified) {
+                if (uses_shared_kv_pool()) {
                     SRV_INF("%s", "idle slots will be saved to prompt cache and cleared upon starting a new task\n");
                 } else {
                     // without a unified KV cache, clearing a slot frees no reusable room, so we only
@@ -3318,7 +3337,7 @@ private:
 
                 ret->prompt_save(*prompt_cache);
 
-                if (!ret->prompt_load(*prompt_cache, task.tokens)) {
+                if (!ret->prompt_load(*prompt_cache, task.tokens, prompt_cache_state_restore_allowed(*ret))) {
                     ret->prompt_clear(false);
                 }
 
@@ -3340,7 +3359,7 @@ private:
     bool try_clear_idle_slots() {
         bool res = false;
 
-        if (!params_base.kv_unified) {
+        if (!uses_shared_kv_pool()) {
             return res;
         }
 
@@ -4241,7 +4260,7 @@ private:
                     } else {
                         // Unified KV: check if launching this task would overflow the shared cell pool.
                         // Use max(current, planned) since a just-launched slot hasn't filled yet.
-                        if (params_base.kv_unified && task.n_tokens() > 0 && task.n_tokens() < slot->n_ctx) {
+                        if (uses_shared_kv_pool() && task.n_tokens() > 0 && task.n_tokens() < slot->n_ctx) {
                             int64_t cells_committed = 0;
                             for (const auto & s : slots) {
                                 if (s.is_processing() && s.task) {
@@ -4273,7 +4292,7 @@ private:
                                     prompt_cache->update();
                                 }
 
-                                if (params_base.kv_unified) {
+                                if (uses_shared_kv_pool()) {
                                     // [TAG_IDLE_SLOT_CLEAR]
                                     slot.prompt_clear(false);
                                 }

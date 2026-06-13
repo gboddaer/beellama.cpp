@@ -104,15 +104,9 @@ int llama_server(int argc, char ** argv) {
     }
 
     if (params.n_parallel < 0) {
-        if (params.kvarn.type != LLAMA_KVARN_TYPE_DISABLED) {
-            SRV_WRN("%s", "n_parallel is set to auto with KVarN; KVarN requires non-unified KV, using n_parallel = 4 and kv_unified = false\n");
-            params.n_parallel = 4;
-            params.kv_unified = false;
-        } else {
-            SRV_INF("%s", "n_parallel is set to auto, using n_parallel = 4 and kv_unified = true\n");
-            params.n_parallel = 4;
-            params.kv_unified = true;
-        }
+        SRV_INF("%s", "n_parallel is set to auto, using n_parallel = 4 and kv_unified = true\n");
+        params.n_parallel = 4;
+        params.kv_unified = true;
     }
 
     // for consistency between server router mode and single-model mode, we set the same model name as alias
