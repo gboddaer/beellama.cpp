@@ -10,7 +10,8 @@ BeeLlama.cpp is Anbeeld's fork of llama.cpp. Fork-specific work is concentrated 
 - **Adaptive draft-max**: server controllers that adjust the active DFlash draft horizon. The default controller is `profit`; `fringe` is also available.
 - **DDTree**: tree speculative verification with GPU `parent_ids` and recurrent tree kernels.
 - **CopySpec**: model-free speculation through rolling-hash suffix matching.
-- **TurboQuant / TCQ KV cache types**: `turbo2`, `turbo3`, `turbo4`, `turbo2_tcq`, and `turbo3_tcq`.
+- **TurboQuant / TCQ KV cache types**: `turbo2`, `turbo3`, `turbo4`, `turbo2_tcq`, `turbo3_tcq`, and `turbo4_tcq`, plus newly added low-bit standard quantized KV types `q2_0`/`q2_1`/`q3_0`/`q3_1`/`q6_1`.
+- **KVarN KV-cache compression** (experimental): structured KV compression via `--cache-type-k`/`--cache-type-v` pseudo names `kvarn2`…`kvarn8` (all nine 2/3/4/5/6/8 K/V bit combinations); target-context only, wired for Qwen3.6 and Gemma 4, with non-KVarN layers falling back to bit-width-matched standard cache types.
 - **Reasoning loop guard**: server-side detection and intervention for repeated hidden reasoning output.
 
 Treat the local codebase as the source of truth for implementation behavior.
@@ -65,6 +66,11 @@ Key binaries: `build/bin/llama-server`, `build/bin/llama-cli`, `build/bin/llama-
 - `tools/server/server-loop-guard.cpp` / `.h` - reasoning loop guard.
 - `ggml/src/ggml-turbo-quant.c` - CPU reference quantize/dequantize for turbo2/3/4 and TCQ types.
 - `ggml/src/ggml-cuda/turbo-quant-cuda.cuh` - CUDA set-rows/dequantize kernels for all TurboQuant types.
+- `src/llama-kvarn.cpp` / `.h` - KVarN type descriptors, tile layout, bit-width presets, and runtime validation.
+- `src/llama-kv-cache-kvarn.cpp` / `.h` - target-context KVarN KV cache and group-range state serialization.
+- `ggml/src/ggml-cuda/kvarn.cu` / `.cuh` - CUDA KVarN store/materialize ops.
+- `ggml/src/ggml-cuda/fattn-kvarn.cuh` - KVarN FlashAttention kernels.
+- `ggml/src/ggml-vulkan/vulkan-shaders/kvarn_store.comp` / `kvarn_materialize.comp` - Vulkan KVarN store/materialize shaders.
 - `ggml/src/ggml-cuda/cross-ring-interleave.cu` - GPU cross-ring management and interleave kernel.
 - `ggml/src/ggml-cuda/gated_delta_net.cu` - DeltaNet CUDA kernels.
 - `ggml/src/ggml-cuda/ssm-conv.cu` - SSM convolution CUDA kernels.
