@@ -99,9 +99,9 @@ list(APPEND GGML_SOURCES_ROCM ${SRCS})
             q6_0
             q5_1
             q5_0
+            q4_1
             turbo4_tcq
             turbo4_0
-            q4_1
             q4_0
             q3_1
             turbo3_tcq
@@ -112,6 +112,38 @@ list(APPEND GGML_SOURCES_ROCM ${SRCS})
             turbo2_0
             q2_0
         )
+
+        function(ggml_cuda_fa_kv_rank_rocm OUT TYPE)
+            if (TYPE STREQUAL "f16")
+                set(${OUT} 0 PARENT_SCOPE)
+            elseif (TYPE STREQUAL "bf16")
+                set(${OUT} 1 PARENT_SCOPE)
+            elseif (TYPE STREQUAL "q8_0")
+                set(${OUT} 2 PARENT_SCOPE)
+            elseif (TYPE STREQUAL "q6_1")
+                set(${OUT} 3 PARENT_SCOPE)
+            elseif (TYPE STREQUAL "q6_0")
+                set(${OUT} 4 PARENT_SCOPE)
+            elseif (TYPE STREQUAL "q5_1")
+                set(${OUT} 5 PARENT_SCOPE)
+            elseif (TYPE STREQUAL "q5_0")
+                set(${OUT} 6 PARENT_SCOPE)
+            elseif (TYPE STREQUAL "q4_1" OR TYPE STREQUAL "turbo4_tcq" OR TYPE STREQUAL "turbo4_0")
+                set(${OUT} 7 PARENT_SCOPE)
+            elseif (TYPE STREQUAL "q4_0")
+                set(${OUT} 8 PARENT_SCOPE)
+            elseif (TYPE STREQUAL "q3_1" OR TYPE STREQUAL "turbo3_tcq" OR TYPE STREQUAL "turbo3_0")
+                set(${OUT} 9 PARENT_SCOPE)
+            elseif (TYPE STREQUAL "q3_0")
+                set(${OUT} 10 PARENT_SCOPE)
+            elseif (TYPE STREQUAL "q2_1" OR TYPE STREQUAL "turbo2_tcq" OR TYPE STREQUAL "turbo2_0")
+                set(${OUT} 11 PARENT_SCOPE)
+            elseif (TYPE STREQUAL "q2_0")
+                set(${OUT} 12 PARENT_SCOPE)
+            else()
+                message(FATAL_ERROR "Unknown HIP/ROCm FA K/V rank type: ${TYPE}")
+            endif()
+        endfunction()
 
         list(LENGTH GGML_CUDA_FA_KV_TYPES_ORDERED GGML_CUDA_FA_KV_TYPES_LEN)
         math(EXPR GGML_CUDA_FA_KV_TYPES_LAST "${GGML_CUDA_FA_KV_TYPES_LEN} - 1")
@@ -124,15 +156,18 @@ list(APPEND GGML_SOURCES_ROCM ${SRCS})
             foreach(VI RANGE 0 ${GGML_CUDA_FA_KV_TYPES_LAST})
                 list(GET GGML_CUDA_FA_KV_TYPES_ORDERED ${VI} V_TYPE)
 
-                if (KI LESS_EQUAL VI OR K_TYPE STREQUAL "f16" OR V_TYPE STREQUAL "f16")
+                ggml_cuda_fa_kv_rank_rocm(K_RANK "${K_TYPE}")
+                ggml_cuda_fa_kv_rank_rocm(V_RANK "${V_TYPE}")
+
+                if (K_RANK LESS_EQUAL V_RANK OR K_TYPE STREQUAL "f16" OR V_TYPE STREQUAL "f16")
                     ggml_add_fattn_vec_pair_rocm(GGML_SOURCES_ROCM "${FA_VEC_PREFIX}" "${K_TYPE}" "${V_TYPE}")
                     math(EXPR GGML_CUDA_FA_HALF_PAIR_COUNT "${GGML_CUDA_FA_HALF_PAIR_COUNT} + 1")
                 endif()
             endforeach()
         endforeach()
 
-        if (NOT GGML_CUDA_FA_HALF_PAIR_COUNT EQUAL 208)
-            message(FATAL_ERROR "GGML_CUDA_FA_HALF_QUANTS expected 208 FA vec pairs, got ${GGML_CUDA_FA_HALF_PAIR_COUNT}")
+        if (NOT GGML_CUDA_FA_HALF_PAIR_COUNT EQUAL 217)
+            message(FATAL_ERROR "GGML_CUDA_FA_HALF_QUANTS expected 217 FA vec pairs, got ${GGML_CUDA_FA_HALF_PAIR_COUNT}")
         endif()
 
         add_compile_definitions(GGML_CUDA_FA_HALF_QUANTS)
