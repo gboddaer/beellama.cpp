@@ -422,10 +422,13 @@ int main() {
         state.apply_profit_recommendation(recommended);
     }
     state.observe_profit_timing(0, 0, 0, 0.0f, 30.0f, 0.0f, 30.0f);
-    assert(state.decide_profit_n_max(8) == 4);
+    // With a baseline available the cold controller bootstraps at the maximum
+    // draft depth rather than walking up from a shallow probe.
+    assert(state.decide_profit_n_max(8) == 8);
 
-    // test cold start: fresh profit controllers seed no-spec baseline before
-    // any positive-depth DFlash cycle, then probe shallow depth first.
+    // test cold start: fresh profit controllers seed the no-spec baseline before
+    // any positive-depth DFlash cycle, then bootstrap production at the maximum
+    // draft depth (the lower spread is characterized via transient excursions).
     state.reset_profit_state();
     state.dm_profit_min_samples = 2;
     state.dm_off_dwell = 1;
@@ -435,7 +438,7 @@ int main() {
     assert(state.decide_profit_n_max(8) == 0);
     state.observe_profit_timing(0, 0, 0, 0.0f, 32.0f, 0.0f, 32.0f);
     assert(state.profit_baseline_ready());
-    assert(state.decide_profit_n_max(8) == 2);
+    assert(state.decide_profit_n_max(8) == 8);
 
     // Baseline scoring uses the same current EWMA policy as positive depths;
     // stale best no-spec spikes must not make baseline unbeatable.
@@ -447,17 +450,79 @@ int main() {
     assert(state.profit_baseline.best_score >= 39.9f);
     assert_close(state.profit_score_for_depth(0), 16.0f);
 
-    // test explicit warmup requires extra measured samples for the initial
-    // positive-depth probe before moving to the next depth.
+    // test explicit warmup requires extra measured samples per spread depth before
+    // the initial probe set is treated as characterized; production holds at the
+    // maximum draft depth throughout, and only argmax (post-characterization) moves.
     state.reset_profit_state();
     state.dm_profit_min_samples = 1;
     state.dm_profit_warmup = 2;
     state.observe_profit_timing(0, 0, 0, 0.0f, 30.0f, 0.0f, 30.0f);
-    assert(state.decide_profit_n_max(8) == 2);
+    assert(state.profit_baseline_ready());
+    assert(state.decide_profit_n_max(8) == 8);
+    // one sample per spread depth is not enough under warmup=2
     observe_profit_cycle(state, 2, 2, 1, 60.0f);
-    assert(state.decide_profit_n_max(8) == 2);
+    observe_profit_cycle(state, 4, 4, 1, 60.0f);
+    observe_profit_cycle(state, 8, 8, 1, 60.0f);
+    assert(!state.profit_initial_probe_set_ready(8));
+    assert(state.decide_profit_n_max(8) == 8);
+    // a second sample per spread depth completes characterization
     observe_profit_cycle(state, 2, 2, 1, 60.0f);
-    assert(state.decide_profit_n_max(8) == 4);
+    observe_profit_cycle(state, 4, 4, 1, 60.0f);
+    observe_profit_cycle(state, 8, 8, 1, 60.0f);
+    assert(state.profit_initial_probe_set_ready(8));
+    state.dm_profit_warmup = 0;
+
+    // End-to-end convergence: a cold profit controller bootstraps at the maximum
+    // draft depth and must then settle on the genuinely fastest depth, regardless
+    // of whether the optimum is high, mid, or low. This is the property the earlier
+    // "start high, walk down, rest at the walk terminal" regression violated: it
+    // collapsed to the floor and could not climb back. Throughput here is modeled
+    // unimodally (peak at `optimum`): score(d) = (1 + min(d, optimum)) / (20 + 2d),
+    // with a no-spec baseline every positive depth beats.
+    auto converged_depth = [](int base_n_max, int optimum) -> int {
+        server_adaptive_dm_state s;
+        s.dm_profit_min_samples = 2;
+        s.dm_profit_baseline_interval = 0; // disable reprobe noise for a deterministic check
+        auto feed = [&](int d) {
+            if (d <= 0) {
+                s.observe_profit_timing(0, 0, 0, 0.0f, 35.0f, 0.0f, 35.0f);
+                return;
+            }
+            const int acc = d < optimum ? d : optimum;
+            const float ms = 20.0f + 2.0f * (float) d;
+            s.observe_profit_acceptance(d, acc);
+            s.observe_profit_timing(d, d, acc, 0.0f, ms, 0.0f, ms);
+        };
+        feed(0);
+        feed(0);
+        assert(s.profit_baseline_ready());
+        int rec = s.decide_profit_n_max(base_n_max);
+        assert(rec == base_n_max); // cold start bootstraps at max, not a low probe
+        s.apply_profit_recommendation(rec);
+        // Each iteration samples production plus the full depth range, standing in
+        // for transient characterization/exploration excursions accumulating over
+        // time. The controller must converge to (and hold) the throughput optimum.
+        for (int iter = 0; iter < 200; ++iter) {
+            feed(s.adaptive_n_max > 0 ? s.adaptive_n_max : base_n_max);
+            for (int d = 1; d <= base_n_max; ++d) {
+                feed(d);
+            }
+            feed(0);
+            rec = s.decide_profit_n_max(base_n_max);
+            s.apply_profit_recommendation(rec);
+        }
+        return s.adaptive_n_max;
+    };
+    {
+        const int high = converged_depth(15, 15);
+        assert(high >= 12); // high optimum: stay high (the regressed case wanted this)
+        const int mid8 = converged_depth(15, 8);
+        assert(mid8 >= 6 && mid8 <= 10); // mid optimum identified, not stuck high or low
+        const int mid12 = converged_depth(15, 12);
+        assert(mid12 >= 10 && mid12 <= 14); // mid-high optimum identified
+        const int low = converged_depth(15, 4);
+        assert(low >= 2 && low <= 6); // low optimum identified, not stuck high
+    }
 
     // test reset_request_state preserves learned profit data while resetting
     // request-local counters

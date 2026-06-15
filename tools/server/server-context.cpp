@@ -1264,12 +1264,20 @@ struct server_slot : server_adaptive_dm_state {
                 if (advance_adaptive_probe) {
                     explore_counter++;
                     if (explore_counter % dm_explore_interval == 0) {
-                        const int explore_n_max = profit_next_unready_explore_depth(
-                                adaptive_n_max,
-                                base_n_max,
-                                explore_counter / dm_explore_interval);
-                        if (explore_n_max > 0) {
-                            n_draft_max = explore_n_max;
+                        // While the cold-start probe spread is still uncharacterized,
+                        // sample it through transient excursions so the profit argmax
+                        // can compare low/mid/high depths; production stays at the held
+                        // max between excursions. Afterwards, use steady local explore.
+                        const int excursion_n_max =
+                            (profit_baseline_ready() &&
+                                    !profit_initial_probe_set_ready(base_n_max))
+                                ? profit_next_unready_probe_depth(base_n_max)
+                                : profit_next_unready_explore_depth(
+                                        adaptive_n_max,
+                                        base_n_max,
+                                        explore_counter / dm_explore_interval);
+                        if (excursion_n_max > 0) {
+                            n_draft_max = excursion_n_max;
                         }
                     }
                 }

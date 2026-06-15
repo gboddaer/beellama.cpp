@@ -1298,29 +1298,30 @@ struct server_adaptive_dm_state {
                 ? base_n_max
                 : std::clamp<int>(adaptive_n_max, 0, base_n_max));
         const bool returning_from_baseline_probe = profit_baseline_probe_resume_n > 0;
-        const int unready_probe = profit_next_unready_probe_depth(base_n_max);
         const bool collecting_initial_probe_set =
             profit_baseline_probe_resume_n <= 0 &&
             !profit_request_requires_fresh_switch_sample &&
             !profit_initial_probe_set_ready(base_n_max);
-        const bool current_episode_ready_for_probe =
-            current_n > 0 &&
-            profit_active_episode_ready(current_n, base_n_max);
-        const float current_episode_score_for_probe =
-            current_episode_ready_for_probe ? profit_active_episode_score(current_n) : 0.0f;
-        const bool current_episode_clearly_bad =
-            current_episode_ready_for_probe &&
-            current_episode_score_for_probe < baseline_score * (1.0f + dm_profit_min);
-        const bool unready_probe_can_reduce_current =
-            current_n > 0 &&
-            unready_probe > 0 &&
-            unready_probe < current_n;
-        if (collecting_initial_probe_set &&
-                unready_probe > 0 &&
-                (!current_episode_clearly_bad || unready_probe_can_reduce_current)) {
-            profit_current_score = baseline_score;
-            profit_last_recommended_n = unready_probe;
-            return unready_probe;
+        // Cold-start bootstrap: once the no-spec baseline exists, run production at
+        // the maximum draft depth and let the scheduler characterize the lower probe
+        // spread through transient exploration excursions (see get_dflash_n_draft_max).
+        // Holding max keeps short requests fast instead of stranding them at a low
+        // probe depth, and the argmax candidate scorer below demotes only when a
+        // measured lower depth is genuinely faster. If the held positive depth is
+        // measured to be clearly worse than no-spec, fall through so a better
+        // characterized depth (or baseline) can take over without waiting for the
+        // full spread.
+        if (collecting_initial_probe_set) {
+            const int hold_n = current_n > 0 ? current_n : base_n_max;
+            const bool hold_episode_clearly_bad =
+                current_n > 0 &&
+                profit_active_episode_ready(current_n, base_n_max) &&
+                profit_active_episode_score(current_n) < baseline_score * (1.0f + dm_profit_min);
+            if (!hold_episode_clearly_bad) {
+                profit_current_score = baseline_score;
+                profit_last_recommended_n = hold_n;
+                return hold_n;
+            }
         }
 
         if (current_n == 0 && profit_baseline_probe_resume_n <= 0) {
