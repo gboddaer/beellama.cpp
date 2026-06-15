@@ -730,8 +730,9 @@ int main(int argc, char ** argv) {
             "CUDA backend must expose FA build policy and pair-compiled diagnostics through proc_address");
         ok &= expect(cparams_h.find("flash_attn_required") != std::string::npos &&
                      context_cpp.find("llama_cuda_fa_missing_pair_message") != std::string::npos &&
-                     context_cpp.find("is not compiled in this default build") != std::string::npos &&
-                     context_cpp.find("is not compiled in this HALF build") != std::string::npos &&
+                     context_cpp.find("Default builds compile standard q/KVarN-fallback pairs only (no TurboQuant/TCQ)") != std::string::npos &&
+                     context_cpp.find("HALF builds compile same-or-higher ranked K than V, with TurboQuant/TCQ is treated as pseudo-equal to qX_1") != std::string::npos &&
+                     context_cpp.find("GGML_CUDA_FA_IGNORE_UNCOMPILED_PAIRS") != std::string::npos &&
                      context_cpp.find("failed to reserve graph for required Flash Attention check") != std::string::npos &&
                      context_cpp.find("This is not a quant-pair build-policy miss") != std::string::npos &&
                      context_cpp.find("Flash Attention was auto, set to disabled") != std::string::npos,

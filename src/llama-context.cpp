@@ -131,6 +131,14 @@ static std::string llama_cuda_fa_pair_label(ggml_type type_k, ggml_type type_v) 
     return msg;
 }
 
+static bool llama_cuda_fa_ignore_uncompiled_pairs() {
+    static const bool enabled = [] {
+        const char * env = std::getenv("GGML_CUDA_FA_IGNORE_UNCOMPILED_PAIRS");
+        return env && std::atoi(env) != 0;
+    }();
+    return enabled;
+}
+
 static std::string llama_cuda_fa_missing_pair_message(
         const char * build_policy,
         ggml_type type_k,
@@ -139,18 +147,16 @@ static std::string llama_cuda_fa_missing_pair_message(
     const std::string policy = build_policy ? build_policy : "";
 
     if (policy == "default") {
-        return "CUDA FlashAttention cache pair " + pair + " is not compiled in this default build. "
-            "Default builds compile standard q/KVarN-fallback pairs only: K must be the same or higher precision than V, "
-            "and V may be no more than two tier groups below K. Tier groups are fp, high q, q5, q4, q3, and q2; "
-            "within a bit width, _1 ranks above _0. TurboQuant/TCQ and mixed f16/bf16 pairs are not compiled by default. "
-            "Use a default compiled pair, rebuild with GGML_CUDA_FA_HALF_QUANTS=ON for TurboQuant/TCQ or wider K>=V experiments, "
+        return "CUDA FlashAttention cache pair " + pair + " is not compiled in this build. "
+            "Default builds compile standard q/KVarN-fallback pairs only (no TurboQuant/TCQ), "
+            "K must be the same or higher precision than V, and V may be no more than two tier groups below K. "
+            "Use a default compiled pair, rebuild with GGML_CUDA_FA_HALF_QUANTS=ON for TurboQuant/TCQ or wider K>=V, "
             "or use GGML_CUDA_FA_ALL_QUANTS=ON for the full matrix.";
     }
 
     if (policy == "half") {
-        return "CUDA FlashAttention cache pair " + pair + " is not compiled in this HALF build. "
-            "HALF builds compile same-or-higher ranked K than V plus required f16 pairs. TurboQuant/TCQ is treated as "
-            "pseudo-equal to qX_1, so qX_1<->turboX pairs are compiled, but qX_0->turboX is excluded as K<V. "
+        return "CUDA FlashAttention cache pair " + pair + " is not compiled in this build. "
+            "HALF builds compile same-or-higher ranked K than V, with TurboQuant/TCQ is treated as pseudo-equal to qX_1. "
             "Use a HALF compiled pair or rebuild with GGML_CUDA_FA_ALL_QUANTS=ON for the full matrix.";
     }
 
@@ -215,7 +221,44 @@ static llama_cuda_fa_device_mismatch llama_cuda_fa_find_device_mismatch(
     return mismatch;
 }
 
-static void llama_cuda_fa_report_or_throw(
+static llama_cuda_fa_device_mismatch llama_cuda_fa_find_uncompiled_pair(
+        ggml_cgraph * gf,
+        const llama_model & model) {
+    llama_cuda_fa_device_mismatch mismatch;
+    if (!gf) {
+        return mismatch;
+    }
+
+    const size_t prefix_len = strlen(LLAMA_TENSOR_NAME_FATTN) + 1;
+    for (int i = 0; i < ggml_graph_n_nodes(gf); i++) {
+        ggml_tensor * n = ggml_graph_node(gf, i);
+        if (n->op != GGML_OP_FLASH_ATTN_EXT) {
+            continue;
+        }
+
+        GGML_ASSERT(strncmp(n->name, LLAMA_TENSOR_NAME_FATTN "-", prefix_len) == 0);
+        const int il = std::stoi(n->name + prefix_len);
+        ggml_backend_dev_t device_kv = model.dev_layer(il);
+        ggml_type type_k = n->src[1] ? n->src[1]->type : GGML_TYPE_F16;
+        ggml_type type_v = n->src[2] ? n->src[2]->type : GGML_TYPE_F16;
+        const llama_cuda_fa_pair_diag diag = llama_cuda_fa_pair_diag_for(device_kv, type_k, type_v);
+        if (!diag.available || diag.pair_compiled) {
+            continue;
+        }
+
+        mismatch.found = true;
+        mismatch.layer = il;
+        mismatch.device_kv = device_kv;
+        mismatch.device_fa = device_kv;
+        mismatch.type_k = type_k;
+        mismatch.type_v = type_v;
+        return mismatch;
+    }
+
+    return mismatch;
+}
+
+static bool llama_cuda_fa_report_or_throw(
         const char * func,
         const llama_cuda_fa_device_mismatch & mismatch,
         bool required) {
@@ -226,6 +269,13 @@ static void llama_cuda_fa_report_or_throw(
         ? llama_cuda_fa_missing_pair_message(diag.build_policy, mismatch.type_k, mismatch.type_v)
         : llama_cuda_fa_generic_mismatch_message(mismatch);
 
+    if (diag.available && !diag.pair_compiled && llama_cuda_fa_ignore_uncompiled_pairs()) {
+        LLAMA_LOG_WARN(
+            "%s: WARNING: GGML_CUDA_FA_IGNORE_UNCOMPILED_PAIRS=1: %s Continuing despite the missing compiled CUDA FA pair.\n",
+            func, msg.c_str());
+        return true;
+    }
+
     if (required) {
         LLAMA_LOG_ERROR("%s: %s\n", func, msg.c_str());
         throw std::runtime_error(msg);
@@ -233,6 +283,7 @@ static void llama_cuda_fa_report_or_throw(
 
     LLAMA_LOG_WARN("%s: %s\n", func, msg.c_str());
     LLAMA_LOG_WARN("%s: Flash Attention was auto, set to disabled\n", func);
+    return false;
 }
 
 static bool dflash_is_cuda_compatible_tensor(const ggml_tensor * t) {
@@ -900,12 +951,15 @@ void llama_context::sched_reserve() {
             throw std::runtime_error("failed to reserve graph for Flash Attention check");
         }
 
+        const llama_cuda_fa_device_mismatch fa_uncompiled_pair =
+            llama_cuda_fa_find_uncompiled_pair(gf, model);
         const llama_cuda_fa_device_mismatch fa_device_mismatch =
-            llama_cuda_fa_find_device_mismatch(sched.get(), gf, model);
+            fa_uncompiled_pair.found ? fa_uncompiled_pair : llama_cuda_fa_find_device_mismatch(sched.get(), gf, model);
 
         if (fa_device_mismatch.found) {
-            llama_cuda_fa_report_or_throw(__func__, fa_device_mismatch, cparams.flash_attn_required);
-            cparams.flash_attn = false;
+            const bool ignored =
+                llama_cuda_fa_report_or_throw(__func__, fa_device_mismatch, cparams.flash_attn_required);
+            cparams.flash_attn = ignored;
         } else {
             cparams.flash_attn = true;
             LLAMA_LOG_INFO("%s: Flash Attention was auto, set to enabled\n", __func__);
@@ -918,10 +972,16 @@ void llama_context::sched_reserve() {
             throw std::runtime_error("failed to reserve graph for required Flash Attention check");
         }
 
+        const llama_cuda_fa_device_mismatch fa_uncompiled_pair =
+            llama_cuda_fa_find_uncompiled_pair(gf, model);
+        if (fa_uncompiled_pair.found) {
+            (void) llama_cuda_fa_report_or_throw(__func__, fa_uncompiled_pair, true);
+        }
+
         const llama_cuda_fa_device_mismatch fa_device_mismatch =
             llama_cuda_fa_find_device_mismatch(sched.get(), gf, model);
         if (fa_device_mismatch.found) {
-            llama_cuda_fa_report_or_throw(__func__, fa_device_mismatch, true);
+            (void) llama_cuda_fa_report_or_throw(__func__, fa_device_mismatch, true);
         }
     }
 

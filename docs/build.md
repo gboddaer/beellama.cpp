@@ -278,6 +278,10 @@ Use `GGML_CUDA_FORCE_CUBLAS_COMPUTE_32F` environment variable to use FP32 comput
 
 Use `GGML_CUDA_FORCE_CUBLAS_COMPUTE_16F` environment variable to force use FP16 compute type (instead of default FP32) in FP16 cuBLAS for V100, CDNA and RDNA4.
 
+#### GGML_CUDA_FA_IGNORE_UNCOMPILED_PAIRS
+
+Set `GGML_CUDA_FA_IGNORE_UNCOMPILED_PAIRS=1` to warn instead of failing when a CUDA FlashAttention K/V cache quant pair was not compiled into the build. This is an escape hatch for experiments; the recommended fix is to use a compiled pair, rebuild with `GGML_CUDA_FA_HALF_QUANTS=ON`, or rebuild with `GGML_CUDA_FA_ALL_QUANTS=ON`.
+
 ### Unified Memory
 
 The environment variable `GGML_CUDA_ENABLE_UNIFIED_MEMORY=1` can be used to enable unified memory in Linux. This allows swapping to system RAM instead of crashing when the GPU VRAM is exhausted. In Windows this setting is available in the NVIDIA control panel as `System Memory Fallback`.

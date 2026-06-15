@@ -24,7 +24,10 @@ def slice_between(text: str, begin: str, end: str) -> str:
 
 def main() -> None:
     fattn = read("ggml/src/ggml-cuda/fattn.cu")
+    llama_context = read("src/llama-context.cpp")
     set_rows = read("ggml/src/ggml-cuda/set-rows.cu")
+    build_docs = read("docs/build.md")
+    readme = read("README.md")
     convert = read("convert_hf_to_gguf.py")
     conversion_init = read("conversion/__init__.py")
 
@@ -44,6 +47,42 @@ def main() -> None:
     require(
         exec_body.find("ggml_cuda_fattn_make_route_plan") < exec_body.find("ggml_cuda_fattn_pair_compiled(plan.effective_type_K, plan.effective_type_V)"),
         "CUDA FA execution must build the route plan before checking the effective pair",
+    )
+    require(
+        "GGML_CUDA_FA_IGNORE_UNCOMPILED_PAIRS" in fattn and
+        "GGML_CUDA_FA_IGNORE_UNCOMPILED_PAIRS" in llama_context,
+        "CUDA FA must expose one env gate for ignoring uncompiled pair checks",
+    )
+    require(
+        "llama_cuda_fa_find_uncompiled_pair" in llama_context and
+        "llama_cuda_fa_find_uncompiled_pair(gf, model)" in llama_context,
+        "CUDA FA startup check must scan requested graph pairs directly before scheduler fallback can hide them",
+    )
+    require(
+        "allow_vec = allow_vec && pair_compiled" in fattn,
+        "ignored uncompiled CUDA FA pairs must not select missing vec dispatch cases",
+    )
+    require(
+        "WARNING: GGML_CUDA_FA_IGNORE_UNCOMPILED_PAIRS=1" in fattn and
+        "WARNING: GGML_CUDA_FA_IGNORE_UNCOMPILED_PAIRS=1" in llama_context,
+        "ignored uncompiled CUDA FA pairs must emit warnings before continuing",
+    )
+    require(
+        "GGML_CUDA_FA_IGNORE_UNCOMPILED_PAIRS=1" in build_docs and
+        "GGML_CUDA_FA_IGNORE_UNCOMPILED_PAIRS=1" in readme,
+        "CUDA FA uncompiled-pair ignore env must be documented",
+    )
+    require(
+        "is not compiled in this build. " in llama_context and
+        "Default builds compile standard q/KVarN-fallback pairs only (no TurboQuant/TCQ), " in llama_context and
+        "K must be the same or higher precision than V, and V may be no more than two tier groups below K. " in llama_context and
+        "Use a default compiled pair, rebuild with GGML_CUDA_FA_HALF_QUANTS=ON for TurboQuant/TCQ or wider K>=V, " in llama_context,
+        "default-build missing-pair diagnostic must match the concise policy text",
+    )
+    require(
+        "HALF builds compile same-or-higher ranked K than V, with TurboQuant/TCQ is treated as pseudo-equal to qX_1. " in llama_context and
+        "Use a HALF compiled pair or rebuild with GGML_CUDA_FA_ALL_QUANTS=ON for the full matrix." in llama_context,
+        "HALF-build missing-pair diagnostic must match the concise policy text",
     )
 
     require(

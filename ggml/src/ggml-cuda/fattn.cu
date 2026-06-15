@@ -2155,6 +2155,14 @@ static inline bool ggml_cuda_fattn_route_debug_enabled() {
     return enabled;
 }
 
+static inline bool ggml_cuda_fattn_ignore_uncompiled_pairs() {
+    static const bool enabled = [] {
+        const char * e = getenv("GGML_CUDA_FA_IGNORE_UNCOMPILED_PAIRS");
+        return e != nullptr && atoi(e) != 0;
+    }();
+    return enabled;
+}
+
 // Best FlashAttention kernel for a specific GPU:
 enum best_fattn_kernel {
     BEST_FATTN_KERNEL_NONE     =   0,
@@ -2175,7 +2183,7 @@ static const char * ggml_cuda_fattn_kernel_name(const best_fattn_kernel kernel) 
     return "UNKNOWN";
 }
 
-static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const ggml_tensor * dst, const bool allow_vec = true) {
+static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const ggml_tensor * dst, bool allow_vec = true) {
 #ifndef FLASH_ATTN_AVAILABLE
     GGML_UNUSED(device); GGML_UNUSED(dst); GGML_UNUSED(allow_vec);
     return BEST_FATTN_KERNEL_NONE;
@@ -2286,9 +2294,11 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
             return BEST_FATTN_KERNEL_NONE;
     }
 
-    if (!ggml_cuda_fattn_pair_compiled(K->type, V->type)) {
+    const bool pair_compiled = ggml_cuda_fattn_pair_compiled(K->type, V->type);
+    if (!pair_compiled && !ggml_cuda_fattn_ignore_uncompiled_pairs()) {
         return BEST_FATTN_KERNEL_NONE;
     }
+    allow_vec = allow_vec && pair_compiled;
 
     if (mask && mask->ne[2] != 1) {
         return BEST_FATTN_KERNEL_NONE;
@@ -2623,13 +2633,20 @@ void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst
     if ((ggml_cuda_fattn_is_ranked_kv_type(plan.effective_type_K) ||
          ggml_cuda_fattn_is_ranked_kv_type(plan.effective_type_V)) &&
         !ggml_cuda_fattn_pair_compiled(plan.effective_type_K, plan.effective_type_V)) {
+        if (!ggml_cuda_fattn_ignore_uncompiled_pairs()) {
+            fprintf(stderr,
+                "CUDA FA effective K/V pair was not compiled in this build: raw K=%s raw V=%s effective K=%s effective V=%s. "
+                "Use standard q/KVarN fallback cache types in the default build, or rebuild with "
+                "GGML_CUDA_FA_HALF_QUANTS or GGML_CUDA_FA_ALL_QUANTS for Turbo/TCQ or arbitrary pairs.\n",
+                ggml_type_name(K->type), ggml_type_name(V->type),
+                ggml_type_name(plan.effective_type_K), ggml_type_name(plan.effective_type_V));
+            GGML_ABORT("CUDA FA effective K/V pair not compiled");
+        }
         fprintf(stderr,
-            "CUDA FA effective K/V pair was not compiled in this build: raw K=%s raw V=%s effective K=%s effective V=%s. "
-            "Use standard q/KVarN fallback cache types in the default build, or rebuild with "
-            "GGML_CUDA_FA_HALF_QUANTS or GGML_CUDA_FA_ALL_QUANTS for Turbo/TCQ or arbitrary pairs.\n",
+            "WARNING: GGML_CUDA_FA_IGNORE_UNCOMPILED_PAIRS=1: CUDA FA effective K/V pair was not compiled: "
+            "raw K=%s raw V=%s effective K=%s effective V=%s. Continuing with non-vec fallback if available.\n",
             ggml_type_name(K->type), ggml_type_name(V->type),
             ggml_type_name(plan.effective_type_K), ggml_type_name(plan.effective_type_V));
-        GGML_ABORT("CUDA FA effective K/V pair not compiled");
     }
 
     // Turbo prefill: dequant to fp16 and use tensor core MMA for batched attention.
@@ -3054,12 +3071,18 @@ void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst
                 break;
             case BEST_FATTN_KERNEL_VEC:
                 if (!ggml_cuda_fattn_pair_compiled(dst->src[1]->type, dst->src[2]->type)) {
+                    if (!ggml_cuda_fattn_ignore_uncompiled_pairs()) {
+                        fprintf(stderr,
+                            "CUDA FA effective K/V pair was not compiled: K=%s V=%s. "
+                            "Use standard q/KVarN fallback cache types in the default build, or rebuild with "
+                            "GGML_CUDA_FA_HALF_QUANTS or GGML_CUDA_FA_ALL_QUANTS for Turbo/TCQ or arbitrary pairs.\n",
+                            ggml_type_name(dst->src[1]->type), ggml_type_name(dst->src[2]->type));
+                        GGML_ABORT("CUDA FA effective K/V pair not compiled");
+                    }
                     fprintf(stderr,
-                        "CUDA FA effective K/V pair was not compiled: K=%s V=%s. "
-                        "Use standard q/KVarN fallback cache types in the default build, or rebuild with "
-                        "GGML_CUDA_FA_HALF_QUANTS or GGML_CUDA_FA_ALL_QUANTS for Turbo/TCQ or arbitrary pairs.\n",
+                        "WARNING: GGML_CUDA_FA_IGNORE_UNCOMPILED_PAIRS=1: CUDA FA effective K/V pair was not compiled: "
+                        "K=%s V=%s. Continuing with vec dispatch.\n",
                         ggml_type_name(dst->src[1]->type), ggml_type_name(dst->src[2]->type));
-                    GGML_ABORT("CUDA FA effective K/V pair not compiled");
                 }
                 ggml_cuda_flash_attn_ext_vec(ctx, dst);
                 break;
