@@ -124,6 +124,11 @@ if (Python3_Interpreter_FOUND)
         COMMAND ${Python3_EXECUTABLE} ${PROJECT_SOURCE_DIR}/tests/test-turbo-mma-fused-static.py)
     set_property(TEST test-turbo-mma-fused-static PROPERTY LABELS cuda)
     add_test(
+        NAME test-issue41-regressions-static
+        WORKING_DIRECTORY ${PROJECT_SOURCE_DIR}
+        COMMAND ${Python3_EXECUTABLE} ${PROJECT_SOURCE_DIR}/tests/test-issue41-regressions-static.py)
+    set_property(TEST test-issue41-regressions-static PROPERTY LABELS cuda)
+    add_test(
         NAME test-hip-shuffle-compat-static
         WORKING_DIRECTORY ${PROJECT_SOURCE_DIR}
         COMMAND ${Python3_EXECUTABLE} ${PROJECT_SOURCE_DIR}/tests/test-hip-shuffle-compat-static.py)

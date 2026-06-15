@@ -2617,14 +2617,19 @@ void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst
     const ggml_tensor * K = dst->src[1];
     const ggml_tensor * V = dst->src[2];
 
-    if ((ggml_cuda_fattn_is_ranked_kv_type(K->type) || ggml_cuda_fattn_is_ranked_kv_type(V->type)) &&
-        !ggml_cuda_fattn_pair_compiled(K->type, V->type)) {
+    const ggml_cuda_fattn_route_plan plan =
+        ggml_cuda_fattn_make_route_plan(ctx.device, dst);
+
+    if ((ggml_cuda_fattn_is_ranked_kv_type(plan.effective_type_K) ||
+         ggml_cuda_fattn_is_ranked_kv_type(plan.effective_type_V)) &&
+        !ggml_cuda_fattn_pair_compiled(plan.effective_type_K, plan.effective_type_V)) {
         fprintf(stderr,
-            "CUDA FA K/V pair was not compiled in this build: K=%s V=%s. "
+            "CUDA FA effective K/V pair was not compiled in this build: raw K=%s raw V=%s effective K=%s effective V=%s. "
             "Use standard q/KVarN fallback cache types in the default build, or rebuild with "
             "GGML_CUDA_FA_HALF_QUANTS or GGML_CUDA_FA_ALL_QUANTS for Turbo/TCQ or arbitrary pairs.\n",
-            ggml_type_name(K->type), ggml_type_name(V->type));
-        GGML_ABORT("CUDA FA K/V pair not compiled");
+            ggml_type_name(K->type), ggml_type_name(V->type),
+            ggml_type_name(plan.effective_type_K), ggml_type_name(plan.effective_type_V));
+        GGML_ABORT("CUDA FA effective K/V pair not compiled");
     }
 
     // Turbo prefill: dequant to fp16 and use tensor core MMA for batched attention.
@@ -2664,8 +2669,8 @@ void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst
         (Q->ne[0] == 128 || Q->ne[0] == 256) &&
         turing_mma_available(ggml_cuda_info().devices[ggml_cuda_get_device()].cc)) {
         cudaStream_t stream = ctx.stream();
-        int device;
-        CUDA_CHECK(cudaGetDevice(&device));
+        int device_fused;
+        CUDA_CHECK(cudaGetDevice(&device_fused));
 
         if (turbo_fa_debug) {
             fprintf(stderr,
@@ -2681,16 +2686,16 @@ void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst
         ggml_tensor * orig_q_fused = nullptr;
         if (Q->ne[0] % 128 == 0) {
             const size_t q_size = ggml_nelements(Q) * sizeof(float);
-            if (q_size > q_rot_buf_size[device]) {
-                if (q_rot_buf[device]) CUDA_CHECK(cudaFree(q_rot_buf[device]));
-                CUDA_CHECK(cudaMalloc(&q_rot_buf[device], q_size));
-                q_rot_buf_size[device] = q_size;
+            if (q_size > q_rot_buf_size[device_fused]) {
+                if (q_rot_buf[device_fused]) CUDA_CHECK(cudaFree(q_rot_buf[device_fused]));
+                CUDA_CHECK(cudaMalloc(&q_rot_buf[device_fused], q_size));
+                q_rot_buf_size[device_fused] = q_size;
             }
             const int64_t n_q_groups = ggml_nelements(Q) / 128;
             k_turbo_fwht_forward<<<(int)n_q_groups, 128, 0, stream>>>(
-                (const float *)Q->data, q_rot_buf[device], ggml_nelements(Q));
+                (const float *)Q->data, q_rot_buf[device_fused], ggml_nelements(Q));
             Q_rot_fused = *Q;
-            Q_rot_fused.data = q_rot_buf[device];
+            Q_rot_fused.data = q_rot_buf[device_fused];
             orig_q_fused = dst->src[0];
             dst->src[0] = &Q_rot_fused;
         }
@@ -2806,7 +2811,7 @@ void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst
 
         cudaStream_t stream = ctx.stream();
 
-        // Build the unified route plan from raw K/V types. The same plan drives
+        // Use the unified route plan from raw K/V types. The same plan drives
         // allocation, support checks, and execution. Mixed classic K + Turbo V
         // uses decoded Turbo V plus MMA/tile fallback for D>=256 when the
         // effective classic_K/f16 vec route is unsafe. D=512 classic_non_q8 K
@@ -2814,8 +2819,6 @@ void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst
         // classic_K/Turbo_V vec crash seen on Gemma 4.
         int device_dec;
         CUDA_CHECK(cudaGetDevice(&device_dec));
-        const ggml_cuda_fattn_route_plan plan =
-            ggml_cuda_fattn_make_route_plan(device_dec, dst);
 
         if (ggml_cuda_fattn_route_debug_enabled()) {
             fprintf(stderr,

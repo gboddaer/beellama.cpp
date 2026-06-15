@@ -129,8 +129,11 @@ static void init_tcq_error_dump(int device) {
     tcq_dump_device = device;
     tcq_dump_x_host = (float *)malloc(n * 128 * sizeof(float));
     tcq_dump_out_host = (uint8_t *)malloc(n * 128 * sizeof(uint8_t));
-    cudaMalloc(&tcq_dump_x_dev, n * 128 * sizeof(float));
-    cudaMalloc(&tcq_dump_out_dev, n * 128 * sizeof(uint8_t));
+    if (!tcq_dump_x_host || !tcq_dump_out_host) {
+        GGML_ABORT("TCQ error dump host allocation failed for %d groups", n);
+    }
+    CUDA_CHECK(cudaMalloc(&tcq_dump_x_dev, n * 128 * sizeof(float)));
+    CUDA_CHECK(cudaMalloc(&tcq_dump_out_dev, n * 128 * sizeof(uint8_t)));
     cudaMemcpyToSymbol(d_tcq_dump_x_buf, &tcq_dump_x_dev, sizeof(float*));
     cudaMemcpyToSymbol(d_tcq_dump_out_buf, &tcq_dump_out_dev, sizeof(uint8_t*));
     cudaMemcpyToSymbol(d_tcq_dump_max, &n, sizeof(int));
@@ -241,7 +244,8 @@ static void set_rows_cuda_quant(
         const uint3 ne11_fd = init_fastdiv_values((uint32_t) ne11);
         const uint3 ne12_fd = init_fastdiv_values((uint32_t) ne12);
 
-        k_set_rows_quant<idx_t, block_type, qk, quantize_func><<<grid_size, block_size, 0, stream>>>(
+        const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(grid_size, block_size, 0, stream);
+        ggml_cuda_kernel_launch(k_set_rows_quant<idx_t, block_type, qk, quantize_func>, launch_params,
             src0_d, src1_d, dst_d, ne_total, ne10, ne11, ne12, ne13, s01, s02, s03, s10, s11, s12, s1, s2, s3, ne00_fd,
             ne01_fd, ne02_fd, ne11_fd, ne12_fd);
     }
@@ -360,8 +364,13 @@ static int64_t   tcq_bt_buf_bytes[GGML_CUDA_MAX_DEVICES] = {};
 
 static void ensure_tcq_bt_buf(int device, int64_t bytes_needed) {
     if (bytes_needed <= tcq_bt_buf_bytes[device]) return;
-    if (tcq_bt_buf[device]) cudaFree(tcq_bt_buf[device]);
-    cudaMalloc(&tcq_bt_buf[device], bytes_needed);
+
+    uint8_t * new_buf = nullptr;
+    CUDA_CHECK(cudaMalloc(&new_buf, bytes_needed));
+    if (tcq_bt_buf[device]) {
+        CUDA_CHECK(cudaFree(tcq_bt_buf[device]));
+    }
+    tcq_bt_buf[device] = new_buf;
     tcq_bt_buf_bytes[device] = bytes_needed;
 }
 
@@ -537,7 +546,9 @@ static void set_rows_cuda(ggml_backend_cuda_context & ctx, const ggml_tensor * s
             const uint3 ne02_fd = init_fastdiv_values((uint32_t) ne02);
             const uint3 ne11_fd = init_fastdiv_values((uint32_t) ne11);
             const uint3 ne12_fd = init_fastdiv_values((uint32_t) ne12);
-            k_set_rows_turbo2<idx_t><<<num_blocks_grid, CUDA_SET_ROWS_BLOCK_SIZE, 0, stream>>>(
+            const ggml_cuda_kernel_launch_params launch_params =
+                ggml_cuda_kernel_launch_params(dim3(num_blocks_grid), dim3(CUDA_SET_ROWS_BLOCK_SIZE), 0, stream);
+            ggml_cuda_kernel_launch(k_set_rows_turbo2<idx_t>, launch_params,
                 src0_d, src1_d, (block_turbo2_0 *)dst->data,
                 ne_total_groups, ne00, ne01, ne02, ne10, ne11, ne12, ne13,
                 s01_f, s02_f, s03_f, s10_i, s11_i, s12_i, nb1, nb2, nb3,
@@ -556,7 +567,9 @@ static void set_rows_cuda(ggml_backend_cuda_context & ctx, const ggml_tensor * s
             const uint3 ne02_fd = init_fastdiv_values((uint32_t) ne02);
             const uint3 ne11_fd = init_fastdiv_values((uint32_t) ne11);
             const uint3 ne12_fd = init_fastdiv_values((uint32_t) ne12);
-            k_set_rows_turbo3<idx_t><<<num_blocks_grid, CUDA_SET_ROWS_BLOCK_SIZE, 0, stream>>>(
+            const ggml_cuda_kernel_launch_params launch_params =
+                ggml_cuda_kernel_launch_params(dim3(num_blocks_grid), dim3(CUDA_SET_ROWS_BLOCK_SIZE), 0, stream);
+            ggml_cuda_kernel_launch(k_set_rows_turbo3<idx_t>, launch_params,
                 src0_d, src1_d, (block_turbo3_0 *)dst->data,
                 ne_total_groups, ne00, ne01, ne02, ne10, ne11, ne12, ne13,
                 s01_f, s02_f, s03_f, s10_i, s11_i, s12_i, iq_is_k, nb1, nb2, nb3,
@@ -624,7 +637,9 @@ static void set_rows_cuda(ggml_backend_cuda_context & ctx, const ggml_tensor * s
             const uint3 ne11_fd = init_fastdiv_values((uint32_t) ne11);
             const uint3 ne12_fd = init_fastdiv_values((uint32_t) ne12);
             const int shared_bytes = tcq4_use_shared_bt[ctx.device] ? tcq4_bt_shared_bytes : 0;
-            k_set_rows_turbo4_tcq<idx_t><<<(int)ne_total_groups, 1024, shared_bytes, stream>>>(
+            const ggml_cuda_kernel_launch_params launch_params =
+                ggml_cuda_kernel_launch_params(dim3((uint32_t)ne_total_groups), dim3(1024), shared_bytes, stream);
+            ggml_cuda_kernel_launch(k_set_rows_turbo4_tcq<idx_t>, launch_params,
                 src0_d, src1_d, (block_turbo4_tcq *)dst->data,
                 ne_total_groups, tcq_bt_buf[ctx.device], tcq4_use_shared_bt[ctx.device], ne00, ne01, ne02, ne10, ne11, ne12, ne13,
                 s01_f, s02_f, s03_f, s10_i, s11_i, s12_i, iq_is_k, nb1, nb2, nb3,
@@ -690,7 +705,9 @@ static void set_rows_cuda(ggml_backend_cuda_context & ctx, const ggml_tensor * s
             const uint3 ne11_fd = init_fastdiv_values((uint32_t) ne11);
             const uint3 ne12_fd = init_fastdiv_values((uint32_t) ne12);
             const int shared_bytes = tcq3_use_shared_bt[ctx.device] ? tcq3_bt_shared_bytes : 0;
-            k_set_rows_turbo3_tcq<idx_t><<<(int)ne_total_groups, 512, shared_bytes, stream>>>(
+            const ggml_cuda_kernel_launch_params launch_params =
+                ggml_cuda_kernel_launch_params(dim3((uint32_t)ne_total_groups), dim3(512), shared_bytes, stream);
+            ggml_cuda_kernel_launch(k_set_rows_turbo3_tcq<idx_t>, launch_params,
                 src0_d, src1_d, (block_turbo3_tcq *)dst->data,
                 ne_total_groups, tcq_bt_buf[ctx.device], tcq3_use_shared_bt[ctx.device], ne00, ne01, ne02, ne10, ne11, ne12, ne13,
                 s01_f, s02_f, s03_f, s10_i, s11_i, s12_i, iq_is_k, nb1, nb2, nb3,
@@ -753,7 +770,9 @@ static void set_rows_cuda(ggml_backend_cuda_context & ctx, const ggml_tensor * s
             const uint3 ne11_fd = init_fastdiv_values((uint32_t) ne11);
             const uint3 ne12_fd = init_fastdiv_values((uint32_t) ne12);
             const int shared_bytes = tcq2_use_shared_bt[ctx.device] ? tcq2_bt_shared_bytes : 0;
-            k_set_rows_turbo2_tcq<idx_t><<<(int)ne_total_groups, 256, shared_bytes, stream>>>(
+            const ggml_cuda_kernel_launch_params launch_params =
+                ggml_cuda_kernel_launch_params(dim3((uint32_t)ne_total_groups), dim3(256), shared_bytes, stream);
+            ggml_cuda_kernel_launch(k_set_rows_turbo2_tcq<idx_t>, launch_params,
                 src0_d, src1_d, (block_turbo2_tcq *)dst->data,
                 ne_total_groups, tcq_bt_buf[ctx.device], tcq2_use_shared_bt[ctx.device], ne00, ne01, ne02, ne10, ne11, ne12, ne13,
                 s01_f, s02_f, s03_f, s10_i, s11_i, s12_i, iq_is_k, nb1, nb2, nb3,
