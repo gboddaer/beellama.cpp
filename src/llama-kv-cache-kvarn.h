@@ -34,6 +34,8 @@ public:
 
     ggml_tensor * get_k(ggml_context * ctx, int32_t il) const override;
     ggml_tensor * get_v(ggml_context * ctx, int32_t il) const override;
+    ggml_tensor * get_k_rotated(ggml_context * ctx, int32_t il) const;
+    ggml_tensor * get_v_rotated(ggml_context * ctx, int32_t il) const;
 
     ggml_tensor * get_turbo_rotation() const override;
     ggml_tensor * get_turbo_rotation_inv() const override;
@@ -47,6 +49,7 @@ public:
     ggml_tensor * build_input_v_idxs(ggml_context * ctx, const llama_ubatch & ubatch) const override;
     ggml_tensor * build_input_k_rot(ggml_context * ctx) const override;
     ggml_tensor * build_input_v_rot(ggml_context * ctx) const override;
+    ggml_tensor * build_input_kvarn_rot(ggml_context * ctx) const;
 
     void set_input_k_idxs(ggml_tensor * dst, const llama_ubatch * ubatch) const override;
     void set_input_v_idxs(ggml_tensor * dst, const llama_ubatch * ubatch) const override;
@@ -59,6 +62,7 @@ public:
     void set_input_v_rot(ggml_tensor * dst) const override;
     void set_input_k_rot_backend(ggml_tensor * dst) const override;
     void set_input_v_rot_backend(ggml_tensor * dst) const override;
+    void set_input_kvarn_rot(ggml_tensor * dst) const;
 
 private:
     llama_kv_cache_context * base() const;
@@ -138,7 +142,8 @@ public:
             int32_t il,
             uint32_t n_kv,
             const llama_kv_cache::slot_info & sinfo,
-            bool value) const;
+            bool value,
+            bool emit_rotated = false) const;
 
 private:
     struct layer {

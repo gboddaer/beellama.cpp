@@ -1305,7 +1305,8 @@ static __global__ void kvarn_materialize_kernel(
         int groups_per_stream,
         int record_bytes,
         int bits,
-        bool value) {
+        bool value,
+        bool emit_rotated) {
     const int head = blockIdx.x;
     const int lane = threadIdx.x / KVAR_N_DIM;
     const int dim = threadIdx.x - lane * KVAR_N_DIM;
@@ -1336,6 +1337,17 @@ static __global__ void kvarn_materialize_kernel(
             const uint8_t q = kvarn_unpack_record(record, row * KVAR_N_DIM + col, bits);
             x = (q * __half2float(scale_axis[row]) + __half2float(zp_axis[row])) * __half2float(other_axis[col]);
         }
+    }
+
+    if (emit_rotated) {
+        // Rotated-domain attention: emit the dequantized K_rot/V_rot directly
+        // (pre-inverse-WHT). The query is rotated and the attention output is
+        // inverse-rotated in the graph, so the per-token butterfly is skipped.
+        if (token < n_kv) {
+            dst[((out_stream * n_kv + token) * n_heads + head) * KVAR_N_DIM + dim] =
+                __float2half_rn(x);
+        }
+        return;
     }
 
     rotated_lane[dim] = x;
@@ -1376,7 +1388,7 @@ static __device__ __forceinline__ uint8_t kvarn_unpack_record_fast(const uint8_t
     }
 }
 
-template<int BITS, bool VALUE, int CHUNK>
+template<int BITS, bool VALUE, int CHUNK, bool EMIT_ROTATED>
 static __global__ void kvarn_materialize_fast_kernel(
         const uint8_t * records,
         const half * stage,
@@ -1558,6 +1570,18 @@ static __global__ void kvarn_materialize_fast_kernel(
         }
     }
 
+    if constexpr (EMIT_ROTATED) {
+#pragma unroll
+        for (int i = 0; i < CHUNK; ++i) {
+            const int token = token0 + i;
+            if (token < n_kv) {
+                half * out = dst + ((int64_t) out_stream * n_kv * n_heads + (int64_t) token * n_heads + head) * KVAR_N_DIM;
+                out[dim] = __float2half_rn(x[i]);
+            }
+        }
+        return;
+    }
+
 #pragma unroll
     for (int stride = 1; stride < 32; stride *= 2) {
 #pragma unroll
@@ -1615,22 +1639,36 @@ static void kvarn_launch_materialize_fast(
         int stream_start,
         int groups_per_stream,
         int record_bytes,
+        bool emit_rotated,
         cudaStream_t stream) {
     const int n_chunks = (n_kv + KVAR_N_MATERIALIZE_FAST_CHUNK - 1) / KVAR_N_MATERIALIZE_FAST_CHUNK;
     dim3 blocks((uint32_t) n_heads, (uint32_t) n_chunks, (uint32_t) n_stream);
-    kvarn_materialize_fast_kernel<BITS, VALUE, KVAR_N_MATERIALIZE_FAST_CHUNK><<<blocks, KVAR_N_DIM, 0, stream>>>(
-        records,
-        stage,
-        live_groups,
-        dst,
-        n_heads,
-        n_kv,
-        stream_start,
-        groups_per_stream,
-        record_bytes);
+    if (emit_rotated) {
+        kvarn_materialize_fast_kernel<BITS, VALUE, KVAR_N_MATERIALIZE_FAST_CHUNK, true><<<blocks, KVAR_N_DIM, 0, stream>>>(
+            records,
+            stage,
+            live_groups,
+            dst,
+            n_heads,
+            n_kv,
+            stream_start,
+            groups_per_stream,
+            record_bytes);
+    } else {
+        kvarn_materialize_fast_kernel<BITS, VALUE, KVAR_N_MATERIALIZE_FAST_CHUNK, false><<<blocks, KVAR_N_DIM, 0, stream>>>(
+            records,
+            stage,
+            live_groups,
+            dst,
+            n_heads,
+            n_kv,
+            stream_start,
+            groups_per_stream,
+            record_bytes);
+    }
 }
 
-template<int CHUNK>
+template<int CHUNK, bool EMIT_ROTATED>
 static __global__ void kvarn_materialize_v4_pair_kernel(
         const uint8_t * records,
         const half * stage,
@@ -1694,6 +1732,18 @@ static __global__ void kvarn_materialize_v4_pair_kernel(
         }
     }
 
+    if constexpr (EMIT_ROTATED) {
+#pragma unroll
+        for (int i = 0; i < CHUNK; ++i) {
+            const int token = token0 + i;
+            if (token < n_kv) {
+                half * out = dst + ((int64_t) out_stream * n_kv * n_heads + (int64_t) token * n_heads + head) * KVAR_N_DIM;
+                *((half2 *) (out + dim0)) = __halves2half2(__float2half_rn(x0[i]), __float2half_rn(x1[i]));
+            }
+        }
+        return;
+    }
+
 #pragma unroll
     for (int i = 0; i < CHUNK; ++i) {
         const float a = x0[i];
@@ -1752,19 +1802,33 @@ static void kvarn_launch_materialize_v4_pair(
         int stream_start,
         int groups_per_stream,
         int record_bytes,
+        bool emit_rotated,
         cudaStream_t stream) {
     const int n_chunks = (n_kv + KVAR_N_MATERIALIZE_FAST_CHUNK - 1) / KVAR_N_MATERIALIZE_FAST_CHUNK;
     dim3 blocks((uint32_t) n_heads, (uint32_t) n_chunks, (uint32_t) n_stream);
-    kvarn_materialize_v4_pair_kernel<KVAR_N_MATERIALIZE_FAST_CHUNK><<<blocks, KVAR_N_DIM / 2, 0, stream>>>(
-        records,
-        stage,
-        live_groups,
-        dst,
-        n_heads,
-        n_kv,
-        stream_start,
-        groups_per_stream,
-        record_bytes);
+    if (emit_rotated) {
+        kvarn_materialize_v4_pair_kernel<KVAR_N_MATERIALIZE_FAST_CHUNK, true><<<blocks, KVAR_N_DIM / 2, 0, stream>>>(
+            records,
+            stage,
+            live_groups,
+            dst,
+            n_heads,
+            n_kv,
+            stream_start,
+            groups_per_stream,
+            record_bytes);
+    } else {
+        kvarn_materialize_v4_pair_kernel<KVAR_N_MATERIALIZE_FAST_CHUNK, false><<<blocks, KVAR_N_DIM / 2, 0, stream>>>(
+            records,
+            stage,
+            live_groups,
+            dst,
+            n_heads,
+            n_kv,
+            stream_start,
+            groups_per_stream,
+            record_bytes);
+    }
 }
 
 void ggml_cuda_op_kvarn_store(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
@@ -2018,6 +2082,7 @@ void ggml_cuda_op_kvarn_materialize(ggml_backend_cuda_context & ctx, ggml_tensor
     const bool value = ggml_get_op_params_i32(dst, 1) != 0;
     const int stream_start = ggml_get_op_params_i32(dst, 2);
     const int n_stream = ggml_get_op_params_i32(dst, 3);
+    const bool emit_rotated = ggml_get_op_params_i32(dst, 5) != 0;
     GGML_ASSERT(ggml_cuda_kvarn_valid_bits(bits));
     GGML_ASSERT((KVAR_N_TILE_VALUES * bits) % 8 == 0);
     GGML_ASSERT((KVAR_N_DIM * bits) % 8 == 0);
@@ -2045,55 +2110,55 @@ void ggml_cuda_op_kvarn_materialize(ggml_backend_cuda_context & ctx, ggml_tensor
             case 2:
                 if (value) {
                     kvarn_launch_materialize_fast<2, true>((const uint8_t *) records->data, (const half *) stage->data, live_groups.get(), (half *) dst->data,
-                            (int) dst->ne[1], (int) dst->ne[2], n_stream, stream_start, groups_per_stream, (int) records->ne[0], stream);
+                            (int) dst->ne[1], (int) dst->ne[2], n_stream, stream_start, groups_per_stream, (int) records->ne[0], emit_rotated, stream);
                 } else {
                     kvarn_launch_materialize_fast<2, false>((const uint8_t *) records->data, (const half *) stage->data, live_groups.get(), (half *) dst->data,
-                            (int) dst->ne[1], (int) dst->ne[2], n_stream, stream_start, groups_per_stream, (int) records->ne[0], stream);
+                            (int) dst->ne[1], (int) dst->ne[2], n_stream, stream_start, groups_per_stream, (int) records->ne[0], emit_rotated, stream);
                 }
                 break;
             case 3:
                 if (value) {
                     kvarn_launch_materialize_fast<3, true>((const uint8_t *) records->data, (const half *) stage->data, live_groups.get(), (half *) dst->data,
-                            (int) dst->ne[1], (int) dst->ne[2], n_stream, stream_start, groups_per_stream, (int) records->ne[0], stream);
+                            (int) dst->ne[1], (int) dst->ne[2], n_stream, stream_start, groups_per_stream, (int) records->ne[0], emit_rotated, stream);
                 } else {
                     kvarn_launch_materialize_fast<3, false>((const uint8_t *) records->data, (const half *) stage->data, live_groups.get(), (half *) dst->data,
-                            (int) dst->ne[1], (int) dst->ne[2], n_stream, stream_start, groups_per_stream, (int) records->ne[0], stream);
+                            (int) dst->ne[1], (int) dst->ne[2], n_stream, stream_start, groups_per_stream, (int) records->ne[0], emit_rotated, stream);
                 }
                 break;
             case 4:
                 if (value) {
                     kvarn_launch_materialize_v4_pair((const uint8_t *) records->data, (const half *) stage->data, live_groups.get(), (half *) dst->data,
-                            (int) dst->ne[1], (int) dst->ne[2], n_stream, stream_start, groups_per_stream, (int) records->ne[0], stream);
+                            (int) dst->ne[1], (int) dst->ne[2], n_stream, stream_start, groups_per_stream, (int) records->ne[0], emit_rotated, stream);
                 } else {
                     kvarn_launch_materialize_fast<4, false>((const uint8_t *) records->data, (const half *) stage->data, live_groups.get(), (half *) dst->data,
-                            (int) dst->ne[1], (int) dst->ne[2], n_stream, stream_start, groups_per_stream, (int) records->ne[0], stream);
+                            (int) dst->ne[1], (int) dst->ne[2], n_stream, stream_start, groups_per_stream, (int) records->ne[0], emit_rotated, stream);
                 }
                 break;
             case 5:
                 if (value) {
                     kvarn_launch_materialize_fast<5, true>((const uint8_t *) records->data, (const half *) stage->data, live_groups.get(), (half *) dst->data,
-                            (int) dst->ne[1], (int) dst->ne[2], n_stream, stream_start, groups_per_stream, (int) records->ne[0], stream);
+                            (int) dst->ne[1], (int) dst->ne[2], n_stream, stream_start, groups_per_stream, (int) records->ne[0], emit_rotated, stream);
                 } else {
                     kvarn_launch_materialize_fast<5, false>((const uint8_t *) records->data, (const half *) stage->data, live_groups.get(), (half *) dst->data,
-                            (int) dst->ne[1], (int) dst->ne[2], n_stream, stream_start, groups_per_stream, (int) records->ne[0], stream);
+                            (int) dst->ne[1], (int) dst->ne[2], n_stream, stream_start, groups_per_stream, (int) records->ne[0], emit_rotated, stream);
                 }
                 break;
             case 6:
                 if (value) {
                     kvarn_launch_materialize_fast<6, true>((const uint8_t *) records->data, (const half *) stage->data, live_groups.get(), (half *) dst->data,
-                            (int) dst->ne[1], (int) dst->ne[2], n_stream, stream_start, groups_per_stream, (int) records->ne[0], stream);
+                            (int) dst->ne[1], (int) dst->ne[2], n_stream, stream_start, groups_per_stream, (int) records->ne[0], emit_rotated, stream);
                 } else {
                     kvarn_launch_materialize_fast<6, false>((const uint8_t *) records->data, (const half *) stage->data, live_groups.get(), (half *) dst->data,
-                            (int) dst->ne[1], (int) dst->ne[2], n_stream, stream_start, groups_per_stream, (int) records->ne[0], stream);
+                            (int) dst->ne[1], (int) dst->ne[2], n_stream, stream_start, groups_per_stream, (int) records->ne[0], emit_rotated, stream);
                 }
                 break;
             case 8:
                 if (value) {
                     kvarn_launch_materialize_fast<8, true>((const uint8_t *) records->data, (const half *) stage->data, live_groups.get(), (half *) dst->data,
-                            (int) dst->ne[1], (int) dst->ne[2], n_stream, stream_start, groups_per_stream, (int) records->ne[0], stream);
+                            (int) dst->ne[1], (int) dst->ne[2], n_stream, stream_start, groups_per_stream, (int) records->ne[0], emit_rotated, stream);
                 } else {
                     kvarn_launch_materialize_fast<8, false>((const uint8_t *) records->data, (const half *) stage->data, live_groups.get(), (half *) dst->data,
-                            (int) dst->ne[1], (int) dst->ne[2], n_stream, stream_start, groups_per_stream, (int) records->ne[0], stream);
+                            (int) dst->ne[1], (int) dst->ne[2], n_stream, stream_start, groups_per_stream, (int) records->ne[0], emit_rotated, stream);
                 }
                 break;
             default:
@@ -2114,7 +2179,8 @@ void ggml_cuda_op_kvarn_materialize(ggml_backend_cuda_context & ctx, ggml_tensor
             groups_per_stream,
             (int) records->ne[0],
             bits,
-            value);
+            value,
+            emit_rotated);
     }
     kvarn_prof_end(prof_mat, stream);
 }

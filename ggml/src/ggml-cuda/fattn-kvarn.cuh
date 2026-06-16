@@ -760,6 +760,9 @@ bool ggml_cuda_flash_attn_ext_kvarn_supported(const ggml_tensor * dst) {
     if (k_mat == nullptr || v_mat == nullptr || k_mat->op != GGML_OP_KVARN_MATERIALIZE || v_mat->op != GGML_OP_KVARN_MATERIALIZE) {
         return false;
     }
+    if (ggml_get_op_params_i32(k_mat, 5) != 0 || ggml_get_op_params_i32(v_mat, 5) != 0) {
+        return false;
+    }
     const int k_bits = ggml_get_op_params_i32(k_mat, 0);
     const int v_bits = ggml_get_op_params_i32(v_mat, 0);
     if (!fattn_kvarn_bits_supported(k_bits) || !fattn_kvarn_bits_supported(v_bits)) {

@@ -9,12 +9,14 @@
 #include "llama-kv-cache.h"
 #include "llama-kv-cache-iswa.h"
 #include "llama-kv-cache-dsa.h"
+#include "llama-kv-cache-kvarn.h"
 #include "llama-memory-hybrid.h"
 #include "llama-memory-hybrid-iswa.h"
 #include "llama-memory-recurrent.h"
 
 #include <cassert>
 #include <cmath>
+#include <cstdlib>
 #include <cstring>
 #include <numeric>
 #include <sstream>
@@ -58,6 +60,14 @@ static bool can_reuse_kq_mask(
     res &= (kq_mask->ne[3] == n_stream);
 
     return res;
+}
+
+static bool kvarn_rotated_fa_enabled() {
+    static const bool enabled = [] {
+        const char * env = std::getenv("GGML_KVARN_ROTATED_FA");
+        return env != nullptr && env[0] != '\0' && std::atoi(env) != 0;
+    }();
+    return enabled;
 }
 
 // impl
@@ -517,6 +527,12 @@ void llm_graph_input_attn_kv::set_input(const llama_ubatch * ubatch) {
     if (self_v_rot) {
         mctx->set_input_v_rot(self_v_rot);
     }
+
+    if (self_kvarn_rot) {
+        const auto * kvarn = dynamic_cast<const llama_kv_cache_kvarn_context *>(mctx);
+        GGML_ASSERT(kvarn != nullptr);
+        kvarn->set_input_kvarn_rot(self_kvarn_rot);
+    }
 }
 
 bool llm_graph_input_attn_kv::can_reuse(const llm_graph_params & params) {
@@ -610,6 +626,12 @@ void llm_graph_input_attn_kv_iswa::set_input(const llama_ubatch * ubatch) {
 
     if (self_v_rot) {
         mctx->get_base()->set_input_v_rot(self_v_rot);
+    }
+
+    if (self_kvarn_rot) {
+        const auto * kvarn = dynamic_cast<const llama_kv_cache_kvarn_context *>(mctx->get_base());
+        GGML_ASSERT(kvarn != nullptr);
+        kvarn->set_input_kvarn_rot(self_kvarn_rot);
     }
 
     if (self_k_rot_swa) {
@@ -2314,6 +2336,11 @@ static std::unique_ptr<llm_graph_input_attn_kv> build_attn_inp_kv_impl(
 
     inp->self_k_rot = mctx_cur->build_input_k_rot(ctx0);
     inp->self_v_rot = mctx_cur->build_input_v_rot(ctx0);
+    if (kvarn_rotated_fa_enabled()) {
+        if (const auto * kvarn = dynamic_cast<const llama_kv_cache_kvarn_context *>(mctx_cur)) {
+            inp->self_kvarn_rot = kvarn->build_input_kvarn_rot(ctx0);
+        }
+    }
 
     return inp;
 }
@@ -2358,6 +2385,10 @@ ggml_tensor * llm_graph_context::build_attn(
     ggml_build_forward_expand(gf, k_cur);
 
     const auto * mctx_cur = inp->mctx;
+    const auto * kvarn_ctx =
+        (kvarn_rotated_fa_enabled() && inp->self_kvarn_rot) ?
+            dynamic_cast<const llama_kv_cache_kvarn_context *>(mctx_cur) : nullptr;
+    const bool use_kvarn_rotated = kvarn_ctx != nullptr && q_cur->ne[0] % 128 == 0;
 
     // store to KV cache
     {
@@ -2371,8 +2402,12 @@ ggml_tensor * llm_graph_context::build_attn(
     const auto & kq_mask = inp->get_kq_mask();
 
     ggml_tensor * q = q_cur;
-    ggml_tensor * k = mctx_cur->get_k(ctx0, il);
-    ggml_tensor * v = mctx_cur->get_v(ctx0, il);
+    ggml_tensor * k = use_kvarn_rotated ? kvarn_ctx->get_k_rotated(ctx0, il) : mctx_cur->get_k(ctx0, il);
+    ggml_tensor * v = use_kvarn_rotated ? kvarn_ctx->get_v_rotated(ctx0, il) : mctx_cur->get_v(ctx0, il);
+
+    if (use_kvarn_rotated) {
+        q = ggml_mul_mat_aux(ctx0, q, inp->self_kvarn_rot);
+    }
 
     // TurboQuant Q pre-rotation is handled inline in CUDA FA kernels:
     // - Vec kernel: shared memory FWHT (fattn-vec.cuh)
@@ -2389,7 +2424,10 @@ ggml_tensor * llm_graph_context::build_attn(
     cb(cur, "kqv_out", il);
 
     // TurboQuant V un-rotation at graph level (CUDA graph compatible)
-    if (v->type == GGML_TYPE_TURBO2_0 || v->type == GGML_TYPE_TURBO3_0 || v->type == GGML_TYPE_TURBO4_0 || v->type == GGML_TYPE_TURBO4_TCQ || v->type == GGML_TYPE_TURBO3_TCQ || v->type == GGML_TYPE_TURBO2_TCQ) {
+    if (use_kvarn_rotated) {
+        cur = ggml_cont(ctx0, cur);
+        cur = ggml_mul_mat_aux(ctx0, cur, inp->self_kvarn_rot);
+    } else if (v->type == GGML_TYPE_TURBO2_0 || v->type == GGML_TYPE_TURBO3_0 || v->type == GGML_TYPE_TURBO4_0 || v->type == GGML_TYPE_TURBO4_TCQ || v->type == GGML_TYPE_TURBO3_TCQ || v->type == GGML_TYPE_TURBO2_TCQ) {
         if (cur->ne[0] % 128 == 0) {
             cur = ggml_cont(ctx0, cur);  // force copy to break potential aliasing
             cur = ggml_turbo_wht(ctx0, cur, 1);  // 1 = inverse
@@ -2640,6 +2678,10 @@ ggml_tensor * llm_graph_context::build_attn(
     const auto * mctx_iswa = inp->mctx;
 
     const auto * mctx_cur = is_swa ? mctx_iswa->get_swa() : mctx_iswa->get_base();
+    const auto * kvarn_ctx =
+        (!is_swa && kvarn_rotated_fa_enabled() && inp->self_kvarn_rot) ?
+            dynamic_cast<const llama_kv_cache_kvarn_context *>(mctx_cur) : nullptr;
+    const bool use_kvarn_rotated = kvarn_ctx != nullptr && q_cur->ne[0] % 128 == 0;
 
     // optionally store to KV cache
     if (k_cur) {
@@ -2657,14 +2699,21 @@ ggml_tensor * llm_graph_context::build_attn(
     const auto & kq_mask = is_swa ? inp->get_kq_mask_swa() : inp->get_kq_mask();
 
     ggml_tensor * q = q_cur;
-    ggml_tensor * k = mctx_cur->get_k(ctx0, il);
-    ggml_tensor * v = mctx_cur->get_v(ctx0, il);
+    ggml_tensor * k = use_kvarn_rotated ? kvarn_ctx->get_k_rotated(ctx0, il) : mctx_cur->get_k(ctx0, il);
+    ggml_tensor * v = use_kvarn_rotated ? kvarn_ctx->get_v_rotated(ctx0, il) : mctx_cur->get_v(ctx0, il);
+
+    if (use_kvarn_rotated) {
+        q = ggml_mul_mat_aux(ctx0, q, inp->self_kvarn_rot);
+    }
 
     ggml_tensor * cur = build_attn_mha(q, k, v, kq_b, kq_mask, sinks, v_mla, kq_scale, il);
     cb(cur, "kqv_out", il);
 
     // TurboQuant V un-rotation at graph level (CUDA graph compatible)
-    if (v->type == GGML_TYPE_TURBO2_0 || v->type == GGML_TYPE_TURBO3_0 || v->type == GGML_TYPE_TURBO4_0 || v->type == GGML_TYPE_TURBO4_TCQ || v->type == GGML_TYPE_TURBO3_TCQ || v->type == GGML_TYPE_TURBO2_TCQ) {
+    if (use_kvarn_rotated) {
+        cur = ggml_cont(ctx0, cur);
+        cur = ggml_mul_mat_aux(ctx0, cur, inp->self_kvarn_rot);
+    } else if (v->type == GGML_TYPE_TURBO2_0 || v->type == GGML_TYPE_TURBO3_0 || v->type == GGML_TYPE_TURBO4_0 || v->type == GGML_TYPE_TURBO4_TCQ || v->type == GGML_TYPE_TURBO3_TCQ || v->type == GGML_TYPE_TURBO2_TCQ) {
         if (cur->ne[0] % 128 == 0) {
             cur = ggml_cont(ctx0, cur);
             cur = ggml_turbo_wht(ctx0, cur, 1);  // 1 = inverse
@@ -2803,6 +2852,11 @@ llm_graph_input_attn_kv_iswa * llm_graph_context::build_attn_inp_kv_iswa() const
 
     inp->self_k_rot = mctx_cur->get_base()->build_input_k_rot(ctx0);
     inp->self_v_rot = mctx_cur->get_base()->build_input_v_rot(ctx0);
+    if (kvarn_rotated_fa_enabled()) {
+        if (const auto * kvarn = dynamic_cast<const llama_kv_cache_kvarn_context *>(mctx_cur->get_base())) {
+            inp->self_kvarn_rot = kvarn->build_input_kvarn_rot(ctx0);
+        }
+    }
 
     inp->self_k_rot_swa = mctx_cur->get_swa()->build_input_k_rot(ctx0);
     inp->self_v_rot_swa = mctx_cur->get_swa()->build_input_v_rot(ctx0);

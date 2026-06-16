@@ -3,6 +3,7 @@
 #include "ggml-backend.h"
 
 #include <algorithm>
+#include <array>
 #include <cstdint>
 #include <cmath>
 #include <cstdio>
@@ -220,6 +221,91 @@ static void test_tile_quantization(llama_kvarn_type type) {
     const float max_rmse[] = { 0.0f, 0.0f, 0.40f, 0.22f, 0.12f, 0.08f, 0.05f, 0.0f, 0.025f };
     require(tile_rmse(k, k_dequant) < max_rmse[desc->key_bits], "K tile RMSE too high");
     require(tile_rmse(v, v_dequant) < max_rmse[desc->value_bits], "V tile RMSE too high");
+}
+
+// Proof that KVarN rotated-domain attention is algebraically equivalent to the
+// materialize path, using only the CPU reference quant/dequant. Let R = the
+// normalized WHT-128 (symmetric involution: R^2 = I, verified separately by
+// test_hadamard_roundtrip). KVarN stores K_rot = R*K, V_rot = R*V; materialize
+// reconstructs X_orig = R*dequant(record). Rotated-domain attention skips that
+// inverse-WHT and instead rotates the query / inverse-rotates the output:
+//   K:  Q . K_orig[:,c]        == (R Q) . K_rot[:,c]
+//   V:  sum_t w[t] V_orig[t,:] == R ( sum_t w[t] V_rot[t,:] )
+static void test_rotated_domain_equivalence() {
+    const int bits = 4; // kvarn4
+    const auto layout = llama_kvarn_make_layout(128, 128, bits, bits);
+
+    std::vector<float> k(128 * 128);
+    std::vector<float> v(128 * 128);
+    for (int r = 0; r < 128; ++r) {
+        for (int c = 0; c < 128; ++c) {
+            k[r * 128 + c] = std::sin(float(r) * 0.071f) + std::cos(float(c) * 0.113f) +
+                             float((r * 17 + c * 13) % 29 - 14) * 0.015f;
+            v[r * 128 + c] = std::cos(float(r) * 0.057f) - std::sin(float(c) * 0.091f) +
+                             float((r * 11 + c * 19) % 31 - 15) * 0.012f;
+        }
+    }
+
+    std::vector<uint8_t> k_record(layout.tile_bytes, 0);
+    std::vector<uint8_t> v_record(layout.tile_bytes, 0);
+    llama_kvarn_quantize_k_tile(k.data(), 16, bits, layout, k_record.data());
+    llama_kvarn_quantize_v_tile(v.data(), 16, bits, layout, v_record.data());
+
+    std::vector<float> k_rot(128 * 128); // tile[dim*128 + token]
+    std::vector<float> v_rot(128 * 128); // tile[token*128 + dim]
+    llama_kvarn_dequantize_k_tile(k_record.data(), bits, layout, k_rot.data());
+    llama_kvarn_dequantize_v_tile(v_record.data(), bits, layout, v_rot.data());
+
+    // ---- K side: scores ----
+    std::vector<float> q(128);
+    for (int d = 0; d < 128; ++d) {
+        q[d] = std::sin(float(d) * 0.037f) + 0.25f * std::cos(float(d) * 0.0131f);
+    }
+    std::vector<float> rq = q;
+    llama_kvarn_hadamard_128(rq.data()); // R q
+
+    float k_max_abs = 0.0f, k_max_diff = 0.0f;
+    for (int c = 0; c < 128; ++c) {
+        std::array<float, 128> kcol;                         // K_rot[:,c]
+        for (int d = 0; d < 128; ++d) kcol[d] = k_rot[d * 128 + c];
+        std::array<float, 128> korig = kcol;                 // K_orig[:,c] = R * K_rot[:,c]
+        llama_kvarn_hadamard_128(korig.data());
+
+        double ref = 0.0, rot = 0.0;
+        for (int d = 0; d < 128; ++d) {
+            ref += double(q[d]) * double(korig[d]);          // Q . K_orig
+            rot += double(rq[d]) * double(kcol[d]);          // (R Q) . K_rot
+        }
+        k_max_abs  = std::max(k_max_abs, std::fabs(float(ref)));
+        k_max_diff = std::max(k_max_diff, std::fabs(float(ref - rot)));
+    }
+    require(k_max_diff < 1e-3f * (1.0f + k_max_abs), "K rotated-domain score mismatch");
+
+    // ---- V side: weighted output ----
+    std::vector<float> w(128);
+    double wsum = 0.0;
+    for (int t = 0; t < 128; ++t) { w[t] = 0.5f + 0.5f * std::sin(float(t) * 0.083f) + 0.01f * float(t); wsum += w[t]; }
+    for (int t = 0; t < 128; ++t) w[t] = float(w[t] / wsum);
+
+    std::array<float, 128> ref_o = {}; // sum_t w[t] * R(V_rot[t,:])
+    for (int t = 0; t < 128; ++t) {
+        std::array<float, 128> vorig;
+        for (int d = 0; d < 128; ++d) vorig[d] = v_rot[t * 128 + d];
+        llama_kvarn_hadamard_128(vorig.data());
+        for (int d = 0; d < 128; ++d) ref_o[d] += w[t] * vorig[d];
+    }
+    std::array<float, 128> o_rot = {}; // R( sum_t w[t] * V_rot[t,:] )
+    for (int t = 0; t < 128; ++t) {
+        for (int d = 0; d < 128; ++d) o_rot[d] += w[t] * v_rot[t * 128 + d];
+    }
+    llama_kvarn_hadamard_128(o_rot.data());
+
+    float v_max_abs = 0.0f, v_max_diff = 0.0f;
+    for (int d = 0; d < 128; ++d) {
+        v_max_abs  = std::max(v_max_abs, std::fabs(ref_o[d]));
+        v_max_diff = std::max(v_max_diff, std::fabs(ref_o[d] - o_rot[d]));
+    }
+    require(v_max_diff < 1e-3f * (1.0f + v_max_abs), "V rotated-domain output mismatch");
 }
 
 static ggml_backend_t init_test_backend(enum ggml_backend_dev_type device_type, bool required) {
@@ -721,6 +807,96 @@ static void test_materialize_generic_parity_gpu() {
     ggml_backend_free(backend);
 }
 
+// Validates the GPU/CPU rotated materialize kernel: emitting K_rot (skip the
+// inverse-WHT) and then applying R on the host must reproduce the normal
+// materialize output (X_orig = R*K_rot). The same store feeds both, so this
+// holds for sink/record/stage groups alike.
+static void test_materialize_rotated_parity(enum ggml_backend_dev_type device_type, bool required) {
+    ggml_backend_t backend = init_test_backend(device_type, required);
+    if (backend == nullptr) {
+        return;
+    }
+
+    const int bits = 4;
+    ggml_init_params params = {
+        /*.mem_size   =*/ 8 * 1024 * 1024,
+        /*.mem_buffer =*/ nullptr,
+        /*.no_alloc   =*/ true,
+    };
+    ggml_context * ctx = ggml_init(params);
+    require(ctx != nullptr, "rotated parity: failed to init ctx");
+
+    constexpr int n_stream = 1;
+    constexpr int kv_size = 512;
+    constexpr int n_groups_per_stream = kv_size / 128;
+    constexpr int n_tokens = 385;
+    constexpr int n_heads = 2;
+    const int record_bytes = int(llama_kvarn_packed_bytes(128 * 128, bits) + 3 * 128 * sizeof(ggml_fp16_t));
+
+    ggml_tensor * current = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 128, n_heads, n_tokens);
+    ggml_tensor * indices = ggml_new_tensor_1d(ctx, GGML_TYPE_I64, n_tokens);
+    ggml_tensor * stage = ggml_new_tensor_3d(ctx, GGML_TYPE_F16, 128, n_heads, 384 * n_stream);
+    ggml_tensor * records = ggml_new_tensor_3d(ctx, GGML_TYPE_I8, record_bytes, n_heads, n_groups_per_stream * n_stream);
+
+    ggml_tensor * stored = ggml_kvarn_store(ctx, current, indices, stage, records, bits, 16, false);
+    ggml_tensor * m_orig = ggml_kvarn_materialize(ctx, records, stored, indices, n_tokens, 0, n_stream, bits, false);
+    ggml_tensor * m_rot  = ggml_kvarn_materialize(ctx, records, stored, indices, n_tokens, 0, n_stream, bits, false);
+    m_rot->op_params[5] = 1; // emit rotated-domain values (skip inverse-WHT)
+
+    ggml_cgraph * graph = ggml_new_graph(ctx);
+    ggml_build_forward_expand(graph, m_orig);
+    ggml_build_forward_expand(graph, m_rot);
+
+    ggml_backend_buffer_t buffer = ggml_backend_alloc_ctx_tensors(ctx, backend);
+    require(buffer != nullptr, "rotated parity: failed to allocate tensors");
+
+    std::vector<float> input(128 * n_heads * n_tokens);
+    for (int t = 0; t < n_tokens; ++t) {
+        for (int h = 0; h < n_heads; ++h) {
+            for (int d = 0; d < 128; ++d) {
+                input[(size_t(t) * n_heads + h) * 128 + d] =
+                    std::sin(float(d) * 0.07f + float(h) * 0.13f) + std::cos(float(t) * 0.037f) +
+                    float((d * 13 + h * 7 + t * 17) % 31 - 15) * 0.01f;
+            }
+        }
+    }
+    std::vector<int64_t> idx(n_tokens);
+    for (int t = 0; t < n_tokens; ++t) idx[t] = t;
+    std::vector<uint8_t> zeros(std::max(ggml_nbytes(stage), ggml_nbytes(records)), 0);
+
+    ggml_backend_tensor_set(current, input.data(), 0, ggml_nbytes(current));
+    ggml_backend_tensor_set(indices, idx.data(), 0, ggml_nbytes(indices));
+    ggml_backend_tensor_set(stage, zeros.data(), 0, ggml_nbytes(stage));
+    ggml_backend_tensor_set(records, zeros.data(), 0, ggml_nbytes(records));
+
+    require(ggml_backend_graph_compute(backend, graph) == GGML_STATUS_SUCCESS, "rotated parity: graph compute failed");
+
+    std::vector<ggml_fp16_t> orig_h(ggml_nelements(m_orig));
+    std::vector<ggml_fp16_t> rot_h(ggml_nelements(m_rot));
+    ggml_backend_tensor_get(m_orig, orig_h.data(), 0, ggml_nbytes(m_orig));
+    ggml_backend_tensor_get(m_rot, rot_h.data(), 0, ggml_nbytes(m_rot));
+
+    double max_abs = 0.0, max_diff = 0.0;
+    std::array<float, 128> buf;
+    for (int t = 0; t < n_tokens; ++t) {
+        for (int h = 0; h < n_heads; ++h) {
+            const size_t base = (size_t(t) * n_heads + h) * 128;
+            for (int d = 0; d < 128; ++d) buf[d] = ggml_fp16_to_fp32(rot_h[base + d]);
+            llama_kvarn_hadamard_128(buf.data());
+            for (int d = 0; d < 128; ++d) {
+                const float ref = ggml_fp16_to_fp32(orig_h[base + d]);
+                max_abs  = std::max(max_abs, double(std::fabs(ref)));
+                max_diff = std::max(max_diff, double(std::fabs(ref - buf[d])));
+            }
+        }
+    }
+    require(max_diff < 5e-2 * (1.0 + max_abs), "rotated materialize != inverse-WHT of normal materialize");
+
+    ggml_backend_buffer_free(buffer);
+    ggml_free(ctx);
+    ggml_backend_free(backend);
+}
+
 int main() {
     ggml_backend_load_all();
 
@@ -736,6 +912,7 @@ int main() {
     test_pack_roundtrip(6);
     test_pack_roundtrip(8);
     test_hadamard_roundtrip();
+    test_rotated_domain_equivalence();
 
     for (size_t i = 0; i < llama_kvarn_type_count(); ++i) {
         const llama_kvarn_type type = (llama_kvarn_type) i;
@@ -752,6 +929,8 @@ int main() {
     test_cache_ops_multi_stream(GGML_BACKEND_DEVICE_TYPE_GPU, false, 6);
     test_store_legacy_parity_gpu();
     test_materialize_generic_parity_gpu();
+    test_materialize_rotated_parity(GGML_BACKEND_DEVICE_TYPE_CPU, true);
+    test_materialize_rotated_parity(GGML_BACKEND_DEVICE_TYPE_GPU, false);
 
     std::printf("test-kvarn: all tests OK\n");
     return 0;

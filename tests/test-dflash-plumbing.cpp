@@ -105,6 +105,7 @@ int main(int argc, char ** argv) {
     const std::string context_cpp = read_file(root + "/src/llama-context.cpp");
     const std::string kv_cache_h = read_file(root + "/src/llama-kv-cache.h");
     const std::string kv_cache_cpp = read_file(root + "/src/llama-kv-cache.cpp");
+    const std::string kv_cache_kvarn_h = read_file(root + "/src/llama-kv-cache-kvarn.h");
     const std::string kv_cache_kvarn_cpp = read_file(root + "/src/llama-kv-cache-kvarn.cpp");
     const std::string kv_cache_iswa_cpp = read_file(root + "/src/llama-kv-cache-iswa.cpp");
     const std::string kv_cache_dsa_cpp = read_file(root + "/src/llama-kv-cache-dsa.cpp");
@@ -2724,6 +2725,17 @@ int main(int argc, char ** argv) {
     ok &= expect(cuda_fattn_kvarn.find("extern __shared__ half tile[]") == std::string::npos &&
                  cuda_fattn_kvarn.find("FATTN_KVARN_TILE_VALUES * sizeof(half)") == std::string::npos,
         "CUDA KVarN native attention must not stage full 128x128 K/V tiles in dynamic shared memory");
+    ok &= expect(graph_cpp.find("GGML_KVARN_ROTATED_FA") != std::string::npos &&
+                 graph_cpp.find("kvarn_rotated_fa_enabled") != std::string::npos &&
+                 graph_cpp.find("get_k_rotated") != std::string::npos &&
+                 graph_cpp.find("get_v_rotated") != std::string::npos &&
+                 graph_cpp.find("self_kvarn_rot") != std::string::npos &&
+                 graph_cpp.find("ggml_mul_mat_aux(ctx0, q, inp->self_kvarn_rot)") != std::string::npos &&
+                 graph_cpp.find("ggml_mul_mat_aux(ctx0, cur, inp->self_kvarn_rot)") != std::string::npos &&
+                 kv_cache_kvarn_h.find("build_input_kvarn_rot") != std::string::npos &&
+                 kv_cache_kvarn_cpp.find("result->op_params[5] = emit_rotated ? 1 : 0") != std::string::npos &&
+                 cuda_fattn_kvarn.find("ggml_get_op_params_i32(k_mat, 5) != 0") != std::string::npos,
+        "KVarN rotated-domain FA must be graph-gated, use rotated materialize accessors, rotate Q/output exactly once, and be rejected by native KVarN FA");
 
     return ok ? 0 : 1;
 }

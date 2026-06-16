@@ -8,6 +8,7 @@
 #include "llama-model.h"
 
 #include <algorithm>
+#include <cmath>
 #include <cstring>
 #include <limits>
 #include <map>
@@ -104,6 +105,24 @@ int32_t kvarn_contiguous_tokens_per_stream_hint(const llama_kv_cache::slot_info 
     return (int32_t) n_tokens;
 }
 
+void kvarn_gen_hadamard_128(std::vector<float> & data) {
+    constexpr int n = 128;
+    data.assign(n * n, 0.0f);
+    data[0] = 1.0f / std::sqrt(float(n));
+
+    for (int s = 1; s < n; s *= 2) {
+        for (int i = 0; i < s; ++i) {
+            for (int j = 0; j < s; ++j) {
+                const float val = data[i * n + j];
+
+                data[(i + s) * n + j]       =  val;
+                data[i * n + (j + s)]       =  val;
+                data[(i + s) * n + (j + s)] = -val;
+            }
+        }
+    }
+}
+
 } // namespace
 
 llama_kv_cache_kvarn_context::llama_kv_cache_kvarn_context(
@@ -176,6 +195,18 @@ ggml_tensor * llama_kv_cache_kvarn_context::get_v(ggml_context * ctx, int32_t il
     return cache->materialize(ctx, it->second, il, get_n_kv(), current_sinfo(), true);
 }
 
+ggml_tensor * llama_kv_cache_kvarn_context::get_k_rotated(ggml_context * ctx, int32_t il) const {
+    const auto it = stored_k.find(cache->mapped_layer_id(il));
+    GGML_ASSERT(it != stored_k.end());
+    return cache->materialize(ctx, it->second, il, get_n_kv(), current_sinfo(), false, true);
+}
+
+ggml_tensor * llama_kv_cache_kvarn_context::get_v_rotated(ggml_context * ctx, int32_t il) const {
+    const auto it = stored_v.find(cache->mapped_layer_id(il));
+    GGML_ASSERT(it != stored_v.end());
+    return cache->materialize(ctx, it->second, il, get_n_kv(), current_sinfo(), true, true);
+}
+
 ggml_tensor * llama_kv_cache_kvarn_context::get_turbo_rotation() const {
     return nullptr;
 }
@@ -228,6 +259,13 @@ ggml_tensor * llama_kv_cache_kvarn_context::build_input_v_rot(ggml_context * ctx
     return base()->build_input_v_rot(ctx);
 }
 
+ggml_tensor * llama_kv_cache_kvarn_context::build_input_kvarn_rot(ggml_context * ctx) const {
+    ggml_tensor * res = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, KVAR_N_GROUP, KVAR_N_GROUP);
+    ggml_set_input(res);
+    ggml_set_name(res, "attn_inp_kvarn_rot");
+    return res;
+}
+
 void llama_kv_cache_kvarn_context::set_input_k_idxs(ggml_tensor * dst, const llama_ubatch * ubatch) const {
     base()->set_input_k_idxs(dst, ubatch);
 }
@@ -273,6 +311,15 @@ void llama_kv_cache_kvarn_context::set_input_k_rot_backend(ggml_tensor * dst) co
 
 void llama_kv_cache_kvarn_context::set_input_v_rot_backend(ggml_tensor * dst) const {
     base()->set_input_v_rot_backend(dst);
+}
+
+void llama_kv_cache_kvarn_context::set_input_kvarn_rot(ggml_tensor * dst) const {
+    GGML_ASSERT(ggml_backend_buffer_is_host(dst->buffer));
+    GGML_ASSERT(dst->type == GGML_TYPE_F32 && dst->ne[0] == KVAR_N_GROUP && dst->ne[1] == KVAR_N_GROUP);
+
+    std::vector<float> data;
+    kvarn_gen_hadamard_128(data);
+    memcpy(dst->data, data.data(), ggml_nbytes(dst));
 }
 
 llama_kv_cache_kvarn::llama_kv_cache_kvarn(
@@ -928,7 +975,8 @@ ggml_tensor * llama_kv_cache_kvarn::materialize(
         int32_t il,
         uint32_t n_kv,
         const llama_kv_cache::slot_info & sinfo,
-        bool value) const {
+        bool value,
+        bool emit_rotated) const {
     const auto & layer = layer_for(il);
     const uint32_t stream_start = sinfo.s0;
     const uint32_t stream_count = sinfo.s1 - sinfo.s0 + 1;
@@ -943,6 +991,7 @@ ggml_tensor * llama_kv_cache_kvarn::materialize(
         stream_count,
         value ? params.value_bits : params.key_bits,
         value);
+    result->op_params[5] = emit_rotated ? 1 : 0;
     const uint32_t slices = value ? layer.v_slices : layer.k_slices;
     if (slices > 1) {
         result = ggml_reshape_4d(

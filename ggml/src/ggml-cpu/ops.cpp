@@ -11505,6 +11505,7 @@ void ggml_compute_forward_kvarn_materialize(const ggml_compute_params * params, 
     const bool value = ggml_get_op_params_i32(dst, 1) != 0;
     const int64_t stream_start = ggml_get_op_params_i32(dst, 2);
     const int64_t n_stream = ggml_get_op_params_i32(dst, 3);
+    const bool emit_rotated = ggml_get_op_params_i32(dst, 5) != 0;
     const int64_t n_heads = dst->ne[1];
     const int64_t n_kv = dst->ne[2];
     const int64_t * idx_data = (const int64_t *) indices->data;
@@ -11548,7 +11549,9 @@ void ggml_compute_forward_kvarn_materialize(const ggml_compute_params * params, 
                     rotated[d] = kvarn_cpu_record_value(record, bits, value, pos, d);
                 }
             }
-            kvarn_cpu_hadamard(rotated);
+            if (!emit_rotated) {
+                kvarn_cpu_hadamard(rotated);
+            }
             for (int d = 0; d < 128; ++d) {
                 char * out = (char *) dst->data + d * dst->nb[0] + h * dst->nb[1] + t * dst->nb[2] + out_stream * dst->nb[3];
                 *(ggml_fp16_t *) out = ggml_fp32_to_fp16(rotated[d]);
