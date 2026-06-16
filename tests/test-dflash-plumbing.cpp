@@ -175,6 +175,7 @@ int main(int argc, char ** argv) {
     const std::string cuda_set_rows = read_file(root + "/ggml/src/ggml-cuda/set-rows.cu");
     const std::string cuda_fattn_common = read_file(root + "/ggml/src/ggml-cuda/fattn-common.cuh");
     const std::string cuda_fattn_vec = read_file(root + "/ggml/src/ggml-cuda/fattn-vec.cuh");
+    const std::string cuda_fattn_kvarn = read_file(root + "/ggml/src/ggml-cuda/fattn-kvarn.cuh");
     const std::string cuda_turbo_quant = read_file(root + "/ggml/src/ggml-cuda/turbo-quant-cuda.cuh");
     const std::string cuda_cmake = read_file(root + "/ggml/src/ggml-cuda/CMakeLists.txt");
     const std::string cuda_fattn_h = read_file(root + "/ggml/src/ggml-cuda/fattn.cuh");
@@ -2708,6 +2709,12 @@ int main(int argc, char ** argv) {
                  ggml_cuda_kvarn.find("kvarn_store_kernel_lowshmem") != std::string::npos &&
                  ggml_cuda_kvarn.find("GGML_KVARN_FORCE_LOW_SHMEM") != std::string::npos,
         "CUDA/HIP KVarN store must keep the high-shared-memory path and provide a force-testable low-shared-memory path");
+    ok &= expect(cuda_fattn_kvarn.find("flash_attn_ext_kvarn_tiled") != std::string::npos &&
+                 cuda_fattn_kvarn.find("FATTN_KVARN_MAX_D") != std::string::npos &&
+                 cuda_fattn_kvarn.find("GGML_KVARN_FUSED_REQUIRE") != std::string::npos &&
+                 cuda_fattn_kvarn.find("k_bits == 4 && v_bits == 4") == std::string::npos &&
+                 cuda_fattn_kvarn.find("Q->ne[0] != FATTN_KVARN_D256") == std::string::npos,
+        "CUDA KVarN fused attention must use a tiled multi-D/multi-bit kernel instead of the old D=256 k4/v4 scalar-load prototype");
 
     return ok ? 0 : 1;
 }

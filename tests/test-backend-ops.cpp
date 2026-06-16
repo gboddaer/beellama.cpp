@@ -7437,6 +7437,142 @@ struct test_kvarn_materialize_only : public test_case {
     }
 };
 
+struct test_kvarn_flash_attn_ext : public test_case {
+    int  head_dim;
+    int  bits_k;
+    int  bits_v;
+    int  n_q_heads;
+    int  n_kv_heads;
+    int  n_kv;
+    int  n_stream;
+    bool mask;
+    bool stress_max;
+
+    test_kvarn_flash_attn_ext(
+            int head_dim,
+            int bits_k,
+            int bits_v,
+            int n_q_heads,
+            int n_kv_heads,
+            int n_kv,
+            int n_stream,
+            bool mask,
+            bool stress_max = false)
+        : head_dim(head_dim), bits_k(bits_k), bits_v(bits_v), n_q_heads(n_q_heads), n_kv_heads(n_kv_heads),
+          n_kv(n_kv), n_stream(n_stream), mask(mask), stress_max(stress_max) {}
+
+    std::string vars() override {
+        return VARS_TO_STR9(head_dim, bits_k, bits_v, n_q_heads, n_kv_heads, n_kv, n_stream, mask, stress_max);
+    }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        const int slices = head_dim / 128;
+        const int record_heads = n_kv_heads * slices;
+        const int groups_per_stream = test_kvarn_groups_per_stream(0, n_kv);
+
+        ggml_tensor * q = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, head_dim, 1, n_q_heads, n_stream);
+        ggml_set_name(q, "q");
+
+        ggml_tensor * indices = ggml_new_tensor_1d(ctx, GGML_TYPE_I64, (int64_t) n_kv * n_stream);
+        ggml_set_name(indices, "indices");
+
+        ggml_tensor * current_k = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 128, record_heads, (int64_t) n_kv * n_stream);
+        ggml_tensor * current_v = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 128, record_heads, (int64_t) n_kv * n_stream);
+        ggml_set_name(current_k, "current_k");
+        ggml_set_name(current_v, "current_v");
+
+        ggml_tensor * k_stage   = ggml_new_tensor_3d(ctx, GGML_TYPE_F16, 128, record_heads, 384 * n_stream);
+        ggml_tensor * v_stage   = ggml_new_tensor_3d(ctx, GGML_TYPE_F16, 128, record_heads, 384 * n_stream);
+        ggml_tensor * k_records = ggml_new_tensor_3d(ctx, GGML_TYPE_I8, test_kvarn_record_bytes(bits_k), record_heads, groups_per_stream * n_stream);
+        ggml_tensor * v_records = ggml_new_tensor_3d(ctx, GGML_TYPE_I8, test_kvarn_record_bytes(bits_v), record_heads, groups_per_stream * n_stream);
+        ggml_set_name(k_stage, "k_stage");
+        ggml_set_name(v_stage, "v_stage");
+        ggml_set_name(k_records, "k_records");
+        ggml_set_name(v_records, "v_records");
+
+        ggml_tensor * stored_k = ggml_kvarn_store(ctx, current_k, indices, k_stage, k_records, bits_k, 16, false);
+        ggml_tensor * stored_v = ggml_kvarn_store(ctx, current_v, indices, v_stage, v_records, bits_v, 16, true);
+        stored_k->op_params[3] = n_kv;
+        stored_v->op_params[3] = n_kv;
+
+        ggml_tensor * k_mat = ggml_kvarn_materialize(ctx, k_records, stored_k, indices, n_kv, 0, n_stream, bits_k, false);
+        ggml_tensor * v_mat = ggml_kvarn_materialize(ctx, v_records, stored_v, indices, n_kv, 0, n_stream, bits_v, true);
+        ggml_set_name(k_mat, "k_mat");
+        ggml_set_name(v_mat, "v_mat");
+
+        ggml_tensor * k = ggml_reshape_4d(ctx, k_mat, head_dim, n_kv_heads, n_kv, n_stream);
+        ggml_tensor * v = ggml_reshape_4d(ctx, v_mat, head_dim, n_kv_heads, n_kv, n_stream);
+        k = ggml_permute(ctx, k, 0, 2, 1, 3);
+        v = ggml_permute(ctx, v, 0, 2, 1, 3);
+
+        ggml_tensor * m = nullptr;
+        if (mask) {
+            m = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, n_kv, 1, 1, n_stream);
+            ggml_set_name(m, "m");
+        }
+
+        ggml_tensor * out = ggml_flash_attn_ext(ctx, q, k, v, m, 1.0f / sqrtf((float) head_dim), 0.0f, 0.0f);
+        ggml_flash_attn_ext_set_prec(out, GGML_PREC_F32);
+        ggml_set_name(out, "out");
+
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        const int slices = head_dim / 128;
+        const int record_heads = n_kv_heads * slices;
+        const int groups_per_stream = test_kvarn_groups_per_stream(0, n_kv);
+
+        if (stress_max) {
+            std::vector<float> q_data((size_t) head_dim * n_q_heads * n_stream);
+            for (int s = 0; s < n_stream; ++s) {
+                for (int h = 0; h < n_q_heads; ++h) {
+                    for (int d = 0; d < head_dim; ++d) {
+                        q_data[((size_t) s * n_q_heads + h) * head_dim + d] = 4.0f + 0.01f * float(d % 17);
+                    }
+                }
+            }
+            ggml_backend_tensor_set(ggml_get_tensor(ctx, "q"), q_data.data(), 0, q_data.size() * sizeof(float));
+
+            std::vector<float> k_data((size_t) 128 * record_heads * n_kv * n_stream);
+            for (int s = 0; s < n_stream; ++s) {
+                for (int t = 0; t < n_kv; ++t) {
+                    const float sign = t < 128 ? 1.0f : -1.0f;
+                    const int token = s * n_kv + t;
+                    for (int h = 0; h < record_heads; ++h) {
+                        for (int d = 0; d < 128; ++d) {
+                            k_data[((size_t) token * record_heads + h) * 128 + d] =
+                                sign * (12.0f + 0.02f * float((d + h) % 23));
+                        }
+                    }
+                }
+            }
+            ggml_backend_tensor_set(ggml_get_tensor(ctx, "current_k"), k_data.data(), 0, k_data.size() * sizeof(float));
+            test_kvarn_init_current(ggml_get_tensor(ctx, "current_v"), n_kv, n_stream, record_heads);
+        } else {
+            init_tensor_uniform(ggml_get_tensor(ctx, "q"), -0.125f, 0.125f);
+            test_kvarn_init_current(ggml_get_tensor(ctx, "current_k"), n_kv, n_stream, record_heads);
+            test_kvarn_init_current(ggml_get_tensor(ctx, "current_v"), n_kv, n_stream, record_heads);
+        }
+        test_kvarn_init_indices(ggml_get_tensor(ctx, "indices"), 0, n_kv, n_stream, groups_per_stream);
+        test_kvarn_zero_tensor(ggml_get_tensor(ctx, "k_stage"));
+        test_kvarn_zero_tensor(ggml_get_tensor(ctx, "v_stage"));
+        test_kvarn_zero_tensor(ggml_get_tensor(ctx, "k_records"));
+        test_kvarn_zero_tensor(ggml_get_tensor(ctx, "v_records"));
+        if (mask) {
+            init_tensor_kq_mask(ggml_get_tensor(ctx, "m"));
+        }
+    }
+
+    bool run_whole_graph() override {
+        return true;
+    }
+
+    double max_nmse_err() override {
+        return 2e-3;
+    }
+};
+
 
 enum llm_norm_type {
     LLM_NORM,
@@ -7996,6 +8132,14 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_kvarn_irregular_roundtrip(4, 1, 512, { 0, 3, 1, 4, 2, 5, 129, 128, 257, 256 }, "unified-interleaved", value));
         test_cases.emplace_back(new test_kvarn_store_only(4, 1, 512, 1, value));
     }
+    test_cases.emplace_back(new test_kvarn_flash_attn_ext(128, 4, 3, 2, 2, 512, 1, true));
+    test_cases.emplace_back(new test_kvarn_flash_attn_ext(128, 5, 4, 2, 2, 512, 1, true));
+    test_cases.emplace_back(new test_kvarn_flash_attn_ext(256, 4, 4, 2, 2, 512, 1, true));
+    test_cases.emplace_back(new test_kvarn_flash_attn_ext(384, 6, 5, 1, 1, 512, 1, true));
+    test_cases.emplace_back(new test_kvarn_flash_attn_ext(512, 8, 6, 1, 1, 512, 1, true));
+    test_cases.emplace_back(new test_kvarn_flash_attn_ext(128, 4, 3, 8, 2, 512, 1, true));
+    test_cases.emplace_back(new test_kvarn_flash_attn_ext(128, 4, 4, 4, 2, 512, 2, false));
+    test_cases.emplace_back(new test_kvarn_flash_attn_ext(128, 4, 3, 4, 1, 4096, 1, false, true));
 
     test_cases.emplace_back(new test_set_rows(GGML_TYPE_F32, GGML_TYPE_I64, { 1, 8, 1, 3 }, { 1, 1 }, 2, false));
     test_cases.emplace_back(new test_set_rows(GGML_TYPE_F32, GGML_TYPE_I32, { 1, 8, 1, 3 }, { 1, 1 }, 2, false));

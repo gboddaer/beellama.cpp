@@ -4,31 +4,19 @@
 #include "fattn-common.cuh"
 
 #include <cstdlib>
+#include <cstdint>
 
 static constexpr int FATTN_KVARN_DIM = 128;
-static constexpr int FATTN_KVARN_D256 = 256;
+static constexpr int FATTN_KVARN_MAX_D = 512;
 static constexpr int FATTN_KVARN_STAGE_GROUPS = 3;
+static constexpr int FATTN_KVARN_TILE_VALUES = FATTN_KVARN_DIM * FATTN_KVARN_DIM;
 
-static __device__ __forceinline__ uint8_t fattn_kvarn_unpack_record(const uint8_t * record, int index, int bits) {
-    if (bits == 4) {
-        const uint8_t packed = record[index >> 1];
-        return (packed >> ((index & 1) * 4)) & 0x0fu;
-    }
-    if (bits == 8) {
-        return record[index];
-    }
-    if (bits == 2) {
-        const uint8_t packed = record[index >> 2];
-        return (packed >> ((index & 3) * 2)) & 0x03u;
-    }
-
-    uint8_t value = 0;
-    const int bit_offset = index * bits;
-    for (int bit = 0; bit < bits; ++bit) {
-        const int absolute = bit_offset + bit;
-        value |= ((record[absolute >> 3] >> (absolute & 7)) & 1u) << bit;
-    }
-    return value;
+bool ggml_cuda_kvarn_fused_require_enabled() {
+    static const bool require = [] {
+        const char * env = std::getenv("GGML_KVARN_FUSED_REQUIRE");
+        return env != nullptr && env[0] != '\0' && std::atoi(env) != 0;
+    }();
+    return require;
 }
 
 static __device__ __forceinline__ void fattn_kvarn_wht_128(float * values, int tid) {
@@ -44,44 +32,6 @@ static __device__ __forceinline__ void fattn_kvarn_wht_128(float * values, int t
     }
     values[tid] *= 0.08838834764831845f;
     __syncthreads();
-}
-
-static __device__ __forceinline__ float fattn_kvarn_load(
-        const uint8_t * records,
-        const half * stage,
-        int n_record_heads,
-        int record_head,
-        int stream,
-        int groups_per_stream,
-        int record_bytes,
-        int live_group,
-        int token,
-        int dim,
-        int bits,
-        bool value) {
-    const int group = token / FATTN_KVARN_DIM;
-    const int pos = token - group * FATTN_KVARN_DIM;
-    const int stage_base = stream * FATTN_KVARN_DIM * FATTN_KVARN_STAGE_GROUPS;
-
-    if (group == 0 || (group > 0 && group <= live_group && group + 1 >= live_group)) {
-        const int stage_pos = stage_base + (group == 0 ? pos : FATTN_KVARN_DIM + ((group - 1) & 1) * FATTN_KVARN_DIM + pos);
-        return __half2float(stage[((int64_t) stage_pos * n_record_heads + record_head) * FATTN_KVARN_DIM + dim]);
-    }
-
-    if (group >= live_group || group >= groups_per_stream) {
-        return 0.0f;
-    }
-
-    const int record_group = stream * groups_per_stream + group;
-    const uint8_t * record = records + ((int64_t) record_group * n_record_heads + record_head) * record_bytes;
-    const int row = value ? pos : dim;
-    const int col = value ? dim : pos;
-    const int payload_bytes = FATTN_KVARN_DIM * FATTN_KVARN_DIM * bits / 8;
-    const half * scale_axis = (const half *) (record + payload_bytes);
-    const half * zp_axis = scale_axis + FATTN_KVARN_DIM;
-    const half * other_axis = zp_axis + FATTN_KVARN_DIM;
-    const uint8_t q = fattn_kvarn_unpack_record(record, row * FATTN_KVARN_DIM + col, bits);
-    return (q * __half2float(scale_axis[row]) + __half2float(zp_axis[row])) * __half2float(other_axis[col]);
 }
 
 static __global__ void fattn_kvarn_live_groups_kernel(
@@ -116,6 +66,8 @@ static __global__ void fattn_kvarn_live_groups_kernel(
     if (threadIdx.x == 0) {
         live_groups[out_stream] = partial[0];
     }
+
+    GGML_UNUSED(n_stream);
 }
 
 static __device__ __forceinline__ float fattn_kvarn_warp_sum(float v) {
@@ -132,7 +84,99 @@ static __device__ __forceinline__ float fattn_kvarn_warp_max(float v) {
     return v;
 }
 
-static __global__ void flash_attn_ext_kvarn_d256_k4v4(
+template<int BITS>
+static __device__ __forceinline__ uint8_t fattn_kvarn_unpack_chunk(uint64_t lo, uint64_t hi, int index) {
+    static_assert(BITS == 2 || BITS == 3 || BITS == 4 || BITS == 5 || BITS == 6 || BITS == 8, "unsupported KVarN bits");
+    constexpr uint64_t mask = (uint64_t(1) << BITS) - 1;
+    const int bit = index * BITS;
+    uint64_t value;
+    if (bit < 64) {
+        value = lo >> bit;
+        if (bit > 64 - BITS) {
+            value |= hi << (64 - bit);
+        }
+    } else {
+        value = hi >> (bit - 64);
+    }
+    return (uint8_t) (value & mask);
+}
+
+template<int BITS, bool VALUE>
+static __device__ __forceinline__ void fattn_kvarn_load_tile(
+        half * tile,
+        const uint8_t * records,
+        const half * stage,
+        int n_record_heads,
+        int record_head,
+        int stream,
+        int groups_per_stream,
+        int record_bytes,
+        int live_group,
+        int k0) {
+    const int tid = threadIdx.x;
+    const int group = k0 / FATTN_KVARN_DIM;
+    const int stage_base = stream * FATTN_KVARN_DIM * FATTN_KVARN_STAGE_GROUPS;
+
+    if (group == 0 || (group > 0 && group <= live_group && group + 1 >= live_group)) {
+        const int stage_group = group == 0 ? 0 : 1 + ((group - 1) & 1);
+        const int stage_pos_base = stage_base + stage_group * FATTN_KVARN_DIM;
+        for (int index = tid; index < FATTN_KVARN_TILE_VALUES; index += FATTN_KVARN_DIM) {
+            const int pos = index / FATTN_KVARN_DIM;
+            const int dim = index - pos * FATTN_KVARN_DIM;
+            tile[index] = stage[((int64_t) (stage_pos_base + pos) * n_record_heads + record_head) * FATTN_KVARN_DIM + dim];
+        }
+        __syncthreads();
+        return;
+    }
+
+    if (group >= live_group || group >= groups_per_stream) {
+        for (int index = tid; index < FATTN_KVARN_TILE_VALUES; index += FATTN_KVARN_DIM) {
+            tile[index] = __float2half(0.0f);
+        }
+        __syncthreads();
+        return;
+    }
+
+    const int record_group = stream * groups_per_stream + group;
+    const uint8_t * record = records + ((int64_t) record_group * n_record_heads + record_head) * record_bytes;
+    constexpr int payload_bytes = FATTN_KVARN_TILE_VALUES * BITS / 8;
+    const half * scale_axis = (const half *) (record + payload_bytes);
+    const half * zp_axis = scale_axis + FATTN_KVARN_DIM;
+    const half * other_axis = zp_axis + FATTN_KVARN_DIM;
+
+    const int row = tid;
+    const float scale = __half2float(scale_axis[row]);
+    const float zp = __half2float(zp_axis[row]);
+    for (int col_base = 0; col_base < FATTN_KVARN_DIM; col_base += 16) {
+        const int bit_offset = (row * FATTN_KVARN_DIM + col_base) * BITS;
+        const uint8_t * packed_ptr = record + (bit_offset >> 3);
+        constexpr int segment_bytes = 16 * BITS / 8;
+        uint64_t packed_lo = 0;
+        uint64_t packed_hi = 0;
+#pragma unroll
+        for (int b = 0; b < segment_bytes; ++b) {
+            if (b < 8) {
+                packed_lo |= uint64_t(packed_ptr[b]) << (8 * b);
+            } else {
+                packed_hi |= uint64_t(packed_ptr[b]) << (8 * (b - 8));
+            }
+        }
+
+#pragma unroll
+        for (int i = 0; i < 16; ++i) {
+            const int col = col_base + i;
+            const uint8_t q = fattn_kvarn_unpack_chunk<BITS>(packed_lo, packed_hi, i);
+            const float dequant = (q * scale + zp) * __half2float(other_axis[col]);
+            const int pos = VALUE ? row : col;
+            const int dim = VALUE ? col : row;
+            tile[pos * FATTN_KVARN_DIM + dim] = __float2half(dequant);
+        }
+    }
+    __syncthreads();
+}
+
+template<int D, int K_BITS, int V_BITS>
+static __global__ void flash_attn_ext_kvarn_tiled(
         const char * Q_ptr,
         const char * mask_ptr,
         const char * sinks_ptr,
@@ -166,6 +210,11 @@ static __global__ void flash_attn_ext_kvarn_d256_k4v4(
         int32_t ne33,
         int32_t nb31,
         int64_t nb33) {
+    static_assert(D >= FATTN_KVARN_DIM && D <= FATTN_KVARN_MAX_D && D % FATTN_KVARN_DIM == 0, "unsupported KVarN head dimension");
+    constexpr int SLICES = D / FATTN_KVARN_DIM;
+
+    extern __shared__ half tile[];
+
     const int tid = threadIdx.x;
     const int warp = tid >> 5;
     const int lane = tid & 31;
@@ -182,75 +231,74 @@ static __global__ void flash_attn_ext_kvarn_d256_k4v4(
     const half * maskh = mask_ptr ? (const half *) (mask_ptr + (int64_t) nb33 * (sequence % ne33) + (int64_t) nb31 * ic0) : nullptr;
     const float slope = get_alibi_slope(max_bias, head, n_head_log2, m0, m1);
 
-    __shared__ float q_rot[FATTN_KVARN_D256];
+    __shared__ float q_rot[D];
     __shared__ float scores[FATTN_KVARN_DIM];
     __shared__ float weights[FATTN_KVARN_DIM];
     __shared__ float warp_reduce[4];
     __shared__ float shared_scalar;
-    __shared__ float warp_partial[4][FATTN_KVARN_D256];
-    __shared__ float out_shared[FATTN_KVARN_D256];
+    __shared__ float out_shared[D];
 
-    q_rot[tid] = ((const float *) Q)[tid];
-    __syncthreads();
-    fattn_kvarn_wht_128(q_rot, tid);
-    q_rot[FATTN_KVARN_DIM + tid] = ((const float *) Q)[FATTN_KVARN_DIM + tid];
-    __syncthreads();
-    fattn_kvarn_wht_128(q_rot + FATTN_KVARN_DIM, tid);
-    q_rot[tid] *= scale;
-    q_rot[FATTN_KVARN_DIM + tid] *= scale;
-    __syncthreads();
+    for (int slice = 0; slice < SLICES; ++slice) {
+        q_rot[slice * FATTN_KVARN_DIM + tid] = ((const float *) Q)[slice * FATTN_KVARN_DIM + tid];
+        __syncthreads();
+        fattn_kvarn_wht_128(q_rot + slice * FATTN_KVARN_DIM, tid);
+        q_rot[slice * FATTN_KVARN_DIM + tid] *= scale;
+        out_shared[slice * FATTN_KVARN_DIM + tid] = 0.0f;
+        __syncthreads();
+    }
 
     float kq_max = -FLT_MAX / 2.0f;
     float kq_sum = 0.0f;
-    float out_local[8];
-#pragma unroll
-    for (int i = 0; i < 8; ++i) {
-        out_local[i] = 0.0f;
-    }
 
     const int kv_begin = ((int64_t) n_kv * split) / n_splits;
     const int kv_end   = ((int64_t) n_kv * (split + 1)) / n_splits;
     const int k0_begin = (kv_begin / FATTN_KVARN_DIM) * FATTN_KVARN_DIM;
     for (int k0 = k0_begin; k0 < kv_end; k0 += FATTN_KVARN_DIM) {
-        float warp_max = kq_max;
+        scores[tid] = 0.0f;
+        __syncthreads();
+
 #pragma unroll
-        for (int i = 0; i < 32; ++i) {
-            const int token = k0 + warp * 32 + i;
-            float sum = 0.0f;
-            if (token >= kv_begin && token < kv_end) {
+        for (int slice = 0; slice < SLICES; ++slice) {
+            const int record_head = kv_head * SLICES + slice;
+            fattn_kvarn_load_tile<K_BITS, false>(
+                    tile, k_records, k_stage, record_heads, record_head, stream,
+                    groups_per_stream, k_record_bytes, live_group, k0);
+
 #pragma unroll
-                for (int d = 0; d < FATTN_KVARN_DIM; d += 32) {
-                    const int dim = d + lane;
-                    const int rh = kv_head * 2;
-                    const float k = fattn_kvarn_load(k_records, k_stage, record_heads, rh, stream,
-                            groups_per_stream, k_record_bytes, live_group, token, dim, 4, false);
-                    sum += k * q_rot[dim];
+            for (int i = 0; i < 32; ++i) {
+                const int pos = warp * 32 + i;
+                const int token = k0 + pos;
+                float sum = 0.0f;
+                if (token >= kv_begin && token < kv_end) {
+#pragma unroll
+                    for (int d = 0; d < FATTN_KVARN_DIM; d += 32) {
+                        const int dim = d + lane;
+                        sum += __half2float(tile[pos * FATTN_KVARN_DIM + dim]) * q_rot[slice * FATTN_KVARN_DIM + dim];
+                    }
                 }
-#pragma unroll
-                for (int d = 0; d < FATTN_KVARN_DIM; d += 32) {
-                    const int dim = d + lane;
-                    const int rh = kv_head * 2 + 1;
-                    const float k = fattn_kvarn_load(k_records, k_stage, record_heads, rh, stream,
-                            groups_per_stream, k_record_bytes, live_group, token, dim, 4, false);
-                    sum += k * q_rot[FATTN_KVARN_DIM + dim];
+                sum = fattn_kvarn_warp_sum(sum);
+                if (lane == i) {
+                    scores[pos] += sum;
                 }
             }
-            sum = fattn_kvarn_warp_sum(sum);
-            if (logit_softcap != 0.0f) {
-                sum = logit_softcap * tanhf(sum);
-            }
-            if (maskh && token >= kv_begin && token < kv_end) {
-                sum += slope * __half2float(maskh[token]);
-            }
-            if (token < kv_begin || token >= kv_end) {
-                sum = -FLT_MAX / 2.0f;
-            }
-            warp_max = fmaxf(warp_max, sum + FATTN_KQ_MAX_OFFSET);
-            if (lane == i) {
-                scores[warp * 32 + i] = sum;
-            }
+            __syncthreads();
         }
 
+        const int token = k0 + tid;
+        float score = scores[tid];
+        if (logit_softcap != 0.0f) {
+            score = logit_softcap * tanhf(score);
+        }
+        if (maskh && token >= kv_begin && token < kv_end) {
+            score += slope * __half2float(maskh[token]);
+        }
+        if (token < kv_begin || token >= kv_end) {
+            score = -FLT_MAX / 2.0f;
+        }
+        scores[tid] = score;
+        __syncthreads();
+
+        float warp_max = fattn_kvarn_warp_max(score + FATTN_KQ_MAX_OFFSET);
         if (lane == 0) {
             warp_reduce[warp] = warp_max;
         }
@@ -258,6 +306,7 @@ static __global__ void flash_attn_ext_kvarn_d256_k4v4(
 
         float block_max = tid < 4 ? warp_reduce[tid] : -FLT_MAX / 2.0f;
         block_max = fattn_kvarn_warp_max(block_max);
+        block_max = fmaxf(block_max, kq_max);
         if (tid == 0) {
             shared_scalar = block_max;
         }
@@ -267,9 +316,8 @@ static __global__ void flash_attn_ext_kvarn_d256_k4v4(
         const float kq_max_scale = __expf(kq_max - kq_max_new);
         kq_max = kq_max_new;
         kq_sum *= kq_max_scale;
-#pragma unroll
-        for (int i = 0; i < 8; ++i) {
-            out_local[i] *= kq_max_scale;
+        for (int d = tid; d < D; d += FATTN_KVARN_DIM) {
+            out_shared[d] *= kq_max_scale;
         }
 
         const float w = __expf(scores[tid] - kq_max);
@@ -289,24 +337,23 @@ static __global__ void flash_attn_ext_kvarn_d256_k4v4(
         kq_sum += shared_scalar;
 
 #pragma unroll
-        for (int i = 0; i < 32; ++i) {
-            const int token = k0 + warp * 32 + i;
-            if (token < kv_begin || token >= kv_end) {
-                continue;
-            }
-            const float kq = weights[warp * 32 + i];
+        for (int slice = 0; slice < SLICES; ++slice) {
+            const int record_head = kv_head * SLICES + slice;
+            fattn_kvarn_load_tile<V_BITS, true>(
+                    tile, v_records, v_stage, record_heads, record_head, stream,
+                    groups_per_stream, v_record_bytes, live_group, k0);
+
+            float out = 0.0f;
 #pragma unroll
-            for (int j = 0; j < 8; ++j) {
-                const int out_dim = lane * 8 + j;
-                const int slice = out_dim >= FATTN_KVARN_DIM;
-                const int dim = out_dim - slice * FATTN_KVARN_DIM;
-                const int rh = kv_head * 2 + slice;
-                const float v = fattn_kvarn_load(v_records, v_stage, record_heads, rh, stream,
-                        groups_per_stream, v_record_bytes, live_group, token, dim, 4, true);
-                out_local[j] += kq * v;
+            for (int pos = 0; pos < FATTN_KVARN_DIM; ++pos) {
+                const int v_token = k0 + pos;
+                if (v_token >= kv_begin && v_token < kv_end) {
+                    out += weights[pos] * __half2float(tile[pos * FATTN_KVARN_DIM + tid]);
+                }
             }
+            out_shared[slice * FATTN_KVARN_DIM + tid] += out;
+            __syncthreads();
         }
-        __syncthreads();
     }
 
     if (sinks_ptr && split == 0) {
@@ -316,37 +363,27 @@ static __global__ void flash_attn_ext_kvarn_d256_k4v4(
         const float sink_w = __expf(sink - kq_max_new);
         kq_max = kq_max_new;
         kq_sum = kq_sum * kq_max_scale + sink_w;
-#pragma unroll
-        for (int i = 0; i < 8; ++i) {
-            out_local[i] *= kq_max_scale;
+        for (int d = tid; d < D; d += FATTN_KVARN_DIM) {
+            out_shared[d] *= kq_max_scale;
         }
+        __syncthreads();
     }
 
-#pragma unroll
-    for (int i = 0; i < 8; ++i) {
-        warp_partial[warp][lane * 8 + i] = out_local[i];
-    }
-    __syncthreads();
-
-    out_shared[tid] = warp_partial[0][tid] + warp_partial[1][tid] + warp_partial[2][tid] + warp_partial[3][tid];
-    out_shared[FATTN_KVARN_DIM + tid] =
-        (warp_partial[0][FATTN_KVARN_DIM + tid] + warp_partial[1][FATTN_KVARN_DIM + tid] +
-         warp_partial[2][FATTN_KVARN_DIM + tid] + warp_partial[3][FATTN_KVARN_DIM + tid]);
-    __syncthreads();
-
-    const int partial_stride = FATTN_KVARN_D256 + 2;
+    const int partial_stride = D + 2;
     float * partial_block = partial + ((((sequence * ne01 + ic0) * ne02 + head) * n_splits + split) * partial_stride);
     if (tid == 0) {
         partial_block[0] = kq_max;
         partial_block[1] = kq_sum;
     }
-    partial_block[2 + tid] = out_shared[tid];
-    partial_block[2 + FATTN_KVARN_DIM + tid] = out_shared[FATTN_KVARN_DIM + tid];
+    for (int d = tid; d < D; d += FATTN_KVARN_DIM) {
+        partial_block[2 + d] = out_shared[d];
+    }
 
     GGML_UNUSED(ne03);
 }
 
-static __global__ void flash_attn_ext_kvarn_d256_combine(
+template<int D>
+static __global__ void flash_attn_ext_kvarn_combine(
         const float * partial,
         float * dst,
         int32_t ne01,
@@ -356,9 +393,9 @@ static __global__ void flash_attn_ext_kvarn_d256_combine(
     const int ic0 = blockIdx.x;
     const int sequence = blockIdx.z / ne02;
     const int head = blockIdx.z - sequence * ne02;
-    const int partial_stride = FATTN_KVARN_D256 + 2;
+    const int partial_stride = D + 2;
 
-    __shared__ float out_shared[FATTN_KVARN_D256];
+    __shared__ float out_shared[D];
     __shared__ float split_scale[32];
     __shared__ float shared_sum;
 
@@ -380,25 +417,23 @@ static __global__ void flash_attn_ext_kvarn_d256_combine(
     }
     __syncthreads();
 
-    float out0 = 0.0f;
-    float out1 = 0.0f;
-    for (int split = 0; split < n_splits; ++split) {
-        const float * partial_block = partial + ((((sequence * ne01 + ic0) * ne02 + head) * n_splits + split) * partial_stride);
-        const float scale = split_scale[split];
-        out0 += partial_block[2 + tid] * scale;
-        out1 += partial_block[2 + FATTN_KVARN_DIM + tid] * scale;
+    for (int d = tid; d < D; d += FATTN_KVARN_DIM) {
+        float out = 0.0f;
+        for (int split = 0; split < n_splits; ++split) {
+            const float * partial_block = partial + ((((sequence * ne01 + ic0) * ne02 + head) * n_splits + split) * partial_stride);
+            out += partial_block[2 + d] * split_scale[split];
+        }
+        out_shared[d] = out / shared_sum;
     }
-
-    out_shared[tid] = out0 / shared_sum;
-    out_shared[FATTN_KVARN_DIM + tid] = out1 / shared_sum;
     __syncthreads();
 
-    fattn_kvarn_wht_128(out_shared, tid);
-    dst[((sequence * ne01 + ic0) * ne02 + head) * FATTN_KVARN_D256 + tid] = out_shared[tid];
-    __syncthreads();
-    fattn_kvarn_wht_128(out_shared + FATTN_KVARN_DIM, tid);
-    dst[((sequence * ne01 + ic0) * ne02 + head) * FATTN_KVARN_D256 + FATTN_KVARN_DIM + tid] =
-        out_shared[FATTN_KVARN_DIM + tid];
+#pragma unroll
+    for (int slice = 0; slice < D / FATTN_KVARN_DIM; ++slice) {
+        fattn_kvarn_wht_128(out_shared + slice * FATTN_KVARN_DIM, tid);
+        dst[((sequence * ne01 + ic0) * ne02 + head) * D + slice * FATTN_KVARN_DIM + tid] =
+            out_shared[slice * FATTN_KVARN_DIM + tid];
+        __syncthreads();
+    }
 }
 
 static const ggml_tensor * ggml_cuda_kvarn_unwrap_fattn_src(const ggml_tensor * t) {
@@ -407,6 +442,10 @@ static const ggml_tensor * ggml_cuda_kvarn_unwrap_fattn_src(const ggml_tensor * 
         t = t->src[0];
     }
     return t;
+}
+
+static bool fattn_kvarn_bits_supported(int bits) {
+    return bits == 2 || bits == 3 || bits == 4 || bits == 5 || bits == 6 || bits == 8;
 }
 
 bool ggml_cuda_flash_attn_ext_kvarn_supported(const ggml_tensor * dst) {
@@ -421,10 +460,14 @@ bool ggml_cuda_flash_attn_ext_kvarn_supported(const ggml_tensor * dst) {
     const ggml_tensor * Q = dst->src[0];
     const ggml_tensor * K = dst->src[1];
     const ggml_tensor * V = dst->src[2];
+    const ggml_tensor * mask = dst->src[3];
+    const ggml_tensor * sinks = dst->src[4];
     if (Q == nullptr || K == nullptr || V == nullptr || Q->type != GGML_TYPE_F32 || dst->type != GGML_TYPE_F32) {
         return false;
     }
-    if (Q->ne[0] != FATTN_KVARN_D256 || K->ne[0] != FATTN_KVARN_D256 || V->ne[0] != FATTN_KVARN_D256) {
+    const int head_dim = (int) Q->ne[0];
+    if (head_dim < FATTN_KVARN_DIM || head_dim > FATTN_KVARN_MAX_D || head_dim % FATTN_KVARN_DIM != 0 ||
+            K->ne[0] != head_dim || V->ne[0] != head_dim) {
         return false;
     }
     if (Q->ne[1] != 1 || K->ne[1] <= 0 || K->ne[2] <= 0 || Q->ne[2] % K->ne[2] != 0 || Q->ne[3] != K->ne[3]) {
@@ -433,13 +476,21 @@ bool ggml_cuda_flash_attn_ext_kvarn_supported(const ggml_tensor * dst) {
     if (V->ne[1] != K->ne[1] || V->ne[2] != K->ne[2] || V->ne[3] != K->ne[3]) {
         return false;
     }
+    if (mask != nullptr && mask->type != GGML_TYPE_F16) {
+        return false;
+    }
+    if (sinks != nullptr && (sinks->type != GGML_TYPE_F32 || sinks->ne[0] < Q->ne[2])) {
+        return false;
+    }
 
     const ggml_tensor * k_mat = ggml_cuda_kvarn_unwrap_fattn_src(K);
     const ggml_tensor * v_mat = ggml_cuda_kvarn_unwrap_fattn_src(V);
     if (k_mat == nullptr || v_mat == nullptr || k_mat->op != GGML_OP_KVARN_MATERIALIZE || v_mat->op != GGML_OP_KVARN_MATERIALIZE) {
         return false;
     }
-    if (ggml_get_op_params_i32(k_mat, 0) != 4 || ggml_get_op_params_i32(v_mat, 0) != 4) {
+    const int k_bits = ggml_get_op_params_i32(k_mat, 0);
+    const int v_bits = ggml_get_op_params_i32(v_mat, 0);
+    if (!fattn_kvarn_bits_supported(k_bits) || !fattn_kvarn_bits_supported(v_bits)) {
         return false;
     }
     if (ggml_get_op_params_i32(k_mat, 1) != 0 || ggml_get_op_params_i32(v_mat, 1) != 1) {
@@ -449,9 +500,15 @@ bool ggml_cuda_flash_attn_ext_kvarn_supported(const ggml_tensor * dst) {
             ggml_get_op_params_i32(k_mat, 3) != ggml_get_op_params_i32(v_mat, 3)) {
         return false;
     }
+
+    const ggml_tensor * k_records = k_mat->src[0];
+    const ggml_tensor * k_stage = k_mat->src[1];
     const ggml_tensor * k_indices = k_mat->src[2];
+    const ggml_tensor * v_records = v_mat->src[0];
+    const ggml_tensor * v_stage = v_mat->src[1];
     const ggml_tensor * v_indices = v_mat->src[2];
-    if (k_indices == nullptr || v_indices == nullptr ||
+    if (k_records == nullptr || k_stage == nullptr || k_indices == nullptr ||
+            v_records == nullptr || v_stage == nullptr || v_indices == nullptr ||
             k_indices->type != GGML_TYPE_I64 || v_indices->type != GGML_TYPE_I64 ||
             k_indices->ne[0] != v_indices->ne[0] ||
             k_indices->ne[1] != v_indices->ne[1] ||
@@ -459,15 +516,38 @@ bool ggml_cuda_flash_attn_ext_kvarn_supported(const ggml_tensor * dst) {
             k_indices->ne[3] != v_indices->ne[3]) {
         return false;
     }
-    if (k_mat->src[0]->ne[1] != K->ne[2] * 2 || v_mat->src[0]->ne[1] != V->ne[2] * 2) {
+
+    const int slices = head_dim / FATTN_KVARN_DIM;
+    if (k_records->ne[1] != K->ne[2] * slices || v_records->ne[1] != V->ne[2] * slices) {
+        return false;
+    }
+    if (k_stage->ne[0] != FATTN_KVARN_DIM || v_stage->ne[0] != FATTN_KVARN_DIM ||
+            k_stage->ne[1] != k_records->ne[1] || v_stage->ne[1] != v_records->ne[1] ||
+            k_stage->ne[2] % (FATTN_KVARN_DIM * FATTN_KVARN_STAGE_GROUPS) != 0 ||
+            v_stage->ne[2] % (FATTN_KVARN_DIM * FATTN_KVARN_STAGE_GROUPS) != 0) {
+        return false;
+    }
+    if (k_stage->ne[2] != v_stage->ne[2]) {
         return false;
     }
     return true;
 }
 
-void ggml_cuda_flash_attn_ext_kvarn(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
-    GGML_ASSERT(ggml_cuda_flash_attn_ext_kvarn_supported(dst));
-
+template<int D, int K_BITS, int V_BITS>
+static void ggml_cuda_flash_attn_ext_kvarn_launch(
+        ggml_backend_cuda_context & ctx,
+        ggml_tensor * dst,
+        int n_splits,
+        int groups_per_stream,
+        int stream_start,
+        const int * live_groups,
+        float * partial,
+        float scale,
+        float max_bias,
+        float m0,
+        float m1,
+        uint32_t n_head_log2,
+        float logit_softcap) {
     const ggml_tensor * Q = dst->src[0];
     const ggml_tensor * K = dst->src[1];
     const ggml_tensor * V = dst->src[2];
@@ -478,9 +558,109 @@ void ggml_cuda_flash_attn_ext_kvarn(ggml_backend_cuda_context & ctx, ggml_tensor
 
     const ggml_tensor * k_records = k_mat->src[0];
     const ggml_tensor * k_stage = k_mat->src[1];
-    const ggml_tensor * indices = k_mat->src[2];
     const ggml_tensor * v_records = v_mat->src[0];
     const ggml_tensor * v_stage = v_mat->src[1];
+
+    cudaStream_t stream = ctx.stream();
+    const size_t tile_shared = FATTN_KVARN_TILE_VALUES * sizeof(half);
+#if defined(GGML_USE_HIP)
+    CUDA_CHECK(hipFuncSetAttribute(
+        reinterpret_cast<const void *>(&flash_attn_ext_kvarn_tiled<D, K_BITS, V_BITS>),
+        hipFuncAttributeMaxDynamicSharedMemorySize,
+        tile_shared));
+#elif !defined(GGML_USE_MUSA)
+    CUDA_CHECK(cudaFuncSetAttribute(
+        flash_attn_ext_kvarn_tiled<D, K_BITS, V_BITS>,
+        cudaFuncAttributeMaxDynamicSharedMemorySize,
+        tile_shared));
+#endif
+
+    const dim3 blocks((uint32_t) Q->ne[1], (uint32_t) n_splits, (uint32_t) (Q->ne[2] * Q->ne[3]));
+    const dim3 block_dim(FATTN_KVARN_DIM, 1, 1);
+    const ggml_cuda_kernel_launch_params launch_params(blocks, block_dim, tile_shared, stream);
+    ggml_cuda_kernel_launch(flash_attn_ext_kvarn_tiled<D, K_BITS, V_BITS>, launch_params,
+        (const char *) Q->data,
+        mask ? (const char *) mask->data : nullptr,
+        sinks ? (const char *) sinks->data : nullptr,
+        partial,
+        (const uint8_t *) k_records->data,
+        (const half *) k_stage->data,
+        (const uint8_t *) v_records->data,
+        (const half *) v_stage->data,
+        live_groups,
+        scale,
+        max_bias,
+        m0,
+        m1,
+        n_head_log2,
+        logit_softcap,
+        (int32_t) Q->ne[1],
+        (int32_t) Q->ne[2],
+        (int32_t) Q->ne[3],
+        (int32_t) Q->nb[1],
+        (int32_t) Q->nb[2],
+        (int32_t) Q->nb[3],
+        (int32_t) K->ne[1],
+        (int32_t) K->ne[2],
+        (int32_t) k_records->ne[1],
+        stream_start,
+        groups_per_stream,
+        (int32_t) k_records->ne[0],
+        (int32_t) v_records->ne[0],
+        (int32_t) n_splits,
+        mask ? (int32_t) mask->ne[1] : 0,
+        mask ? (int32_t) mask->ne[3] : 0,
+        mask ? (int32_t) mask->nb[1] : 0,
+        mask ? (int64_t) mask->nb[3] : 0);
+    CUDA_CHECK(cudaGetLastError());
+
+    const dim3 combine_blocks((uint32_t) Q->ne[1], 1, (uint32_t) (Q->ne[2] * Q->ne[3]));
+    const ggml_cuda_kernel_launch_params combine_params(combine_blocks, block_dim, 0, stream);
+    ggml_cuda_kernel_launch(flash_attn_ext_kvarn_combine<D>, combine_params,
+        partial,
+        (float *) dst->data,
+        (int32_t) Q->ne[1],
+        (int32_t) Q->ne[2],
+        (int32_t) n_splits);
+    CUDA_CHECK(cudaGetLastError());
+}
+
+#define GGML_CUDA_KVARN_DISPATCH_D(KB, VB)                            \
+    do {                                                               \
+        switch (head_dim) {                                            \
+            case 128: ggml_cuda_flash_attn_ext_kvarn_launch<128, KB, VB>(ctx, dst, n_splits, groups_per_stream, stream_start, live_groups.get(), partial.get(), scale, max_bias, m0, m1, n_head_log2, logit_softcap); break; \
+            case 256: ggml_cuda_flash_attn_ext_kvarn_launch<256, KB, VB>(ctx, dst, n_splits, groups_per_stream, stream_start, live_groups.get(), partial.get(), scale, max_bias, m0, m1, n_head_log2, logit_softcap); break; \
+            case 384: ggml_cuda_flash_attn_ext_kvarn_launch<384, KB, VB>(ctx, dst, n_splits, groups_per_stream, stream_start, live_groups.get(), partial.get(), scale, max_bias, m0, m1, n_head_log2, logit_softcap); break; \
+            case 512: ggml_cuda_flash_attn_ext_kvarn_launch<512, KB, VB>(ctx, dst, n_splits, groups_per_stream, stream_start, live_groups.get(), partial.get(), scale, max_bias, m0, m1, n_head_log2, logit_softcap); break; \
+            default: GGML_ABORT("unsupported KVarN fused attention head dimension"); \
+        }                                                              \
+    } while (0)
+
+#define GGML_CUDA_KVARN_DISPATCH_V(KB)                                 \
+    do {                                                               \
+        switch (v_bits) {                                              \
+            case 2: GGML_CUDA_KVARN_DISPATCH_D(KB, 2); break;          \
+            case 3: GGML_CUDA_KVARN_DISPATCH_D(KB, 3); break;          \
+            case 4: GGML_CUDA_KVARN_DISPATCH_D(KB, 4); break;          \
+            case 5: GGML_CUDA_KVARN_DISPATCH_D(KB, 5); break;          \
+            case 6: GGML_CUDA_KVARN_DISPATCH_D(KB, 6); break;          \
+            case 8: GGML_CUDA_KVARN_DISPATCH_D(KB, 8); break;          \
+            default: GGML_ABORT("unsupported KVarN fused attention V bits"); \
+        }                                                              \
+    } while (0)
+
+void ggml_cuda_flash_attn_ext_kvarn(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+    GGML_ASSERT(ggml_cuda_flash_attn_ext_kvarn_supported(dst));
+
+    const ggml_tensor * Q = dst->src[0];
+    const ggml_tensor * K = dst->src[1];
+    const ggml_tensor * k_mat = ggml_cuda_kvarn_unwrap_fattn_src(K);
+    const ggml_tensor * k_records = k_mat->src[0];
+    const ggml_tensor * k_stage = k_mat->src[1];
+    const ggml_tensor * indices = k_mat->src[2];
+    const int head_dim = (int) Q->ne[0];
+    const int k_bits = ggml_get_op_params_i32(k_mat, 0);
+    const int v_bits = ggml_get_op_params_i32(ggml_cuda_kvarn_unwrap_fattn_src(dst->src[2]), 0);
 
     const int stream_start = ggml_get_op_params_i32(k_mat, 2);
     const int n_stream = ggml_get_op_params_i32(k_mat, 3);
@@ -512,62 +692,33 @@ void ggml_cuda_flash_attn_ext_kvarn(ggml_backend_cuda_context & ctx, ggml_tensor
     const float m0 = powf(2.0f, -(max_bias) / n_head_log2);
     const float m1 = powf(2.0f, -(max_bias / 2.0f) / n_head_log2);
 
-    int n_splits = (int) ((K->ne[1] + 2047) / 2048);
+    // Split the KV/context dimension across enough CTAs to fill the GPU (FlashDecoding-style).
+    // The fused tile kernel runs at ~2 blocks/SM with the f16 tile, so target ~2 waves; cap at
+    // the number of context groups (avoids empty splits) and at 32 (combine split_scale[] size).
+    const int n_sm = ggml_cuda_info().devices[ggml_cuda_get_device()].nsm;
+    const int n_cta_base = (int) (Q->ne[2] * Q->ne[3]);
+    const int n_groups = (int) ((K->ne[1] + FATTN_KVARN_DIM - 1) / FATTN_KVARN_DIM);
+    int n_splits = (4 * n_sm + n_cta_base - 1) / n_cta_base;
     n_splits = n_splits < 1 ? 1 : n_splits;
-    n_splits = n_splits > 16 ? 16 : n_splits;
+    n_splits = n_splits > n_groups ? n_groups : n_splits;
+    n_splits = n_splits > 32 ? 32 : n_splits;
 
-    const int partial_stride = FATTN_KVARN_D256 + 2;
+    const int partial_stride = head_dim + 2;
     const size_t partial_count =
         (size_t) Q->ne[1] * (size_t) Q->ne[2] * (size_t) Q->ne[3] *
         (size_t) n_splits * (size_t) partial_stride;
     ggml_cuda_pool_alloc<float> partial(ctx.pool(), partial_count);
 
-    const dim3 blocks((uint32_t) Q->ne[1], (uint32_t) n_splits, (uint32_t) (Q->ne[2] * Q->ne[3]));
-    const dim3 block_dim(FATTN_KVARN_DIM, 1, 1);
-    const ggml_cuda_kernel_launch_params launch_params(blocks, block_dim, 0, stream);
-    ggml_cuda_kernel_launch(flash_attn_ext_kvarn_d256_k4v4, launch_params,
-        (const char *) Q->data,
-        mask ? (const char *) mask->data : nullptr,
-        sinks ? (const char *) sinks->data : nullptr,
-        partial.get(),
-        (const uint8_t *) k_records->data,
-        (const half *) k_stage->data,
-        (const uint8_t *) v_records->data,
-        (const half *) v_stage->data,
-        live_groups.get(),
-        scale,
-        max_bias,
-        m0,
-        m1,
-        n_head_log2,
-        logit_softcap,
-        (int32_t) Q->ne[1],
-        (int32_t) Q->ne[2],
-        (int32_t) Q->ne[3],
-        (int32_t) Q->nb[1],
-        (int32_t) Q->nb[2],
-        (int32_t) Q->nb[3],
-        (int32_t) K->ne[1],
-        (int32_t) K->ne[2],
-        (int32_t) k_records->ne[1],
-        stream_start,
-        groups_per_stream,
-        (int32_t) k_records->ne[0],
-        (int32_t) v_records->ne[0],
-        (int32_t) n_splits,
-        mask ? (int32_t) mask->ne[1] : 0,
-        mask ? (int32_t) mask->ne[3] : 0,
-        mask ? (int32_t) mask->nb[1] : 0,
-        mask ? (int64_t) mask->nb[3] : 0);
-    CUDA_CHECK(cudaGetLastError());
-
-    const dim3 combine_blocks((uint32_t) Q->ne[1], 1, (uint32_t) (Q->ne[2] * Q->ne[3]));
-    const ggml_cuda_kernel_launch_params combine_params(combine_blocks, block_dim, 0, stream);
-    ggml_cuda_kernel_launch(flash_attn_ext_kvarn_d256_combine, combine_params,
-        partial.get(),
-        (float *) dst->data,
-        (int32_t) Q->ne[1],
-        (int32_t) Q->ne[2],
-        (int32_t) n_splits);
-    CUDA_CHECK(cudaGetLastError());
+    switch (k_bits) {
+        case 2: GGML_CUDA_KVARN_DISPATCH_V(2); break;
+        case 3: GGML_CUDA_KVARN_DISPATCH_V(3); break;
+        case 4: GGML_CUDA_KVARN_DISPATCH_V(4); break;
+        case 5: GGML_CUDA_KVARN_DISPATCH_V(5); break;
+        case 6: GGML_CUDA_KVARN_DISPATCH_V(6); break;
+        case 8: GGML_CUDA_KVARN_DISPATCH_V(8); break;
+        default: GGML_ABORT("unsupported KVarN fused attention K bits");
+    }
 }
+
+#undef GGML_CUDA_KVARN_DISPATCH_V
+#undef GGML_CUDA_KVARN_DISPATCH_D
