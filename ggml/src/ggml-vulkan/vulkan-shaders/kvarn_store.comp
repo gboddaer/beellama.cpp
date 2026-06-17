@@ -11,6 +11,7 @@ layout(push_constant) uniform parameter {
     uint bits;
     uint iterations;
     uint value;
+    uint swa; // SWA sliding-window ring store (absolute-position indices, no group-0 sink)
 } p;
 
 layout(binding = 0, std430) readonly buffer Current { float data_current[]; };
@@ -71,7 +72,9 @@ void wht_128(uint lane) {
 float stage_matrix_value(uint head, uint stage_base, uint stage_group, uint row, uint col) {
     const uint token = p.value != 0 ? row : col;
     const uint dim = p.value != 0 ? col : row;
-    const uint stage_pos = stage_base + KVAR_N_DIM + (((stage_group - 1) & 1) * KVAR_N_DIM) + token;
+    // SWA: 3-deep ping-pong over absolute tiles; non-SWA: tile 0 sink + slots 1/2.
+    const uint stage_slot = p.swa != 0u ? (stage_group % KVAR_N_STAGE_GROUPS) : (1u + ((stage_group - 1u) & 1u));
+    const uint stage_pos = stage_base + stage_slot * KVAR_N_DIM + token;
     return load_stage_value(stage_pos, head, dim);
 }
 
@@ -240,24 +243,28 @@ void main() {
     for (uint token = 0; token < p.n_tokens; ++token) {
         const uint idx = read_index_low(token);
         const uint group_global = idx / KVAR_N_DIM;
-        const uint stream = group_global / p.groups_per_stream;
-        const uint group = group_global - stream * p.groups_per_stream;
         const uint pos = idx % KVAR_N_DIM;
-        if (stream >= p.n_stream || group >= p.groups_per_stream) {
+        // SWA: idx is the absolute token position; records form a ring (single
+        // stream) and there is no permanent group-0 sink.
+        const uint stream = p.swa != 0u ? 0u : group_global / p.groups_per_stream;
+        const uint group = p.swa != 0u ? group_global : group_global - stream * p.groups_per_stream;
+        if (stream >= p.n_stream || (p.swa == 0u && group >= p.groups_per_stream)) {
             return;
         }
 
         const uint stage_base = stream * KVAR_N_DIM * KVAR_N_STAGE_GROUPS;
-        if (group > 2 && pos == 0) {
-            const uint flush_group = group - 2;
-            const uint flush_record_group = stream * p.groups_per_stream + flush_group;
+        if (pos == 0 && (p.swa != 0u ? group >= 2u : group > 2u)) {
+            const uint flush_group = group - 2u;
+            const uint flush_ring = p.swa != 0u ? flush_group % p.groups_per_stream : flush_group;
+            const uint flush_record_group = stream * p.groups_per_stream + flush_ring;
             const uint record_base = (flush_record_group * p.n_heads + head) * p.record_words;
             quantize_stage(head, stage_base, flush_group, record_base, lane);
         }
 
         sh_wht[lane] = data_current[(token * p.n_heads + head) * KVAR_N_DIM + lane];
         wht_128(lane);
-        const uint stage_pos = stage_base + (group == 0 ? pos : KVAR_N_DIM + (((group - 1) & 1) * KVAR_N_DIM) + pos);
+        const uint stage_slot = p.swa != 0u ? (group % KVAR_N_STAGE_GROUPS) : (group == 0u ? 0u : 1u + ((group - 1u) & 1u));
+        const uint stage_pos = stage_base + stage_slot * KVAR_N_DIM + pos;
         store_stage_pair(stage_pos, head, lane);
         barrier();
     }

@@ -2891,13 +2891,15 @@ llm_graph_input_attn_kv_iswa * llm_graph_context::build_attn_inp_kv_iswa() const
 
     inp->self_k_rot_swa = mctx_cur->get_swa()->build_input_k_rot(ctx0);
     inp->self_v_rot_swa = mctx_cur->get_swa()->build_input_v_rot(ctx0);
-    if (!kvarn_force_materialize_enabled()) {
-        if (const auto * kvarn_swa = dynamic_cast<const llama_kv_cache_kvarn_context *>(mctx_cur->get_swa())) {
-            inp->self_kvarn_mat_idxs_swa = kvarn_swa->build_input_kvarn_mat_idxs(ctx0);
-            // make the materialize indices available to the context at graph build time
-            // (get_k/get_v/materialize run during build, before set_input populates them)
-            const_cast<llama_kv_cache_kvarn_context *>(kvarn_swa)->set_mat_idxs(inp->self_kvarn_mat_idxs_swa);
-        }
+    // SWA KVarN materialize needs per-cell positions on BOTH the rotated and the
+    // force-materialize (non-rotated) paths, so build them whenever the SWA cache
+    // is a KVarN cache — independent of kvarn_force_materialize_enabled(). Omitting
+    // them under force-materialize left mat_idxs null and crashed in materialize().
+    if (const auto * kvarn_swa = dynamic_cast<const llama_kv_cache_kvarn_context *>(mctx_cur->get_swa())) {
+        inp->self_kvarn_mat_idxs_swa = kvarn_swa->build_input_kvarn_mat_idxs(ctx0);
+        // make the materialize indices available to the context at graph build time
+        // (get_k/get_v/materialize run during build, before set_input populates them)
+        const_cast<llama_kv_cache_kvarn_context *>(kvarn_swa)->set_mat_idxs(inp->self_kvarn_mat_idxs_swa);
     }
 
     return (llm_graph_input_attn_kv_iswa *) res->add_input(std::move(inp));

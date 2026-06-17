@@ -414,7 +414,12 @@ llama_kv_cache_kvarn::llama_kv_cache_kvarn(
     hparams(hparams),
     params(params),
     n_stream(unified ? 1u : n_seq_max),
-    n_groups_per_stream((kv_size + KVAR_N_GROUP - 1) / KVAR_N_GROUP),
+    // SWA: the metadata window of up to kv_size cells spans kv_size/128 + 1 tiles
+    // (a sliding window is rarely tile-aligned), so the record ring needs 2 extra
+    // slots over the non-SWA count to represent the oldest in-window tile without
+    // a slot collision and to keep (live_group - group) < groups_per_stream.
+    n_groups_per_stream(((kv_size + KVAR_N_GROUP - 1) / KVAR_N_GROUP) +
+        ((n_swa > 0 && swa_type != LLAMA_SWA_TYPE_NONE) ? 2u : 0u)),
     swa(n_swa > 0 && swa_type != LLAMA_SWA_TYPE_NONE),
     metadata(std::make_unique<llama_kv_cache>(
         model,
@@ -437,6 +442,11 @@ llama_kv_cache_kvarn::llama_kv_cache_kvarn(
     GGML_ASSERT(swa || kv_size % KVAR_N_GROUP == 0);
     if (swa) {
         GGML_ASSERT(n_stream == 1 && "SWA KVarN ring requires a unified (single-stream) cache");
+        // Backstop for the ring-size invariant above: the record ring must have
+        // strictly more slots than the metadata window's worst-case tile span so
+        // the oldest in-window tile still materializes from records.
+        GGML_ASSERT(n_groups_per_stream > (kv_size + KVAR_N_GROUP - 1) / KVAR_N_GROUP &&
+            "SWA KVarN record ring is too small for the sliding window");
     }
 
     struct buft_comparator {

@@ -13,6 +13,7 @@ layout(push_constant) uniform parameter {
     uint value;
     uint n_indices;
     uint emit_rotated;
+    uint swa; // SWA sliding-window ring materialize (indices carry per-cell positions)
 } p;
 
 layout(binding = 0, std430) readonly buffer Records { uint data_records[]; };
@@ -59,10 +60,18 @@ float load_axis_value(uint record_base, uint payload_words, uint axis, uint inde
 uint compute_live_group(uint stream, uint lane) {
     uint live_group = 0;
     for (uint i = lane; i < p.n_indices; i += KVAR_N_DIM) {
-        const uint group_global = read_index_low(i) / KVAR_N_DIM;
-        const uint idx_stream = group_global / p.groups_per_stream;
-        if (idx_stream == stream) {
-            live_group = max(live_group, group_global - stream * p.groups_per_stream);
+        if (p.swa != 0u) {
+            // SWA ring: indices carry absolute positions; negative marks empty cells
+            const int v = int(read_index_low(i));
+            if (v >= 0) {
+                live_group = max(live_group, uint(v) / KVAR_N_DIM);
+            }
+        } else {
+            const uint group_global = read_index_low(i) / KVAR_N_DIM;
+            const uint idx_stream = group_global / p.groups_per_stream;
+            if (idx_stream == stream) {
+                live_group = max(live_group, group_global - stream * p.groups_per_stream);
+            }
         }
     }
 
@@ -111,16 +120,40 @@ void main() {
     const uint stream = p.stream_start + out_stream;
 
     const uint live_group = compute_live_group(stream, lane);
-    const uint group = token / KVAR_N_DIM;
-    const uint pos = token % KVAR_N_DIM;
     const uint stage_base = stream * KVAR_N_DIM * KVAR_N_STAGE_GROUPS;
 
+    uint group;
+    uint pos;
+    bool from_stage;
+    bool from_record;
+    if (p.swa != 0u) {
+        // SWA ring: one absolute position per output cell; negative => empty cell.
+        const int abs_pos = int(read_index_low(token));
+        if (abs_pos < 0) {
+            sh_wht[lane] = 0.0;
+            barrier();
+            store_dst_pair(out_stream, token, head, lane);
+            return;
+        }
+        group = uint(abs_pos) / KVAR_N_DIM;
+        pos = uint(abs_pos) % KVAR_N_DIM;
+        from_stage  = (group + 1u >= live_group) && (group <= live_group);
+        from_record = (!from_stage) && (group < live_group) && (live_group - group < p.groups_per_stream);
+    } else {
+        group = token / KVAR_N_DIM;
+        pos = token % KVAR_N_DIM;
+        from_stage  = group == 0u || (group > 0u && group <= live_group && group + 1u >= live_group);
+        from_record = (!from_stage) && group < live_group && group < p.groups_per_stream;
+    }
+
     float x = 0.0;
-    if (group == 0 || (group > 0 && group <= live_group && group + 1 >= live_group)) {
-        const uint stage_pos = stage_base + (group == 0 ? pos : KVAR_N_DIM + (((group - 1) & 1) * KVAR_N_DIM) + pos);
+    if (from_stage) {
+        const uint stage_slot = p.swa != 0u ? (group % KVAR_N_STAGE_GROUPS) : (group == 0u ? 0u : 1u + ((group - 1u) & 1u));
+        const uint stage_pos = stage_base + stage_slot * KVAR_N_DIM + pos;
         x = load_stage_value(stage_pos, head, lane);
-    } else if (group < live_group && group < p.groups_per_stream) {
-        const uint record_group = stream * p.groups_per_stream + group;
+    } else if (from_record) {
+        const uint ring = p.swa != 0u ? (group % p.groups_per_stream) : group;
+        const uint record_group = stream * p.groups_per_stream + ring;
         const uint record_base = (record_group * p.n_heads + head) * p.record_words;
         const uint row = p.value != 0 ? pos : lane;
         const uint col = p.value != 0 ? lane : pos;

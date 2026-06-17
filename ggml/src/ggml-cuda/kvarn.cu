@@ -1335,21 +1335,16 @@ static __global__ void kvarn_materialize_swa_kernel(
         return;
     }
 
-    // inverse WHT (128-dim) via shared-memory butterfly; mirrors kvarn_wht_128
+    // inverse WHT (128-dim): reuse the store path's shared-memory butterfly. It
+    // guards the butterfly to lanes < 64 (each lane handles one pair) and applies
+    // the 1/sqrt(128) normalization. Running the butterfly unguarded over all 128
+    // lanes (as an earlier inline version did) makes lanes 64..127 read/write
+    // sh[128..255] out of bounds on this float[128] array.
     __shared__ float sh[KVAR_N_DIM];
     sh[dim] = rotated;
-    __syncthreads();
-    for (int stride = 1; stride < KVAR_N_DIM; stride *= 2) {
-        const int j = (dim / stride) * (2 * stride) + (dim % stride);
-        const float a = sh[j];
-        const float b = sh[j + stride];
-        sh[j] = a + b;
-        sh[j + stride] = a - b;
-        __syncthreads();
-    }
-    const float out_val = sh[dim] * 0.08838834764831845f;
+    kvarn_wht_128(sh);
     half * out = dst + ((int64_t) cell * n_heads + head) * KVAR_N_DIM;
-    out[dim] = __float2half_rn(out_val);
+    out[dim] = __float2half_rn(sh[dim]);
 }
 
 template<int BITS, bool VALUE>
