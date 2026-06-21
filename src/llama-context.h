@@ -700,6 +700,11 @@ public:
     void set_dflash_consume_reduced(bool enabled);
     void set_dflash_n_slots(int n);
 
+    // DFlash: mark whether the drafter's normal KV cache is populated with
+    // TARGET context K/V. When false, full-attention DFlash layers fall back
+    // to fresh K/V projection from target_hidden.
+    void set_dflash_target_kv_available(bool avail);
+
     // DFlash: reset hidden-state capture for a fresh decode() call so the
     // eval callback accumulates across this call's ubatches
     void dflash_reset_hidden_capture();

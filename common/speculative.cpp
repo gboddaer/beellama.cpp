@@ -2574,6 +2574,12 @@ struct common_speculative_impl_dflash : public common_speculative_impl {
             llama_set_dflash_gpu_capture(ctx_tgt, false);
             LOG_WRN("dflash: GPU cross ring unavailable; using CPU hidden capture\n");
         }
+
+        // Full-attention DFlash layers may read target context from the drafter's
+        // normal KV cache only when the GPU cross ring can populate it. Vulkan
+        // CPU hidden capture has no such cache and must project K/V freshly from
+        // target_hidden in the drafter graph.
+        llama_set_dflash_target_kv_available(ctx_dft, gpu_ring_handle != nullptr);
     }
 
     ~common_speculative_impl_dflash() override {
@@ -3005,13 +3011,16 @@ struct common_speculative_impl_dflash : public common_speculative_impl {
             // build drafter batch: [id_last, mask, mask, ..., mask]
             // positions stay on the target model's absolute timeline so RoPE
             // tracks the accepted suffix instead of restarting at the window.
-            // batch size adapts to n_draft+1 (saves compute when n_max < block_size-1)
-            const int batch_len = n_draft + 1;
+            // DFlash attention is non-causal over the query block, so shorter
+            // n_draft+1 batches are not semantically equivalent to the trained
+            // full block. Decode the full block but consume only output_len rows.
+            const int batch_len = block_size;
+            const int output_len = n_draft + 1;
             const int draft_pos_base = committed_len;
             common_batch_clear(batch_dft);
             common_batch_add(batch_dft, id_last, draft_pos_base, { seq_id }, true);
             for (int i = 1; i < batch_len; ++i) {
-                common_batch_add(batch_dft, mask_token_id, draft_pos_base + i, { seq_id }, true);
+                common_batch_add(batch_dft, mask_token_id, draft_pos_base + i, { seq_id }, i < output_len);
             }
 
             const int64_t t2 = ggml_time_us();
@@ -3025,7 +3034,7 @@ struct common_speculative_impl_dflash : public common_speculative_impl {
 
             const int64_t t3 = ggml_time_us();
 
-            // read argmax tokens for positions 1..batch_len-1 (skip position 0 = staged_first)
+            // read argmax tokens for output positions 1..output_len-1 (skip position 0 = staged_first)
             {
                 int32_t * argmax = llama_get_logits_argmax(ctx_dft);
                 float * argmax_probs = llama_get_logits_argmax_probs(ctx_dft);
@@ -3033,7 +3042,7 @@ struct common_speculative_impl_dflash : public common_speculative_impl {
                 const int argmax_rows = llama_get_logits_argmax_n(ctx_dft);
                 if (argmax) {
                     const int n_vocab = llama_vocab_n_tokens(llama_model_get_vocab(model_dft));
-                    if (!common_dflash_argmax_shape_valid(__func__, argmax_rows, batch_len, K_flat)) {
+                    if (!common_dflash_argmax_shape_valid(__func__, argmax_rows, output_len, K_flat)) {
                         if (dp.draft_log_probs) {
                             dp.draft_log_probs->clear();
                         }
@@ -3042,21 +3051,21 @@ struct common_speculative_impl_dflash : public common_speculative_impl {
                     }
 
                     // GPU argmax path - only top-k ids/probs are transferred.
-                    for (int i = 1; i < batch_len && (int) result.size() < n_draft; ++i) {
+                    for (int i = 1; i < output_len && (int) result.size() < n_draft; ++i) {
                         const auto params = dp;
                         if (argmax_probs && p_min > 0.0f && (int) result.size() >= params.n_min) {
                             float log_prob = argmax_probs[i * K_flat];
                             float log_p_min = logf(p_min);
                             if (log_prob < log_p_min) {
                                 LOG_DBG("dflash: early stop at position %d/%d (prob %.3f < p_min %.3f)\n",
-                                        i, batch_len, expf(log_prob), p_min);
+                                        i, output_len, expf(log_prob), p_min);
                                 break;
                             }
                         }
                         const int32_t token_raw = argmax[i * K_flat];
                         if (!common_dflash_argmax_token_valid(token_raw, n_vocab)) {
                             const float score = argmax_probs ? argmax_probs[i * K_flat] : std::numeric_limits<float>::quiet_NaN();
-                            note_invalid_reduced_logits(__func__, token_raw, i, batch_len, K_flat,
+                            note_invalid_reduced_logits(__func__, token_raw, i, output_len, K_flat,
                                     committed_len, cross_len, -1, 0, score);
                             if (dp.draft_log_probs) {
                                 dp.draft_log_probs->clear();
@@ -3073,7 +3082,7 @@ struct common_speculative_impl_dflash : public common_speculative_impl {
                 } else {
                     // fallback: CPU argmax over full vocab
                     const int n_vocab_dft = llama_vocab_n_tokens(llama_model_get_vocab(model_dft));
-                    for (int i = 1; i < batch_len && (int) result.size() < n_draft; ++i) {
+                    for (int i = 1; i < output_len && (int) result.size() < n_draft; ++i) {
                         float * logits = llama_get_logits_ith(ctx_dft, i);
                         if (!logits) {
                             break;
@@ -4561,7 +4570,11 @@ void common_speculative_draft_batch(
     const llama_model * model_dft  = llama_get_model(ctx_dft);
     const int block_size           = llama_model_dflash_block_size(model_dft);
     const int n_draft              = std::min(block_size - 1, params.n_max);
-    const int batch_len            = n_draft + 1;
+    // Keep the full query block for flat/batched DFlash too. Tree drafting
+    // already does this; non-causal query attention makes shorter batches
+    // semantically different from the trained full block.
+    const int batch_len            = block_size;
+    const int output_len           = n_draft + 1;
     const llama_token mask_tok     = (llama_token) llama_model_dflash_mask_token_id(model_dft);
 
     const int64_t t0 = ggml_time_us();
@@ -4641,7 +4654,7 @@ void common_speculative_draft_batch(
     for (const auto & rs : ready) {
         common_batch_add(batch, id_last_per_spec[rs.spec_idx], rs.draft_pos_base, { rs.seq_id }, true);
         for (int i = 1; i < batch_len; i++) {
-            common_batch_add(batch, mask_tok, rs.draft_pos_base + i, { rs.seq_id }, true);
+            common_batch_add(batch, mask_tok, rs.draft_pos_base + i, { rs.seq_id }, i < output_len);
         }
     }
 
@@ -4664,11 +4677,11 @@ void common_speculative_draft_batch(
         auto & rs     = ready[r];
         auto & result = result_per_spec[rs.spec_idx];
         std::vector<float> * log_probs = log_probs_per_spec ? &(*log_probs_per_spec)[rs.spec_idx] : nullptr;
-        const int offset = r * batch_len;
+        const int offset = r * output_len;
 
         if (argmax) {
             const int n_vocab = llama_vocab_n_tokens(llama_model_get_vocab(model_dft));
-            if (!common_dflash_argmax_shape_valid(__func__, argmax_rows, n_ready * batch_len, K_flat)) {
+            if (!common_dflash_argmax_shape_valid(__func__, argmax_rows, n_ready * output_len, K_flat)) {
                 if (log_probs) {
                     log_probs->clear();
                 }
@@ -4676,7 +4689,7 @@ void common_speculative_draft_batch(
                 return;
             }
 
-            for (int i = 1; i < batch_len && (int) result.size() < n_draft; i++) {
+            for (int i = 1; i < output_len && (int) result.size() < n_draft; i++) {
                 if (argmax_probs && params.p_min > 0.0f && (int) result.size() >= params.n_min) {
                     float log_prob = argmax_probs[(offset + i) * K_flat];
                     if (log_prob < logf(params.p_min)) {
@@ -4687,7 +4700,7 @@ void common_speculative_draft_batch(
                 if (!common_dflash_argmax_token_valid(token_raw, n_vocab)) {
                     const float score = argmax_probs ? argmax_probs[(offset + i) * K_flat] : std::numeric_limits<float>::quiet_NaN();
                     auto * dfl = static_cast<common_speculative_impl_dflash *>(rs.impl);
-                    dfl->note_invalid_reduced_logits(__func__, token_raw, i, batch_len, K_flat,
+                    dfl->note_invalid_reduced_logits(__func__, token_raw, i, output_len, K_flat,
                             rs.draft_pos_base, rs.cross_len, rs.spec_idx, offset, score);
                     if (log_probs) {
                         log_probs->clear();
@@ -4703,7 +4716,7 @@ void common_speculative_draft_batch(
             }
         } else {
             const int n_vocab = llama_vocab_n_tokens(llama_model_get_vocab(model_dft));
-            for (int i = 1; i < batch_len && (int) result.size() < n_draft; i++) {
+            for (int i = 1; i < output_len && (int) result.size() < n_draft; i++) {
                 float * logits = llama_get_logits_ith(ctx_dft, offset + i);
                 if (!logits) {
                     break;

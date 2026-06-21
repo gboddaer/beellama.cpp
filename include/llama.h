@@ -1159,6 +1159,11 @@ extern "C" {
     // cache and forces a reserve on next decode.
     LLAMA_API void llama_set_dflash_n_slots(struct llama_context * ctx, int n);
 
+    // DFlash: mark whether the drafter's normal KV cache is populated with
+    // TARGET context K/V. Vulkan CPU-hidden capture does not populate it, so
+    // full-attention DFlash layers must use fresh K/V from target_hidden.
+    LLAMA_API void llama_set_dflash_target_kv_available(struct llama_context * ctx, bool avail);
+
     // DFlash: enable/disable tape recording for DeltaNet rollback
     // When enabled, the eval callback records per-token DeltaNet inputs (k, v, gate, beta)
     // during verification decode for efficient state replay instead of full re-evaluation

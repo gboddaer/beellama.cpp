@@ -68,6 +68,12 @@ struct llama_cparams {
     int  dflash_verify_topk = 1;
     bool dflash_reduced_consumer_active = false;
 
+    // DFlash drafter: true when the drafter's normal KV cache is populated
+    // with TARGET context K/V (via the GPU cross ring). When false (e.g.
+    // Vulkan CPU hidden capture), full-attention layers must project K/V
+    // freshly from target_hidden instead of reading an empty/stale KV cache.
+    bool dflash_target_kv_available = false;
+
     // DFlash: cross-attention window in tokens (how many target hidden states the drafter sees)
     int dflash_cross_ctx = 512;
 

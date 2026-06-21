@@ -880,8 +880,11 @@ llm_build_dflash_draft::llm_build_dflash_draft(
     // Full-attention draft layers consume accepted-prefix K/V from the normal
     // drafter KV cache. Sliding layers still read the current target-hidden
     // window directly because their context is already bounded by SWA.
+    // Only build this input when the cache is actually populated with TARGET
+    // context K/V. Vulkan CPU hidden capture has no GPU cross ring, so it must
+    // use the fresh K/V projection path below instead of reading an empty cache.
     llm_graph_input_attn_kv * inp_attn_kv_full = nullptr;
-    if (mctx) {
+    if (mctx && cparams.dflash_target_kv_available) {
         const bool rebind_base_from_iswa = hparams.swa_type != LLAMA_SWA_TYPE_NONE;
         const llama_kv_cache_context * base_ctx =
             rebind_base_from_iswa

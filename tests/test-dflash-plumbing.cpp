@@ -180,6 +180,27 @@ int main(int argc, char ** argv) {
                  cmake_root.find("CMAKE_CUDA_ARCHITECTURES=120") != std::string::npos,
         "CMake must fail loudly when users pass obsolete GGML_CUDA_ARCH instead of CMAKE_CUDA_ARCHITECTURES");
 
+    ok &= expect(llama_h.find("llama_set_dflash_target_kv_available") != std::string::npos &&
+                 context_h.find("void set_dflash_target_kv_available(bool avail)") != std::string::npos &&
+                 context_cpp.find("void llama_context::set_dflash_target_kv_available(bool avail)") != std::string::npos,
+        "DFlash must expose a target-KV availability flag for drafter graph selection");
+    ok &= expect(cparams_h.find("bool dflash_target_kv_available = false") != std::string::npos,
+        "DFlash target-KV availability must default false so Vulkan CPU-hidden capture avoids empty KV cache reads");
+    ok &= expect(speculative.find("llama_set_dflash_target_kv_available(ctx_dft, gpu_ring_handle != nullptr)") != std::string::npos,
+        "DFlash must mark target KV available only when the GPU cross ring exists");
+    ok &= expect(dflash_draft.find("if (mctx && cparams.dflash_target_kv_available)") != std::string::npos,
+        "DFlash full-attention layers must not read drafter target KV unless it was populated");
+    ok &= expect(context_cpp.find("linear_attn_qkv_mixed-") != std::string::npos &&
+                 context_cpp.find("qkv_mixed-") != std::string::npos,
+        "Qwen3Next DFlash tape capture must include pre-conv QKV tensor aliases for conv-state replay");
+    ok &= expect(speculative.find("const int batch_len = block_size;") != std::string::npos &&
+                 speculative.find("const int batch_len            = block_size;") != std::string::npos &&
+                 speculative.find("const int output_len = n_draft + 1;") != std::string::npos &&
+                 speculative.find("const int output_len           = n_draft + 1;") != std::string::npos,
+        "Flat DFlash drafting must decode the full block while consuming only the requested output rows");
+    ok &= expect(speculative.find("const int offset = r * output_len;") != std::string::npos,
+        "Batched flat DFlash reduced-logits offsets must use compact output rows");
+
     {
         const size_t zero_reuse_reset = server_context.find("n_past == 0");
         const size_t stale_ring_reset = server_context.find("common_speculative_discard_dflash_state(slot.get_spec(), nullptr)");
@@ -590,7 +611,7 @@ int main(int argc, char ** argv) {
                  arg_cpp.find("drafter doesn't need the full main ctx") != std::string::npos,
         "DFlash default -cd must stay at the production 256-token drafter context unless the user overrides it");
     ok &= expect(speculative.find("float * logits = llama_get_logits_ith(ctx_dft, i);") != std::string::npos, "DFlash flat draft fallback rows must preserve seed-token offset");
-    ok &= expect(speculative.find("const int offset = r * batch_len;") != std::string::npos, "DFlash batched draft argmax row offsets must preserve seed-token output rows");
+    ok &= expect(speculative.find("const int offset = r * output_len;") != std::string::npos, "DFlash batched draft argmax row offsets must use compact output rows after full-block drafting");
     ok &= expect(speculative.find("graph_reuse=%d") != std::string::npos, "DFlash draft profile must report drafter graph reuse");
     ok &= expect(context_cpp.find("output_reorder();\n    if (logits_argmax_buf.empty())") != std::string::npos, "argmax row access must honor output reordering");
     ok &= expect(context_cpp.find("std::swap(logits_argmax_buf") != std::string::npos, "output reordering must include reduced logits ids");

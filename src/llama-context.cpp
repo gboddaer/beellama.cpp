@@ -1767,6 +1767,16 @@ void llama_context::set_dflash_n_slots(int n) {
     gf_res_prev->reset();
 }
 
+void llama_context::set_dflash_target_kv_available(bool avail) {
+    if (cparams.dflash_target_kv_available == avail) {
+        return;
+    }
+    cparams.dflash_target_kv_available = avail;
+    // The drafter graph attention branch depends on this flag.
+    sched_need_reserve = true;
+    gf_res_prev->reset();
+}
+
 void llama_context::set_dflash_capture(const int32_t * layer_ids, int32_t n_layers) {
     if (layer_ids == nullptr || n_layers <= 0) {
         // Permanent deconfiguration: clear layer config and remove callback.
@@ -1994,6 +2004,11 @@ void llama_context::dflash_ensure_recurrent_setup() {
             dflash_capture->tape_name_map["gate-" + il_str]                   = {idx, DFLASH_TAPE_GATE};
             dflash_capture->tape_name_map["beta-" + il_str]                   = {idx, DFLASH_TAPE_BETA};
             dflash_capture->tape_name_map["qkv_mixed_pretranspose-" + il_str] = {idx, DFLASH_TAPE_QKV};
+            // Qwen3Next emits pre-conv QKV under these names. Without one of
+            // them, DFlash conv replay skips every recurrent layer and leaves
+            // r_l frozen at the pre-draft backup state.
+            dflash_capture->tape_name_map["linear_attn_qkv_mixed-" + il_str] = {idx, DFLASH_TAPE_QKV};
+            dflash_capture->tape_name_map["qkv_mixed-" + il_str]             = {idx, DFLASH_TAPE_QKV};
         }
     }
     dflash_capture->tape_layers.resize(dflash_capture->recurrent_layer_ids.size());
@@ -8587,6 +8602,10 @@ void llama_set_dflash_consume_reduced(llama_context * ctx, bool enabled) {
 
 void llama_set_dflash_n_slots(llama_context * ctx, int n) {
     ctx->set_dflash_n_slots(n);
+}
+
+void llama_set_dflash_target_kv_available(llama_context * ctx, bool avail) {
+    ctx->set_dflash_target_kv_available(avail);
 }
 
 void llama_set_tape_recording(llama_context * ctx, bool enable) {
