@@ -6028,7 +6028,26 @@ private:
                 int32_t * compact_argmax = llama_get_logits_argmax(ctx_tgt);
                 const int32_t compact_n = llama_get_logits_argmax_n(ctx_tgt);
                 const int compact_k = llama_get_logits_argmax_k(ctx_tgt);
-                if (compact_argmax != nullptr &&
+                // Value-sanity check: on backends that allocate the argmax buffer but
+                // don't implement GGML_OP_TOPK (e.g. Vulkan), the buffer is non-null
+                // with the right n/k but contains UNINITIALIZED garbage ids. The
+                // structural check below would pass and dflash_sample_reduced_verify
+                // would read garbage -> out-of-range bonus token. Validate that the
+                // first n_tokens*top_k ids are in [0, vocab_size); if not, treat as
+                // broken so the cycle falls back to full logits.
+                const int32_t vocab_size = llama_n_vocab(llama_model_get_vocab(llama_get_model(ctx_tgt)));
+                bool compact_argmax_valid = (compact_argmax != nullptr);
+                if (compact_argmax_valid) {
+                    const size_t n_check = (size_t) std::min<int32_t>(compact_n, n_tokens) * (size_t) std::max(1, compact_k);
+                    for (size_t v = 0; v < n_check; ++v) {
+                        const int32_t id = compact_argmax[v];
+                        if (id < 0 || id >= vocab_size) {
+                            compact_argmax_valid = false;
+                            break;
+                        }
+                    }
+                }
+                if (compact_argmax_valid &&
                         compact_n >= n_tokens &&
                         compact_k == dflash_verify_plan.top_k) {
                     dflash_reduced_verify_ready = true;
