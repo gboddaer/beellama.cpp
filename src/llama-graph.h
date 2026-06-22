@@ -93,6 +93,8 @@ struct llama_cross {
     const void * v_embd_gpu = nullptr;
     int64_t v_embd_gpu_n_enc_real = 0;
     void (*fn_set_tensor_d2d)(void * d_dst, const void * d_src, size_t offset, size_t size) = nullptr;
+    // Vulkan tensor-variant: resolves vk_buffer from ggml_tensor* (CUDA uses the raw variant above).
+    void (*fn_set_tensor_d2d_tensor)(ggml_tensor * d_dst, const void * d_src, size_t offset, size_t size) = nullptr;
 
     // Temporary DFlash K/V-update input. This lets the drafter-side projection
     // cache read newly committed hidden states without mutating the main cross
@@ -102,6 +104,7 @@ struct llama_cross {
     int64_t dflash_kv_update_n_embd = 0;
     int64_t dflash_kv_update_n_enc_real = 0;
     void (*dflash_kv_update_fn_set_tensor_d2d)(void * d_dst, const void * d_src, size_t offset, size_t size) = nullptr;
+    void (*dflash_kv_update_fn_set_tensor_d2d_tensor)(ggml_tensor * d_dst, const void * d_src, size_t offset, size_t size) = nullptr;
 
     // Per-seq cross buffers for DFlash multi-slot.
     // When non-empty, graph builders should pack these into target_hidden per slot

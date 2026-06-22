@@ -68,6 +68,9 @@ static ggml_backend_reg_t dflash_gpu_backend_reg() {
     if (!reg) {
         reg = ggml_backend_reg_by_name("ROCm");
     }
+    if (!reg) {
+        reg = ggml_backend_reg_by_name("Vulkan");
+    }
     return reg;
 }
 
@@ -242,6 +245,20 @@ llama_context::llama_context(
     if (cparams.n_rs_seq > 0 && !llm_arch_supports_rs_rollback(model.arch)) {
         LLAMA_LOG_DEBUG("%s: n_rs_seq=%u requested but model arch does not support recurrent partial rollback; clamping to 0\n",
                         __func__, cparams.n_rs_seq);
+        cparams.n_rs_seq = 0;
+    }
+    // QWEN35MOE workaround (DFlash regression on Vulkan): the DeltaNet recurrent-state
+    // RS-rollback snapshot builder (src/models/delta-net-base.cpp, the n_rs_seq>0 branch,
+    // tagged [TAG_RECURRENT_ROLLBACK_SPLITS]) assumes the last (n_rs_seq+1) tokens of a
+    // sequence are inside the same ubatch, which is incorrect under split_equal(). Raising
+    // n_rs_seq for the MoE (commit 9d09310cc) switched the 122B target from safe
+    // checkpoint-restore (n_rs_seq=0 -> use_ckpt_tgt=true, coherent) to the buggy RS partial
+    // rollback, corrupting the target output (garbage). Keep n_rs_seq=0 for QWEN35MOE so
+    // draft rejection uses checkpoint-restore (correct, slower) until the DeltaNet snapshot
+    // logic is fixed. QWEN35 dense (Qwen3.6) keeps n_rs_seq=8 because its RS path works.
+    if (cparams.n_rs_seq > 0 && model.arch == LLM_ARCH_QWEN35MOE) {
+        LLAMA_LOG_WARN("%s: n_rs_seq=%u clamped to 0 for QWEN35MOE (DeltaNet RS-rollback snapshot bug under split_equal; using checkpoint-restore for draft rejection)\n",
+                       __func__, cparams.n_rs_seq);
         cparams.n_rs_seq = 0;
     }
     cparams.ctx_type                = params.ctx_type;
@@ -4119,7 +4136,8 @@ std::unique_ptr<dflash_kv_cache_data> & llama_context::dflash_kv_cache_active_re
 
 void llama_context::set_cross_data_gpu(
         llama_seq_id seq_id, const void * d_staging, int cross_len,
-        int n_layers, int n_embd_layer, set_tensor_d2d_fn_t fn_d2d) {
+        int n_layers, int n_embd_layer, set_tensor_d2d_fn_t fn_d2d,
+        set_tensor_d2d_tensor_fn_t fn_d2d_tensor) {
     int64_t n_target_features = (int64_t)n_layers * n_embd_layer;
 
     const int64_t max_ctx = dflash_max_cross_ctx();
@@ -4135,12 +4153,13 @@ void llama_context::set_cross_data_gpu(
     cross.v_embd_gpu = d_staging;
     cross.v_embd_gpu_n_enc_real = cross_len;
     cross.fn_set_tensor_d2d = fn_d2d;
+    cross.fn_set_tensor_d2d_tensor = fn_d2d_tensor;
     cross.dflash_kv_cache = nullptr;
     if (seq_id >= 0) {
         dflash_kv_cache_active_seq = seq_id;
     }
 
-    const bool use_gpu_only = d_staging != nullptr && fn_d2d != nullptr && cparams.dflash_n_slots <= 1;
+    const bool use_gpu_only = d_staging != nullptr && (fn_d2d != nullptr || fn_d2d_tensor != nullptr) && cparams.dflash_n_slots <= 1;
     if (use_gpu_only) {
         std::vector<float>().swap(cross.v_embd);
     } else {
@@ -4736,8 +4755,9 @@ bool llama_context::dflash_kv_cache_update_gpu(
         int n_tokens,
         int n_layers,
         int n_embd_layer,
-        set_tensor_d2d_fn_t fn_d2d) {
-    if (!d_hidden || n_tokens <= 0 || n_layers <= 0 || n_embd_layer <= 0 || !fn_d2d) {
+        set_tensor_d2d_fn_t fn_d2d,
+        set_tensor_d2d_tensor_fn_t fn_d2d_tensor) {
+    if (!d_hidden || n_tokens <= 0 || n_layers <= 0 || n_embd_layer <= 0 || (!fn_d2d && !fn_d2d_tensor)) {
         return false;
     }
 
@@ -4750,6 +4770,7 @@ bool llama_context::dflash_kv_cache_update_gpu(
     cross.dflash_kv_update_n_embd = n_target_features;
     cross.dflash_kv_update_n_enc_real = n_tokens;
     cross.dflash_kv_update_fn_set_tensor_d2d = fn_d2d;
+    cross.dflash_kv_update_fn_set_tensor_d2d_tensor = fn_d2d_tensor;
 
     const bool ok = dflash_kv_cache_update(n_tokens);
 
@@ -4757,6 +4778,7 @@ bool llama_context::dflash_kv_cache_update_gpu(
     cross.dflash_kv_update_n_embd = 0;
     cross.dflash_kv_update_n_enc_real = 0;
     cross.dflash_kv_update_fn_set_tensor_d2d = nullptr;
+    cross.dflash_kv_update_fn_set_tensor_d2d_tensor = nullptr;
 
     return ok;
 }
@@ -4910,8 +4932,9 @@ bool llama_context::dflash_target_kv_cache_update_gpu(
         int n_tokens,
         int n_layers,
         int n_embd_layer,
-        set_tensor_d2d_fn_t fn_d2d) {
-    if (!d_hidden || n_tokens <= 0 || n_layers <= 0 || n_embd_layer <= 0 || !fn_d2d) {
+        set_tensor_d2d_fn_t fn_d2d,
+        set_tensor_d2d_tensor_fn_t fn_d2d_tensor) {
+    if (!d_hidden || n_tokens <= 0 || n_layers <= 0 || n_embd_layer <= 0 || (!fn_d2d && !fn_d2d_tensor)) {
         return false;
     }
     if (!llm_arch_is_dflash_drafter(model.arch) || !memory) {
@@ -5012,6 +5035,7 @@ bool llama_context::dflash_target_kv_cache_update_gpu(
     cross.dflash_kv_update_n_embd = n_target_features;
     cross.dflash_kv_update_n_enc_real = n_tokens;
     cross.dflash_kv_update_fn_set_tensor_d2d = fn_d2d;
+    cross.dflash_kv_update_fn_set_tensor_d2d_tensor = fn_d2d_tensor;
 
     const ggml_status status = [&] {
         res->set_inputs(&ubatch);
@@ -5022,6 +5046,7 @@ bool llama_context::dflash_target_kv_cache_update_gpu(
     cross.dflash_kv_update_n_embd = 0;
     cross.dflash_kv_update_n_enc_real = 0;
     cross.dflash_kv_update_fn_set_tensor_d2d = nullptr;
+    cross.dflash_kv_update_fn_set_tensor_d2d_tensor = nullptr;
 
     // Reused commit scratch lives on cudaStreamPerThread, while the graph runs on
     // the backend stream. Order those streams before this function returns so the
@@ -8671,13 +8696,17 @@ struct dflash_cross_ring_handle {
     bool   (*fn_snapshot)(void *, int, int, int, float *, int, int, int);
     const float * (*fn_interleave)(void *, int, int, int);
     void   (*fn_set_tensor)(void *, const void *, size_t, size_t);
+    // Tensor-variant fn pointers (Vulkan): resolve vk_buffer from ggml_tensor*.
+    // Null on CUDA (CUDA uses the raw-ptr variants above); the raw variants are null on Vulkan.
+    void   (*fn_set_tensor_tensor)(ggml_tensor *, const void *, size_t, size_t);
+    bool   (*fn_write_d2d_tensor)(void *, int, int, ggml_tensor *, int, int, int);
 };
 
 void * llama_context::init_cross_ring_gpu(int n_layers, int n_embd, int ring_size) {
     ggml_backend_reg_t cuda_reg = dflash_gpu_backend_reg();
     if (!cuda_reg) {
         if (dflash_multi_gpu_debug_enabled() || dflash_diagnostic_debug_enabled()) {
-            LLAMA_LOG_WARN("%s: dflash GPU ring unavailable: CUDA/ROCm backend registry not found\n", __func__);
+            LLAMA_LOG_WARN("%s: dflash GPU ring unavailable: CUDA/ROCm/Vulkan backend registry not found\n", __func__);
         }
         return nullptr;
     }
@@ -8697,6 +8726,8 @@ void * llama_context::init_cross_ring_gpu(int n_layers, int n_embd, int ring_siz
     using snapshot_fn_t   = bool   (*)(void *, int, int, int, float *, int, int, int);
     using interleave_fn_t = const float * (*)(void *, int, int, int);
     using set_tensor_fn_t = void   (*)(void *, const void *, size_t, size_t);
+    using set_tensor_tensor_fn_t = void (*)(ggml_tensor *, const void *, size_t, size_t);
+    using write_d2d_tensor_fn_t  = bool (*)(void *, int, int, ggml_tensor *, int, int, int);
 
     auto fn_alloc_device = (alloc_device_fn_t)
         ggml_backend_reg_get_proc_address(cuda_reg, "dflash_cross_ring_gpu_alloc_device");
@@ -8708,10 +8739,16 @@ void * llama_context::init_cross_ring_gpu(int n_layers, int n_embd, int ring_siz
     auto fn_snapshot   = (snapshot_fn_t)   ggml_backend_reg_get_proc_address(cuda_reg, "dflash_cross_ring_gpu_snapshot");
     auto fn_interleave = (interleave_fn_t) ggml_backend_reg_get_proc_address(cuda_reg, "dflash_cross_ring_gpu_interleave");
     auto fn_set_tensor = (set_tensor_fn_t) ggml_backend_reg_get_proc_address(cuda_reg, "dflash_cross_ring_gpu_set_tensor");
+    // Tensor variants (Vulkan-only). Null on CUDA, which uses the raw variants above.
+    auto fn_set_tensor_tensor = (set_tensor_tensor_fn_t) ggml_backend_reg_get_proc_address(cuda_reg, "dflash_cross_ring_gpu_set_tensor_tensor");
+    auto fn_write_d2d_tensor  = (write_d2d_tensor_fn_t)  ggml_backend_reg_get_proc_address(cuda_reg, "dflash_cross_ring_gpu_write_d2d_tensor");
 
-    if (!fn_alloc || !fn_free || !fn_write || !fn_write_d2d || !fn_sync || !fn_snapshot || !fn_interleave || !fn_set_tensor) {
+    // Need the 7 shared fns, plus at least one of each {set_tensor, set_tensor_tensor} / {write_d2d, write_d2d_tensor} pair.
+    if (!fn_alloc || !fn_free || !fn_write || !fn_sync || !fn_snapshot || !fn_interleave) {
         return nullptr;
     }
+    if (!fn_write_d2d && !fn_write_d2d_tensor) return nullptr;
+    if (!fn_set_tensor && !fn_set_tensor_tensor) return nullptr;
 
     const int ring_device = dflash_gpu_ring_device_override();
 
@@ -8732,6 +8769,8 @@ void * llama_context::init_cross_ring_gpu(int n_layers, int n_embd, int ring_siz
     handle->fn_snapshot   = fn_snapshot;
     handle->fn_interleave = fn_interleave;
     handle->fn_set_tensor = fn_set_tensor;
+    handle->fn_set_tensor_tensor = fn_set_tensor_tensor;
+    handle->fn_write_d2d_tensor  = fn_write_d2d_tensor;
     return handle;
 }
 
@@ -8819,9 +8858,17 @@ bool llama_context::cross_ring_gpu_write_hidden(void * handle, int layer, int ri
     }
 
     auto * h = (dflash_cross_ring_handle *)handle;
+    // Vulkan: tensor-variant D2D resolves the target hidden vk_buffer from ggml_tensor*
+    // and takes src_offset explicitly (the raw variant bakes the offset into the pointer,
+    // which is a Vulkan sentinel and cannot be used). CUDA leaves fn_write_d2d_tensor null.
+    if (h->fn_write_d2d_tensor &&
+        h->fn_write_d2d_tensor(h->gpu_ring, layer, ring_pos, tensor, src_offset, n_tokens, n_embd)) {
+        return true;
+    }
+    // CUDA: raw-ptr D2D (offset baked into the pointer; tensor->data is a real device address).
     const size_t src_offset_bytes = (size_t) src_offset * (size_t) n_embd * sizeof(float);
     const void * src = (const char *) tensor->data + src_offset_bytes;
-    if (h->fn_write_d2d(h->gpu_ring, layer, ring_pos, src, n_tokens, n_embd)) {
+    if (h->fn_write_d2d && h->fn_write_d2d(h->gpu_ring, layer, ring_pos, src, n_tokens, n_embd)) {
         return true;
     }
 
@@ -8870,9 +8917,14 @@ bool llama_context::prefill_gpu_write_hidden(void * handle, int slot, int layer,
     }
 
     auto * h = (dflash_cross_ring_handle *)handle;
+    // Vulkan: tensor-variant D2D (see cross_ring_gpu_write_hidden). CUDA leaves it null.
+    if (h->fn_write_d2d_tensor &&
+        h->fn_write_d2d_tensor(h->gpu_ring, layer, ring_pos, tensor, src_offset, n_tokens, n_embd)) {
+        return true;
+    }
     const size_t src_offset_bytes = (size_t) src_offset * (size_t) n_embd * sizeof(float);
     const void * src = (const char *) tensor->data + src_offset_bytes;
-    if (h->fn_write_d2d(h->gpu_ring, layer, ring_pos, src, n_tokens, n_embd)) {
+    if (h->fn_write_d2d && h->fn_write_d2d(h->gpu_ring, layer, ring_pos, src, n_tokens, n_embd)) {
         return true;
     }
 
@@ -8947,7 +8999,7 @@ void llama_dflash_cross_ring_gpu_set_cross(
     if (!d_staging) return;
 
     int cross_len = ring_filled < ctx_window ? ring_filled : ctx_window;
-    ctx->set_cross_data_gpu(seq_id, d_staging, cross_len, n_layers, n_embd, h->fn_set_tensor);
+    ctx->set_cross_data_gpu(seq_id, d_staging, cross_len, n_layers, n_embd, h->fn_set_tensor, h->fn_set_tensor_tensor);
 }
 
 bool llama_dflash_kv_cache_init(llama_context * ctx, int ctx_size) {
@@ -8983,7 +9035,7 @@ bool llama_dflash_kv_cache_update_from_ring(
     }
 
     const int n_update = std::min(ring_filled, n_tokens);
-    return ctx->dflash_kv_cache_update_gpu(d_staging, n_update, n_layers, n_embd, h->fn_set_tensor);
+    return ctx->dflash_kv_cache_update_gpu(d_staging, n_update, n_layers, n_embd, h->fn_set_tensor, h->fn_set_tensor_tensor);
 }
 
 bool llama_dflash_kv_cache_update_from_ring_seq(
@@ -9021,7 +9073,7 @@ bool llama_dflash_target_kv_cache_update_from_ring(
 
     const int n_update = std::min(ring_filled, n_tokens);
     return ctx->dflash_target_kv_cache_update_gpu(
-        seq_id, start_pos, d_staging, n_update, n_layers, n_embd, h->fn_set_tensor);
+        seq_id, start_pos, d_staging, n_update, n_layers, n_embd, h->fn_set_tensor, h->fn_set_tensor_tensor);
 }
 
 void llama_set_tree_mask(llama_context * ctx, const uint8_t * visibility, int n_tree_tokens) {

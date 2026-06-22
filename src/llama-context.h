@@ -771,15 +771,17 @@ public:
     bool prefill_gpu_write_hidden(void * handle, int slot, int layer, int ring_pos, int src_offset, int n_tokens, int n_embd);
 
     // DFlash GPU ring: set GPU device pointer as cross data source (D2D path)
-    using set_tensor_d2d_fn_t = void (*)(void *, const void *, size_t, size_t);
+    using set_tensor_d2d_fn_t        = void (*)(void *, const void *, size_t, size_t);
+    using set_tensor_d2d_tensor_fn_t = void (*)(ggml_tensor *, const void *, size_t, size_t);
     void set_cross_data_gpu(llama_seq_id seq_id, const void * d_staging, int cross_len,
-                            int n_layers, int n_embd, set_tensor_d2d_fn_t fn_d2d);
+                            int n_layers, int n_embd, set_tensor_d2d_fn_t fn_d2d,
+                            set_tensor_d2d_tensor_fn_t fn_d2d_tensor = nullptr);
 
     bool dflash_kv_cache_init(int ctx_size);
     void dflash_kv_cache_reset();
     bool dflash_kv_cache_update(int n_tokens);
-    bool dflash_kv_cache_update_gpu(const void * d_hidden, int n_tokens, int n_layers, int n_embd_layer, set_tensor_d2d_fn_t fn_d2d);
-    bool dflash_target_kv_cache_update_gpu(llama_seq_id seq_id, llama_pos start_pos, const void * d_hidden, int n_tokens, int n_layers, int n_embd_layer, set_tensor_d2d_fn_t fn_d2d);
+    bool dflash_kv_cache_update_gpu(const void * d_hidden, int n_tokens, int n_layers, int n_embd_layer, set_tensor_d2d_fn_t fn_d2d, set_tensor_d2d_tensor_fn_t fn_d2d_tensor = nullptr);
+    bool dflash_target_kv_cache_update_gpu(llama_seq_id seq_id, llama_pos start_pos, const void * d_hidden, int n_tokens, int n_layers, int n_embd_layer, set_tensor_d2d_fn_t fn_d2d, set_tensor_d2d_tensor_fn_t fn_d2d_tensor = nullptr);
     bool dflash_kv_cache_prepare(int ctx_window);
     bool dflash_kv_cache_prepare_batch(const llama_seq_id * seq_ids, int n_seq, int ctx_window);
     dflash_kv_cache_data * dflash_kv_cache_active();

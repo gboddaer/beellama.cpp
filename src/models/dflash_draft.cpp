@@ -422,7 +422,8 @@ void llm_graph_input_dflash_update::set_input(const llama_ubatch * ubatch) {
 
     const float * src_data = nullptr;
     const void *  src_gpu  = nullptr;
-    auto          fn_d2d   = cross ? cross->fn_set_tensor_d2d : nullptr;
+    auto          fn_d2d        = cross ? cross->fn_set_tensor_d2d        : nullptr;
+    auto          fn_d2d_tensor = cross ? cross->fn_set_tensor_d2d_tensor : nullptr;
     int64_t       src_real = 0;
     int64_t       n_feat   = 0;
 
@@ -432,6 +433,7 @@ void llm_graph_input_dflash_update::set_input(const llama_ubatch * ubatch) {
             src_gpu = cross->dflash_kv_update_gpu;
             src_real = cross->dflash_kv_update_n_enc_real;
             fn_d2d = cross->dflash_kv_update_fn_set_tensor_d2d;
+            fn_d2d_tensor = cross->dflash_kv_update_fn_set_tensor_d2d_tensor;
         } else if (cross->v_embd_gpu) {
             n_feat = cross->n_embd;
             src_gpu = cross->v_embd_gpu;
@@ -449,8 +451,9 @@ void llm_graph_input_dflash_update::set_input(const llama_ubatch * ubatch) {
 
     if (n_copy > 0 && n_feat == target_hidden->ne[0] && (src_gpu || src_data)) {
         const size_t actual_bytes = std::min(copy_bytes, tensor_bytes);
-        if (src_gpu && fn_d2d) {
-            fn_d2d(target_hidden->data, src_gpu, 0, actual_bytes);
+        if (src_gpu && (fn_d2d || fn_d2d_tensor)) {
+            if (fn_d2d_tensor) { fn_d2d_tensor(target_hidden, src_gpu, 0, actual_bytes); }
+            else               { fn_d2d(target_hidden->data, src_gpu, 0, actual_bytes); }
         } else {
             ggml_backend_tensor_set(target_hidden, src_data, 0, actual_bytes);
         }
@@ -526,10 +529,14 @@ void llm_graph_input_dflash::set_input(const llama_ubatch * ubatch) {
                 const size_t copy_bytes  = (size_t) n_feat * (size_t) n_copy * sizeof(float);
                 const size_t actual_bytes = std::min(copy_bytes, tensor_bytes);
 
-                if (src_gpu && cross->fn_set_tensor_d2d) {
+                if (src_gpu && (cross->fn_set_tensor_d2d || cross->fn_set_tensor_d2d_tensor)) {
                     // GPU D2D path
                     const void * gpu_src = (const char *)src_gpu + (size_t)win_off * n_feat * sizeof(float);
-                    cross->fn_set_tensor_d2d(target_hidden->data, gpu_src, 0, actual_bytes);
+                    if (cross->fn_set_tensor_d2d_tensor) {
+                        cross->fn_set_tensor_d2d_tensor(target_hidden, gpu_src, 0, actual_bytes);
+                    } else {
+                        cross->fn_set_tensor_d2d(target_hidden->data, gpu_src, 0, actual_bytes);
+                    }
                 } else {
                     // CPU H2D path (fallback)
                     const float * src = src_data + win_off * n_feat;
@@ -665,16 +672,24 @@ void llm_graph_input_dflash::set_input(const llama_ubatch * ubatch) {
                     const size_t dst_offset =
                         (size_t) s * (size_t) per_slot_ctx * n_feat * sizeof(float);
 
-                    if (slot_info[s].gpu && cross && cross->fn_set_tensor_d2d) {
+                    if (slot_info[s].gpu && cross && (cross->fn_set_tensor_d2d || cross->fn_set_tensor_d2d_tensor)) {
                         const void * gpu_src =
                             (const char *) slot_info[s].gpu +
                             (size_t) slot_win_off[s] * n_feat * sizeof(float);
 
-                        cross->fn_set_tensor_d2d(
-                            target_hidden->data,
-                            gpu_src,
-                            dst_offset,
-                            copy_bytes);
+                        if (cross->fn_set_tensor_d2d_tensor) {
+                            cross->fn_set_tensor_d2d_tensor(
+                                target_hidden,
+                                gpu_src,
+                                dst_offset,
+                                copy_bytes);
+                        } else {
+                            cross->fn_set_tensor_d2d(
+                                target_hidden->data,
+                                gpu_src,
+                                dst_offset,
+                                copy_bytes);
+                        }
                     } else if (slot_info[s].data) {
                         const float * src =
                             slot_info[s].data + slot_win_off[s] * n_feat;

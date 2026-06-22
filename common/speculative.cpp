@@ -2574,12 +2574,19 @@ struct common_speculative_impl_dflash : public common_speculative_impl {
             llama_set_dflash_gpu_capture(ctx_tgt, false);
             LOG_WRN("dflash: GPU cross ring unavailable; using CPU hidden capture\n");
         }
-
-        // Full-attention DFlash layers may read target context from the drafter's
-        // normal KV cache only when the GPU cross ring can populate it. Vulkan
-        // CPU hidden capture has no such cache and must project K/V freshly from
-        // target_hidden in the drafter graph.
-        llama_set_dflash_target_kv_available(ctx_dft, gpu_ring_handle != nullptr);
+        // Tell the drafter graph whether its normal KV cache will be populated with
+        // TARGET context K/V from the ring. This needs the backend's KV D2D helpers
+        // (dflash_kv_cache_write_d2d / _append_d2d / _interleave), which are
+        // CUDA-only today; Vulkan does not register them, so llama_dflash_kv_cache_init
+        // returns false there (the function lookup fails before any allocation).
+        // Enabling the target-KV path without a populated cache makes the drafter
+        // self-attend with empty target KV -> ~0% acceptance (the ring-ON regression:
+        // Coder-Next ring-ON went from ~1.2% to ~58% once this was gated on the actual
+        // KV-cache availability instead of just the ring handle). Gate the flag on
+        // the real KV-cache availability, not merely on the ring handle existing.
+        llama_dflash_kv_cache_set_active_seq(ctx_dft, 0);
+        const bool drafter_kv_cache_ok = llama_dflash_kv_cache_init(ctx_dft, cross_ctx);
+        llama_set_dflash_target_kv_available(ctx_dft, gpu_ring_handle != nullptr && drafter_kv_cache_ok);
     }
 
     ~common_speculative_impl_dflash() override {
