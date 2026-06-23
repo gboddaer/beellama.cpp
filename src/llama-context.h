@@ -95,6 +95,59 @@ static inline bool llama_dflash_view_span_in_bounds_for_test(
     return offset_bytes <= total_bytes && n_bytes <= total_bytes - offset_bytes;
 }
 
+// DFlash DeltaNet RS-snapshot write-back slot decision.
+//
+// build_recurrent_attn() (src/models/delta-net-base.cpp) writes the K recurrent-state
+// snapshot slots back into ssm_states_all after a gated_delta_net step. The kernel
+// only populates the last min(n_seq_tokens, K) gdn_out snapshot slots; for a decode /
+// short batch (n_seq_tokens < K) the leading gdn_out slots are uninitialised, so the
+// older state snapshots must be rotated down by n_pop slots (old slot s -> s + n_pop)
+// instead of being clobbered with garbage. This helper captures that decision as a
+// pure function so it is unit-testable (see tests/test-dflash-plumbing.cpp) and so the
+// production write-back loop and the test share one source of truth.
+//
+// For each output slot index k_i in [0, K):
+//   cache_slot = K - 1 - k_i            (destination state slot)
+//   n_pop     = min(n_seq_tokens, K)    (kernel-populated gdn_out slots)
+//   if k_i >= K - n_pop: from_gdn=true, gdn_slot = k_i   (new state from this batch)
+//   else:                from_gdn=false, old_slot = cache_slot - n_pop  (rotated older snapshot)
+// Iterating k_i ascending visits cache_slot descending, so each old_slot is read before
+// it is overwritten by a later iteration (in-place shift is safe).
+//
+// Returns false (and leaves outputs untouched) if k_i is out of range [0, K) or the
+// inputs are invalid (K < 1, n_seq_tokens < 0, n_pop == 0).
+struct llama_dflash_rs_slot_src {
+    bool     from_gdn;   // true: source is gdn_out snapshot slot gdn_slot; false: rotate from old state slot old_slot
+    int64_t  gdn_slot;   // valid when from_gdn == true
+    uint32_t old_slot;   // valid when from_gdn == false; the older state slot to rotate FROM
+};
+
+static inline bool llama_dflash_rs_writeback_slot_for_test(
+        int64_t  K,
+        int64_t  n_seq_tokens,
+        int64_t  k_i,
+        uint32_t & cache_slot,
+        llama_dflash_rs_slot_src & src) {
+    if (K < 1 || n_seq_tokens < 0 || k_i < 0 || k_i >= K) {
+        return false;
+    }
+    const int64_t n_pop = (n_seq_tokens < K) ? n_seq_tokens : K; // kernel-populated slots
+    if (n_pop == 0) {
+        return false;
+    }
+    cache_slot = (uint32_t) (K - 1 - k_i);
+    if (k_i >= K - n_pop) {
+        src.from_gdn = true;
+        src.gdn_slot = k_i;
+        src.old_slot = 0;
+    } else {
+        src.from_gdn = false;
+        src.gdn_slot = 0;
+        src.old_slot = cache_slot - (uint32_t) n_pop; // rotate older snapshot down by n_pop
+    }
+    return true;
+}
+
 class llama_memory_recurrent;
 
 struct llama_model;
