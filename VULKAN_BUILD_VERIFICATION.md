@@ -1,12 +1,30 @@
 # Vulkan Build Verification for PR #79
 
-Verifies that PR #79 (`dflash: enable Qwen3-Coder-Next on Vulkan`, commit `b788b4af1`) builds cleanly for the Vulkan backend on two independent host environments.
+Verifies that PR #79 builds cleanly for the Vulkan backend on independent host environments.
+
+## PR head history
+
+The PR began as a single Qwen3-Coder-Next Vulkan enablement (`b788b4af1`). It has
+since advanced with layered DFlash fixes, all of which must continue to build
+cleanly for Vulkan:
+
+| Commit | Change |
+|---|---|
+| `b788b4af1` | `dflash: enable Qwen3-Coder-Next on Vulkan` (original PR head) |
+| `4efe54303` | updated PR head at the time of Verification 2 |
+| `bcd42973f` | sync the latest working DFlash code from `vulkan-dflash-cross-ring` (fixes Qwen3.6 divergence + Coder-Next crash on Vulkan) |
+| `ab2be17fd` | keep `n_rs_seq` for QWEN35MOE (fix 122B GPU cross-ring corruption) |
+| `efb07137c` | rotate DeltaNet RS snapshots for `n_seq_tokens<K` (fix Qwen3.6-35B-A3B stochastic-sampling corruption) — **current PR head** |
+
+Verification 1 below is re-run against the current head `efb07137c`. Verification 2
+is retained from the original `b788b4af1`/`4efe54303` run (Debian 11 / NVIDIA RTX
+3090); the build host setup notes there still apply.
 
 ---
 
 ## Verification 1 — AMD Strix Halo (Debian 13 / Mesa RADV)
 
-**Commit verified:** `b788b4af1` — `dflash: enable Qwen3-Coder-Next on Vulkan`
+**Commit verified:** `efb07137c` — `dflash: rotate DeltaNet RS snapshots for n_seq_tokens<K (fix stochastic-sampling corruption)` (current PR head, includes the Coder-Next enablement, the `vulkan-dflash-cross-ring` sync, the 122B `n_rs_seq` fix, and the 35B-A3B snapshot-rotation fix)
 
 ### Build System
 
@@ -15,7 +33,7 @@ Verifies that PR #79 (`dflash: enable Qwen3-Coder-Next on Vulkan`, commit `b788b
 | **OS** | Debian 13 (trixie), Linux 6.12.90-amd64 |
 | **CPU** | AMD Ryzen AI MAX+ 395 w/ Radeon 8060S (16C/32T, up to 5185 MHz) |
 | **GPU** | AMD Strix Halo Radeon 8060S (RADV GFX1151, Mesa 25.0.7) |
-| **RAM** | 30 GiB |
+| **RAM** | 96 GiB UMA |
 | **CMake** | 3.31.6 |
 | **Compiler** | GCC 14.2.0 (`-march=native`) |
 | **Make** | GNU Make 4.4.1, 32 parallel jobs |
@@ -25,31 +43,49 @@ Verifies that PR #79 (`dflash: enable Qwen3-Coder-Next on Vulkan`, commit `b788b
 ## CMake Configuration
 
 ```
-cmake -B build_vulkan -DGGML_VULKAN=ON -DGGML_NATIVE=ON -DCMAKE_BUILD_TYPE=Release
+cmake -B build-vk-verify -DGGML_VULKAN=ON -DGGML_NATIVE=ON -DCMAKE_BUILD_TYPE=Release
 ```
 
 Key flags:
 - `GGML_VULKAN=ON` — Vulkan backend enabled
 - `GGML_NATIVE=ON` — CPU backend compiled with `-march=native`
 - `GGML_CPU=ON` — CPU backend included (cooperative with Vulkan)
-- `CMAKE_BUILD_TYPE=Release`
+- `CMAKE_BUILD_TYPE=Release` (no `-Werror`)
+
+CMake output (fresh out-of-source configure for `efb07137c`):
+
+```
+-- Found Vulkan: /usr/lib/x86_64-linux-gnu/libvulkan.so (found version "1.4.309") found components: glslc missing components: glslangValidator
+-- Vulkan found
+-- GL_KHR_cooperative_matrix supported by glslc
+-- GL_NV_cooperative_matrix2 supported by glslc
+-- GL_NV_cooperative_matrix_decode_vector not supported by glslc
+-- GL_EXT_integer_dot_product supported by glslc
+-- GL_EXT_bfloat16 not supported by glslc
+-- Including Vulkan backend
+-- Configuring done (1.7s)
+-- Generating done (0.2s)
+```
 
 Vulkan shader features detected:
 - `GL_KHR_cooperative_matrix` — supported
 - `GL_NV_cooperative_matrix2` — supported
+- `GL_NV_cooperative_matrix_decode_vector` — not supported (optional fast path)
 - `GL_EXT_integer_dot_product` — supported
 - `GL_EXT_bfloat16` — not supported (driver/hardware limitation)
 
 ## Build Result
 
-- **Configure:** Success (rc=0, 1.8s)
-- **Build:** Success (100%, 0 warnings treated as errors)
-- **Binaries produced:** `llama-server`, `llama-cli`, `llama-bench`, `llama`, `llama-perplexity`, `llama-imatrix`, `llama-quantize`, `llama-llama-bench`, all test binaries
-- **Working tree:** Clean, nothing to commit
+- **Configure:** Success (rc=0, 1.7s)
+- **Build:** Success (100% — `Built target llama-server`, `Built target llama-app`)
+- **Errors:** 0 (zero `error:` lines)
+- **Warnings:** 50, all benign (no `-Werror`) — 35× `-Wdouble-promotion`, 10× `-Wmissing-declarations`, 1× each `-Wunused-variable`, `-Wmissing-field-initializers`, `-Wformat=`, `-Wdeprecated-declarations`, `-Waddress`
+- **Binaries produced:** `llama-server`, `llama-cli`, `llama-bench`, `llama-perplexity`, `llama`, plus shared libs (`libggml-vulkan.so`, `libllama.so`, `libllama-server-impl.so`, etc.)
+- **Runtime sanity:** the `build-vulkan/bin/llama-server` binary from the same source runs DFlash for all tested models (Qwen3.6-27B, Qwen3-Coder-Next, Qwen3.5-122B-A10B, Qwen3.6-35B-A3B) with coherent output and `rep=0`; see `docs/enable-and-fix-dflash-on-vulkan-various-models.md` for the post-fix performance/correctness matrix.
 
 ### Conclusion
 
-PR #79 builds cleanly for Vulkan on native AMD hardware (Strix Halo / Radeon 8060S) with Mesa RADV driver. No compilation errors or warnings.
+The current PR head (`efb07137c`, with the Coder-Next enablement, the `vulkan-dflash-cross-ring` sync, the 122B `n_rs_seq` fix, and the 35B-A3B snapshot-rotation fix) builds cleanly for Vulkan on native AMD hardware (Strix Halo / Radeon 8060S) with the Mesa RADV driver — 0 errors, only benign warnings.
 
 ---
 
