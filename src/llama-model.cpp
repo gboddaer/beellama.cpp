@@ -2492,8 +2492,24 @@ float llama_model_rope_freq_scale_train_swa(const llama_model * model) {
 }
 
 void llama_model_share_tensors(llama_model * dst, const llama_model * src) {
-    dst->tok_embd = src->tok_embd;
-    dst->output   = src->output;
+    // DFlash: share tok_embd and output tensors from src (target) to dst (drafter).
+    // Only share when the drafter does NOT already have its own tensor loaded from
+    // its GGUF. A drafter fine-tuned with its own lm_head (output.weight present in
+    // the GGUF) must keep its own output tensor; overwriting it with the target's
+    // lm_head would destroy the fine-tuned readout and yield 0%% acceptance.
+    // The original Z-Lab drafter (no output.weight in GGUF) still shares the target's.
+    if (!dst->tok_embd) {
+        dst->tok_embd = src->tok_embd;
+        fprintf(stderr, "[dflash share] shared tok_embd from target (drafter had none)\n"); fflush(stderr);
+    } else {
+        fprintf(stderr, "[dflash share] kept drafter's own tok_embd\n"); fflush(stderr);
+    }
+    if (!dst->output) {
+        dst->output = src->output;
+        fprintf(stderr, "[dflash share] shared output from target (drafter had none)\n"); fflush(stderr);
+    } else {
+        fprintf(stderr, "[dflash share] kept drafter's own output (fine-tuned lm_head)\n"); fflush(stderr);
+    }
 }
 
 int32_t llama_model_dflash_block_size(const llama_model * model) {

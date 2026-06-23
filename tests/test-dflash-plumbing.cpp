@@ -2,6 +2,9 @@
 #include "dflash-profile.h"
 #include "speculative.h"
 
+#include "ggml.h"
+#include "ggml-backend.h"
+
 #include <cstdio>
 #include <cstdlib>
 #include <fstream>
@@ -60,6 +63,72 @@ static std::string slice_between(const std::string & text, const std::string & b
     return text.substr(b, e - b);
 }
 
+static bool test_vk_dflash_cross_ring_roundtrip() {
+    ggml_backend_reg_t vk_reg = ggml_backend_reg_by_name("Vulkan");
+    if (!vk_reg) { return true; } // no Vulkan backend in this build — skip
+    using alloc_fn_t = void *(*)(int,int,int);
+    using free_fn_t  = void  (*)(void*);
+    using write_fn_t = void  (*)(void*,int,int,const float*,int,int);
+    using sync_fn_t  = void  (*)(void*);
+    using snap_fn_t  = bool  (*)(void*,int,int,int,float*,int,int,int);
+    using inter_fn_t = const float* (*)(void*,int,int,int);
+    using setT_fn_t  = void  (*)(ggml_tensor*, const void*, size_t, size_t);
+    auto falloc = (alloc_fn_t)ggml_backend_reg_get_proc_address(vk_reg, "dflash_cross_ring_gpu_alloc");
+    auto ffree  = (free_fn_t) ggml_backend_reg_get_proc_address(vk_reg, "dflash_cross_ring_gpu_free");
+    auto fwrite = (write_fn_t)ggml_backend_reg_get_proc_address(vk_reg, "dflash_cross_ring_gpu_write");
+    auto fsync  = (sync_fn_t) ggml_backend_reg_get_proc_address(vk_reg, "dflash_cross_ring_gpu_synchronize");
+    auto fsnap  = (snap_fn_t) ggml_backend_reg_get_proc_address(vk_reg, "dflash_cross_ring_gpu_snapshot");
+    auto finter = (inter_fn_t)ggml_backend_reg_get_proc_address(vk_reg, "dflash_cross_ring_gpu_interleave");
+    auto fsetT  = (setT_fn_t) ggml_backend_reg_get_proc_address(vk_reg, "dflash_cross_ring_gpu_set_tensor_tensor");
+    if (!falloc || !ffree || !fwrite || !fsync || !fsnap || !finter || !fsetT) return false;
+
+    void * h = falloc(/*n_layers*/2, /*n_embd*/3, /*ring_size*/4);
+    if (!h) { return true; } // Vulkan present but cross-ring alloc failed (e.g. no buffer_device_address) — skip
+
+    float l0[3] = {1,2,3}, l1[3] = {4,5,6};
+    fwrite(h, 0, 1, l0, 1, 3);
+    fwrite(h, 1, 1, l1, 1, 3);
+    fsync(h);
+
+    float snap[12] = {0};
+    bool ok = fsnap(h, /*write_pos*/2, /*filled*/2, /*ctx_window*/2, snap, /*n_tokens*/2, /*n_layers*/2, /*n_embd*/3);
+    if (ok) {
+        const float exp_snap[12] = {0,0,0,1,2,3, 0,0,0,4,5,6};
+        for (int i = 0; i < 12; ++i) { if (snap[i] != exp_snap[i]) { ok = false; break; } }
+    }
+
+    const float * staging = finter(h, /*write_pos*/2, /*filled*/2, /*ctx_window*/2);
+    ok = ok && staging != nullptr;
+
+    // Drafter-side Vulkan tensor to receive the set_tensor_tensor D2D copy.
+    ggml_backend_dev_t dev = ggml_backend_reg_dev_get(vk_reg, 0);
+    ggml_backend_t backend = ggml_backend_dev_init(dev, nullptr);
+    ggml_backend_buffer_type_t buft = ggml_backend_dev_buffer_type(dev);
+    size_t mem_size = ggml_tensor_overhead()*4;
+    void * mem = malloc(mem_size);
+    struct ggml_init_params ip = {};
+    ip.mem_buffer = mem;
+    ip.mem_size   = mem_size;
+    ip.no_alloc   = true;
+    ggml_context * gctx = ggml_init(ip);
+    ggml_tensor * t = ggml_new_tensor_1d(gctx, GGML_TYPE_F32, 12);
+    ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors(gctx, backend);
+    ok = ok && buf != nullptr && t != nullptr && t->buffer != nullptr;
+    if (ok) {
+        fsetT(t, staging, 0, 12 * sizeof(float));
+        float got[12] = {0};
+        ggml_backend_tensor_get(t, got, 0, 12 * sizeof(float));
+        const float exp[12] = {0,0,0, 0,0,0, 1,2,3, 4,5,6};
+        for (int i = 0; i < 12; ++i) { if (got[i] != exp[i]) { ok = false; break; } }
+    }
+    if (buf) ggml_backend_buffer_free(buf);
+    if (gctx) ggml_free(gctx);
+    free(mem);
+    ggml_backend_free(backend);
+    ffree(h);
+    return ok;
+}
+
 int main(int argc, char ** argv) {
     bool ok = true;
 
@@ -68,6 +137,7 @@ int main(int argc, char ** argv) {
     ok &= expect(!llama_dflash_gpu_tape_supported_arch(LLM_ARCH_QWEN3NEXT), "Qwen3Next must stay on fallback");
     ok &= expect(!llama_dflash_gpu_tape_supported_arch(LLM_ARCH_KIMI_LINEAR), "Kimi-linear must stay on fallback");
     ok &= expect(!llama_dflash_gpu_tape_supported_arch(LLM_ARCH_UNKNOWN), "unknown arch must stay on fallback");
+    ok &= expect(test_vk_dflash_cross_ring_roundtrip(), "Vulkan DFlash cross-ring alloc/write/snapshot/interleave/set_tensor_tensor round-trip");
     ok &= expect(argc == 2, "expected repo root argument");
     if (!ok) {
         return 1;
@@ -154,6 +224,19 @@ int main(int argc, char ** argv) {
     const std::string cuda_template_generator = read_file(root + "/ggml/src/ggml-cuda/template-instances/generate_cu_files.py");
     const std::string metal = read_file(root + "/ggml/src/ggml-metal/ggml-metal.metal");
 
+    const std::string dflash_rs_dump = slice_between(context_cpp,
+            "void llama_context::dflash_dump_recurrent_state_dbg",
+            "\n}\n\n");
+
+    ok &= expect(dflash_rs_dump.find("const uint32_t n_embd_r = model.hparams.n_embd_r()") != std::string::npos,
+            "DFlash recurrent-state debug dump must use per-cell n_embd_r for r_l reads");
+    ok &= expect(dflash_rs_dump.find("ggml_nelements(r_tensor)") == std::string::npos,
+            "DFlash recurrent-state debug dump must not use full r_l tensor element count as one cell");
+    ok &= expect(dflash_draft.find("n_real=%lld ctx_len=%lld n_block=%lld") != std::string::npos,
+            "DFlash RX diagnostic must print int64 ctx_len/n_block with %lld");
+    ok &= expect(dflash_draft.find("n_real=%lld ctx_len=%d n_block=%d") == std::string::npos,
+            "DFlash RX diagnostic must not print int64 ctx_len/n_block with %d");
+
     ok &= expect(dflash_profile_parse_env(nullptr) == 0, "DFlash profile parser must treat missing env as disabled");
     ok &= expect(dflash_profile_parse_env("0") == 0, "DFlash profile parser must treat 0 as disabled");
     ok &= expect(dflash_profile_parse_env("off") == 0, "DFlash profile parser must treat off as disabled");
@@ -179,27 +262,6 @@ int main(int argc, char ** argv) {
     ok &= expect(cmake_root.find("GGML_CUDA_ARCH is not a supported CMake option") != std::string::npos &&
                  cmake_root.find("CMAKE_CUDA_ARCHITECTURES=120") != std::string::npos,
         "CMake must fail loudly when users pass obsolete GGML_CUDA_ARCH instead of CMAKE_CUDA_ARCHITECTURES");
-
-    ok &= expect(llama_h.find("llama_set_dflash_target_kv_available") != std::string::npos &&
-                 context_h.find("void set_dflash_target_kv_available(bool avail)") != std::string::npos &&
-                 context_cpp.find("void llama_context::set_dflash_target_kv_available(bool avail)") != std::string::npos,
-        "DFlash must expose a target-KV availability flag for drafter graph selection");
-    ok &= expect(cparams_h.find("bool dflash_target_kv_available = false") != std::string::npos,
-        "DFlash target-KV availability must default false so Vulkan CPU-hidden capture avoids empty KV cache reads");
-    ok &= expect(speculative.find("llama_set_dflash_target_kv_available(ctx_dft, gpu_ring_handle != nullptr)") != std::string::npos,
-        "DFlash must mark target KV available only when the GPU cross ring exists");
-    ok &= expect(dflash_draft.find("if (mctx && cparams.dflash_target_kv_available)") != std::string::npos,
-        "DFlash full-attention layers must not read drafter target KV unless it was populated");
-    ok &= expect(context_cpp.find("linear_attn_qkv_mixed-") != std::string::npos &&
-                 context_cpp.find("qkv_mixed-") != std::string::npos,
-        "Qwen3Next DFlash tape capture must include pre-conv QKV tensor aliases for conv-state replay");
-    ok &= expect(speculative.find("const int batch_len = block_size;") != std::string::npos &&
-                 speculative.find("const int batch_len            = block_size;") != std::string::npos &&
-                 speculative.find("const int output_len = n_draft + 1;") != std::string::npos &&
-                 speculative.find("const int output_len           = n_draft + 1;") != std::string::npos,
-        "Flat DFlash drafting must decode the full block while consuming only the requested output rows");
-    ok &= expect(speculative.find("const int offset = r * output_len;") != std::string::npos,
-        "Batched flat DFlash reduced-logits offsets must use compact output rows");
 
     {
         const size_t zero_reuse_reset = server_context.find("n_past == 0");

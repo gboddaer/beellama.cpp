@@ -21,6 +21,7 @@ static inline bool llama_dflash_gpu_hidden_supported_arch(llm_arch arch) {
     switch (arch) {
         case LLM_ARCH_QWEN35:
         case LLM_ARCH_QWEN35MOE:
+        case LLM_ARCH_QWEN3NEXT:
         case LLM_ARCH_GEMMA4:
             return true;
         default:
@@ -109,6 +110,7 @@ struct llama_memory_context_i;
 // DFlash: hidden state buffer for captured layer activations
 struct dflash_layer_hidden_buf {
     std::vector<float> data;
+    std::vector<int32_t> token_ids;  // token ID at each position (for training data)
     int64_t n_embd = 0;
     int64_t n_tokens = 0;
 };
@@ -700,9 +702,9 @@ public:
     void set_dflash_consume_reduced(bool enabled);
     void set_dflash_n_slots(int n);
 
-    // DFlash: mark whether the drafter's normal KV cache is populated with
-    // TARGET context K/V. When false, full-attention DFlash layers fall back
-    // to fresh K/V projection from target_hidden.
+    // DFlash: mark whether the drafter's normal KV cache is populated with TARGET
+    // context K/V (GPU cross ring available). When false, the drafter graph must
+    // fall back to fresh Kcur_ctx = wk(fused_target) instead of reading the cache.
     void set_dflash_target_kv_available(bool avail);
 
     // DFlash: reset hidden-state capture for a fresh decode() call so the
@@ -713,6 +715,11 @@ public:
     // Returns false when the eval callback was suppressed on a meta backend.
     bool dflash_hidden_capture_available() const;
     const char * dflash_hidden_capture_unavailable_reason() const;
+
+    // DFlash: dump captured hidden states to file for drafter training
+    int64_t dflash_dump_hidden_states(const char * path);
+    int64_t dflash_hidden_state_count(int slot) const;
+    int dflash_capture_layer_ids(int32_t * out, int out_size) const;
 
     // DFlash: enable/disable tape recording for DeltaNet state rollback
     void set_tape_recording(bool enable);
@@ -738,7 +745,9 @@ public:
     void set_active_dflash_slot(int slot_idx);
 
     // DFlash: replay tape data to reconstruct DeltaNet state for n_accepted tokens
-    void tape_replay(llama_seq_id seq_id, int n_accepted);
+    // Returns 0 if tape replay succeeded, or n_accepted if it was skipped (e.g., Vulkan)
+    // and the server needs to re-decode the accepted positions.
+    int tape_replay(llama_seq_id seq_id, int n_accepted);
     void tape_replay_sync();
     bool tape_replay_conv_gpu(llama_memory_recurrent * mem_recurrent, int32_t cell_idx, int n_accepted);
     bool tape_replay_conv_gpu(llama_memory_recurrent * mem_recurrent, int32_t cell_idx, int n_accepted, bool advance_pos);
@@ -746,11 +755,16 @@ public:
     bool tape_replay_gdn_direct_from_cpu_tape(llama_memory_recurrent * mem_recurrent, int32_t cell_idx, int n_accepted);
     bool tape_replay_conv_gpu_from_cpu_tape(llama_memory_recurrent * mem_recurrent, int32_t cell_idx, int n_accepted, llama_seq_id seq_id);
     void tape_replay_conv(llama_memory_recurrent * mem_recurrent, int32_t cell_idx, int n_accepted, llama_seq_id seq_id = 0);
-    void tape_replay_cpu(llama_memory_recurrent * mem_recurrent, int32_t cell_idx, int n_accepted);
+    int tape_replay_cpu(llama_memory_recurrent * mem_recurrent, int32_t cell_idx, int n_accepted);
     bool dflash_memory_seq_cp_recurrent_ordered(llama_seq_id seq_id_src, llama_seq_id seq_id_dst, llama_pos p0, llama_pos p1);
 
     // DFlash: complete rollback for hybrid models (KV trim + recurrent restore + tape replay)
-    void dflash_rollback(llama_seq_id seq_id, llama_seq_id seq_backup, int n_past_before, int n_accepted);
+    // Returns the number of positions that need re-decoding after rollback.
+    // 0 means tape replay succeeded; >0 means the server must re-decode.
+    int dflash_rollback(llama_seq_id seq_id, llama_seq_id seq_backup, int n_past_before, int n_accepted);
+
+    // DFlash debug: dump committed recurrent state checksum for seq_id (no-op on state)
+    void dflash_dump_recurrent_state_dbg(llama_seq_id seq_id, const char * tag);
 
     // DFlash: prepare DeltaNet state for branch verification (recurrent restore + tape replay, no KV touch)
     void dflash_prepare_branch(llama_seq_id seq_id, llama_seq_id seq_backup, int depth);

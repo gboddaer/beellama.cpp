@@ -60,6 +60,42 @@ static bool dflash_server_crash_trace_enabled() {
     return enabled;
 }
 
+static bool dflash_rx_diag_enabled() {
+    /* Per-cycle ring/cross/append diagnostics for DFlash investigation.
+     * Logs committed_len, ring_filled, cross_len, n_enc_real, n_real,
+     * n_accepted_draft, n_hidden_keep, and append success on every cycle.
+     * Zero cost when disabled (static const guard). */
+    static const bool enabled = [] {
+        const char * env = std::getenv("GGML_DFLASH_RX_DIAG");
+        return env && std::atoi(env) != 0;
+    }();
+    return enabled;
+}
+
+static bool dflash_token_trace_enabled() {
+    static const bool enabled = [] {
+        const char * env = std::getenv("GGML_DFLASH_TOKEN_TRACE");
+        return env && std::atoi(env) != 0;
+    }();
+    return enabled;
+}
+
+static std::string dflash_format_tokens(const llama_tokens & tokens, size_t limit = 16) {
+    std::string s = "[";
+    const size_t n = std::min(tokens.size(), limit);
+    for (size_t i = 0; i < n; ++i) {
+        if (i) {
+            s += ",";
+        }
+        s += std::to_string(tokens[i]);
+    }
+    if (tokens.size() > limit) {
+        s += ",...";
+    }
+    s += "]";
+    return s;
+}
+
 static bool dflash_verify_padding_enabled() {
     static const bool enabled = [] {
         const char * env = getenv("GGML_DFLASH_VERIFY_PAD");
@@ -1808,6 +1844,12 @@ private:
     common_init_result_ptr llama_init;
 
     llama_context * ctx_tgt = nullptr;
+
+    // DFlash: if reduced verify (TOPK-based argmax) failed on first attempt,
+    // the backend likely lacks GGML_OP_TOPK support (e.g., Vulkan). Set to true
+    // to disable reduced verify permanently for this model session. Resets when
+    // the model is reloaded (since server_context_impl is destroyed/recreated).
+    bool dflash_reduced_verify_broken = false;
 
     // DFlash: one drafter context shared across all slots'
     // common_speculative states (non-owning refs). Must outlive all specs — the
@@ -4252,6 +4294,18 @@ private:
     }
 
     void update_slots() {
+        // DFlash: check for hidden state dump trigger file
+        {
+            const char * dump_path_env = getenv("LLAMA_DFLASH_HIDDEN_DUMP");
+            if (dump_path_env && strlen(dump_path_env) > 0) {
+                // Dump once per cycle if the path exists (idempotent)
+                int64_t n = llama_dflash_dump_hidden_states(ctx_tgt, dump_path_env);
+                if (n > 0) {
+                    SRV_INF("dflash: dumped %ld hidden state tokens to %s\n", (long)n, dump_path_env);
+                }
+            }
+        }
+
         // check if all slots are idle
         {
             bool all_idle = true;
@@ -4394,27 +4448,31 @@ private:
         };
         auto dflash_backup_recurrent_state = [&](llama_seq_id seq_id_src, llama_seq_id seq_id_dst) {
             auto * mem = llama_get_memory(ctx_tgt);
+            if (const char * e = std::getenv("GGML_DFLASH_DEBUG"); e && std::atoi(e) != 0) {
+                // dump committed recurrent state (s_l for first recurrent layer) at cycle start
+                llama_dflash_dump_recurrent_state_dbg(ctx_tgt, seq_id_src, "backup_pre");
+            }
             dflash_recurrent_profile_reset(mem);
             const int64_t t_backup_start = dflash_profile_start();
             if (dflash_server_crash_trace_enabled()) {
-                SRV_INF("dflash crash breadcrumb: recurrent backup enter src=%d dst=%d\n",
+                SRV_DBG("dflash crash breadcrumb: recurrent backup enter src=%d dst=%d\n",
                         (int) seq_id_src, (int) seq_id_dst);
             }
             const bool ordered = llama_dflash_memory_seq_cp_recurrent_ordered(ctx_tgt, seq_id_src, seq_id_dst, -1, -1);
             if (!ordered) {
                 if (dflash_server_crash_trace_enabled()) {
-                    SRV_INF("dflash crash breadcrumb: recurrent backup fallback copy src=%d dst=%d\n",
+                    SRV_DBG("dflash crash breadcrumb: recurrent backup fallback copy src=%d dst=%d\n",
                             (int) seq_id_src, (int) seq_id_dst);
                 }
                 llama_memory_seq_cp_recurrent(mem, seq_id_src, seq_id_dst, -1, -1);
             } else if (dflash_server_crash_trace_enabled()) {
-                SRV_INF("dflash crash breadcrumb: recurrent backup ordered copy complete src=%d dst=%d\n",
+                SRV_DBG("dflash crash breadcrumb: recurrent backup ordered copy complete src=%d dst=%d\n",
                         (int) seq_id_src, (int) seq_id_dst);
             }
             dflash_profile_add(t_recurrent_backup_total, t_backup_start);
             dflash_recurrent_profile_collect(mem);
             if (dflash_server_crash_trace_enabled()) {
-                SRV_INF("dflash crash breadcrumb: recurrent backup exit src=%d dst=%d\n",
+                SRV_DBG("dflash crash breadcrumb: recurrent backup exit src=%d dst=%d\n",
                         (int) seq_id_src, (int) seq_id_dst);
             }
         };
@@ -4801,6 +4859,15 @@ private:
                     slot.spec_draft = common_speculative_draft(slot.get_spec(), params_spec, cached_text_tokens, slot.sampled, nullptr, draft_n_past);
                 }
                 slot.spec_pad_i_batch.clear();
+
+                if (dflash_server_crash_trace_enabled() && !slot.spec_draft.empty()) {
+                    SRV_DBG("dflash draft produced: slot=%d n_draft=%zu adaptive_n_max=%d n_past=%d\n",
+                            slot.id, slot.spec_draft.size(), slot.adaptive_n_max, draft_n_past);
+                }
+                if (dflash_token_trace_enabled() && !slot.spec_draft.empty()) {
+                    SRV_INF("dflash token trace: slot=%d sampled=%d draft=%s n_past=%d\n",
+                            slot.id, (int) slot.sampled, dflash_format_tokens(slot.spec_draft).c_str(), draft_n_past);
+                }
 
                 if (slot.spec_draft.size() > (size_t) n_draft_max) {
                     SLT_WRN(slot, "draft size %d exceeds max %d, truncating\n", (int) slot.spec_draft.size(), n_draft_max);
@@ -5750,7 +5817,18 @@ private:
         int32_t dflash_reduced_verify_view_start = 0;
         bool dflash_verify_graph_enabled = false;
 
-        if (dflash_verify_plan.enabled) {
+        // If reduced verify has been attempted but never succeeded, the backend
+        // likely doesn't support the TOPK compute op (e.g. Vulkan).  Disable
+        // it permanently so we fall back to full logits.
+        const bool dflash_use_reduced_verify = dflash_verify_plan.enabled && !dflash_reduced_verify_broken;
+
+        // Set to true when reduced verify fails on the current cycle.  Skips all
+        // speculative token processing (KV rollback, accept, output) because we
+        // have no logits or argmax to work with.  The draft state is cleared and
+        // the slot continues generating with a fresh single-token decode.
+        bool dflash_reduced_verify_recovery = false;
+
+        if (dflash_use_reduced_verify) {
             for (int32_t j = 0; j < batch.n_tokens; j += std::min(n_batch, batch.n_tokens - j)) {
                 const int32_t n_tokens_probe = std::min(n_batch, batch.n_tokens - j);
                 const char * dflash_reduce_reason_probe = dflash_verify_plan.reason;
@@ -5763,7 +5841,7 @@ private:
             }
         }
         if (dflash_server_crash_trace_enabled() && params_base.speculative.type() == COMMON_SPECULATIVE_TYPE_DFLASH) {
-            SRV_INF("dflash crash breadcrumb: before verify logits config graph=%d enabled=%d top_k=%d batch_tokens=%d\n",
+            SRV_DBG("dflash crash breadcrumb: before verify logits config graph=%d enabled=%d top_k=%d batch_tokens=%d\n",
                     dflash_verify_graph_enabled ? 1 : 0,
                     dflash_verify_plan.enabled ? 1 : 0,
                     dflash_verify_plan.top_k,
@@ -5771,7 +5849,7 @@ private:
         }
         llama_set_dflash_verify_logits(ctx_tgt, dflash_verify_graph_enabled, dflash_verify_plan.top_k);
         if (dflash_server_crash_trace_enabled() && params_base.speculative.type() == COMMON_SPECULATIVE_TYPE_DFLASH) {
-            SRV_INF("dflash crash breadcrumb: after verify logits config graph=%d enabled=%d top_k=%d batch_tokens=%d\n",
+            SRV_DBG("dflash crash breadcrumb: after verify logits config graph=%d enabled=%d top_k=%d batch_tokens=%d\n",
                     dflash_verify_graph_enabled ? 1 : 0,
                     dflash_verify_plan.enabled ? 1 : 0,
                     dflash_verify_plan.top_k,
@@ -5891,7 +5969,7 @@ private:
             dflash_reduced_verify_ready = false;
             const char * dflash_reduce_reason = dflash_verify_plan.reason;
             bool dflash_reduce_this_view = false;
-            if (dflash_verify_plan.enabled) {
+            if (dflash_use_reduced_verify) {
                 dflash_reduce_this_view =
                     dflash_batch_view_is_reduced_verify(slots, params_base.sampling, params_base.speculative,
                             use_rejection_sampling, ddtree_batch_active, i, n_tokens,
@@ -5978,7 +6056,7 @@ private:
                 }
 
                 if (dflash_server_profile_enabled(DFLASH_PROFILE_PREFILL)) {
-                    SRV_INF("dflash prefill capture: view_start=%d n_tokens=%d enabled=%d\n",
+                    SRV_DBG("dflash prefill capture: view_start=%d n_tokens=%d enabled=%d\n",
                             i, n_tokens, dflash_capture_needed_for_view ? 1 : 0);
                 }
             }
@@ -5999,8 +6077,25 @@ private:
                 dflash_profile_add(t_replay_sync_total, t_replay_sync_start);
             }
 
+            if (dflash_server_crash_trace_enabled() && params_base.speculative.type() == COMMON_SPECULATIVE_TYPE_DFLASH) {
+                int n_logits_requested = 0;
+                for (int32_t j = 0; j < batch_view.n_tokens; ++j) {
+                    if (batch_view.logits[j]) { n_logits_requested++; }
+                }
+                SRV_DBG("dflash crash breadcrumb: before decode ret=? batch_tokens=%d logits_requested=%d dflash_verify_graph=%d dflash_reduce_view=%d adaptive_n_max=%d\n",
+                        batch_view.n_tokens, n_logits_requested,
+                        dflash_verify_graph_enabled ? 1 : 0,
+                        dflash_reduce_this_view ? 1 : 0,
+                        slots.empty() ? -1 : slots[0].adaptive_n_max);
+            }
             const int64_t t_verify_start = ggml_time_us();
             const int ret = llama_decode(ctx_tgt, batch_view);
+            if (dflash_server_crash_trace_enabled() && params_base.speculative.type() == COMMON_SPECULATIVE_TYPE_DFLASH) {
+                const float * logits_ptr = llama_get_logits(ctx_tgt);
+                SRV_DBG("dflash crash breadcrumb: after decode ret=%d batch_tokens=%d logits_ptr=%p reduced_verify_ready=%d\n",
+                        ret, batch_view.n_tokens, (const void *) logits_ptr,
+                        dflash_reduced_verify_ready ? 1 : 0);
+            }
             if (params_base.speculative.type() == COMMON_SPECULATIVE_TYPE_DFLASH &&
                     dflash_server_crash_trace_enabled() &&
                     !pending_prefill_flushes.empty()) {
@@ -6011,7 +6106,7 @@ private:
                     const int64_t prefill_gpu_n = llama_dflash_prefill_gpu_n_tokens(ctx_tgt, pf.slot_id);
                     llama_dflash_set_active_slot(ctx_tgt, pf.slot_id);
                     const int64_t cpu_hidden_n = llama_get_layer_hidden_n_tokens(ctx_tgt, 0);
-                    SRV_INF("dflash prefill capture result: slot=%d requested=%d src_offset=%d ret=%d plan=%d planned=%d written=%d prefill_gpu_active=%d prefill_gpu_n=%lld cpu_hidden_n=%lld\n",
+                    SRV_DBG("dflash prefill capture result: slot=%d requested=%d src_offset=%d ret=%d plan=%d planned=%d written=%d prefill_gpu_active=%d prefill_gpu_n=%lld cpu_hidden_n=%lld\n",
                             pf.slot_id,
                             pf.span.n_tokens,
                             pf.span.src_offset,
@@ -6053,10 +6148,21 @@ private:
                     dflash_reduced_verify_ready = true;
                     dflash_reduced_verify_top_k = dflash_verify_plan.top_k;
                     dflash_reduced_verify_view_start = i;
-                } else if (dflash_server_profile_enabled(DFLASH_PROFILE_VERIFY)) {
-                    SRV_INF("dflash compact-output mismatch: view_start=%d n_tokens=%d expected_top_k=%d got_ptr=%d got_n=%d got_k=%d\n",
-                            i, n_tokens, dflash_verify_plan.top_k,
-                            compact_argmax != nullptr ? 1 : 0, compact_n, compact_k);
+                } else {
+                    // Backend doesn't produce argmax/TOPK output (e.g. Vulkan
+                    // doesn't support GGML_OP_TOPK).  Disable reduced verify
+                    // permanently so subsequent cycles fall back to full logits.
+                    if (!dflash_reduced_verify_broken) {
+                        SRV_WRN("DFlash reduced verify failed (no argmax output, top_k=%d); "
+                                "disabling reduced verify for this session (backend may not support TOPK)\n",
+                                dflash_verify_plan.top_k);
+                    }
+                    dflash_reduced_verify_broken = true;
+                    if (dflash_server_profile_enabled(DFLASH_PROFILE_VERIFY)) {
+                        SRV_INF("dflash compact-output mismatch: view_start=%d n_tokens=%d expected_top_k=%d got_ptr=%d got_n=%d got_k=%d\n",
+                                i, n_tokens, dflash_verify_plan.top_k,
+                                compact_argmax != nullptr ? 1 : 0, compact_n, compact_k);
+                    }
                 }
             }
             const int64_t t_verify_elapsed = ggml_time_us() - t_verify_start;
@@ -6416,7 +6522,40 @@ private:
                                 GGML_ABORT("DFlash reduced verifier output missing; falling back is unsafe because raw logits were not copied\n");
                             }
                         } else {
-                            prefetched.ids = common_sampler_sample_and_accept_n(slot.smpl.get(), ctx_tgt, slot.spec_i_batch, slot.spec_draft, false, on_accept);
+                            if (dflash_reduce_this_view && !dflash_reduced_verify_ready) {
+                                // Reduced verify was active but failed to produce argmax results,
+                                // and the logits buffer was not allocated.  Skip all speculative
+                                // token processing; clear the draft state and let the slot
+                                // continue with a fresh single-token decode.
+                                SLT_WRN(slot, "DFlash reduced verify failed and logits unavailable; "
+                                        "discarding %d draft tokens and recovering\n",
+                                        (int) slot.spec_draft.size());
+                                dflash_reduced_verify_recovery = true;
+                            } else {
+#ifdef GGML_DFLASH_DEBUG
+                                {
+                                    static int fv_probe_count = 0;
+                                    if (fv_probe_count < 2) {
+                                        fv_probe_count++;
+                                        const int n_vocab = llama_n_vocab(llama_model_get_vocab(llama_get_model(ctx_tgt)));
+                                        std::string dbg;
+                                        for (size_t p = 0; p < slot.spec_i_batch.size() && p < 4; ++p) {
+                                            const float * l = llama_get_logits_ith(ctx_tgt, slot.spec_i_batch[p]);
+                                            if (l) {
+                                                int amax = 0; float vmax = l[0]; bool has_nan = false;
+                                                for (int v = 0; v < n_vocab; ++v) {
+                                                    if (std::isnan(l[v]) || std::isinf(l[v])) { has_nan = true; break; }
+                                                    if (l[v] > vmax) { vmax = l[v]; amax = v; }
+                                                }
+                                                dbg += "p" + std::to_string(p) + ":amax=" + std::to_string(amax) + ":vmax=" + std::to_string(vmax) + ":nan=" + std::to_string((int)has_nan) + " ";
+                                            } else { dbg += "p" + std::to_string(p) + ":NULL "; }
+                                        }
+                                        SLT_WRN(slot, "FV_PROBE full_verify raw logits: %s\n", dbg.c_str());
+                                    }
+                                }
+#endif
+                                prefetched.ids = common_sampler_sample_and_accept_n(slot.smpl.get(), ctx_tgt, slot.spec_i_batch, slot.spec_draft, false, on_accept);
+                            }
                         }
                     }
                     prefetched.sample_us = ggml_time_us() - t_sample_start;
@@ -6436,6 +6575,11 @@ private:
                         std::max(0, (int) prefetched.ids.size() - (prefetched.speculative_has_bonus ? 1 : 0));
                     prefetched.n_hidden_keep = prefetched.ids.empty() ? 0 : prefetched.n_accepted_draft + 1;
                     prefetched.ready = true;
+                    if (dflash_server_crash_trace_enabled() && params_base.speculative.type() == COMMON_SPECULATIVE_TYPE_DFLASH) {
+                        SRV_INF("dflash prefetch verify: slot=%d ids=%zu n_accepted=%d n_draft=%zu reduced_ready=%d\n",
+                                slot.id, prefetched.ids.size(), prefetched.n_accepted_draft, slot.spec_draft.size(),
+                                dflash_reduced_verify_ready ? 1 : 0);
+                    }
                 }
 
                 for (auto & slot : slots) {
@@ -6784,7 +6928,26 @@ private:
                                 GGML_ABORT("DFlash reduced verifier output missing; falling back is unsafe because raw logits were not copied\n");
                             }
                         } else {
-                            ids = common_sampler_sample_and_accept_n(slot.smpl.get(), ctx_tgt, slot.spec_i_batch, slot.spec_draft, false, on_accept);
+                            // When DFlash reduced verify was active (dflash_reduce_this_view=true),
+                            // output_reserve skips the logits buffer allocation.  If the reduced
+                            // verify path then fails to produce argmax output
+                            // (reduced_verify_ready=false), we have no logits and no argmax.
+                            // Accept 0 draft tokens and recover on the next cycle.
+                            if (dflash_reduce_this_view && !dflash_reduced_verify_ready) {
+                                // Reduced verify was active but failed to produce argmax results,
+                                // and the logits buffer was not allocated because output_reserve
+                                // saw dflash_reduced_consumer_active.  We have no logits and no
+                                // argmax output.  Skip all speculative token processing; clear
+                                // the draft state and let the slot continue with a fresh
+                                // single-token decode on the next cycle (which will use full
+                                // logits since dflash_reduced_verify_broken is now true).
+                                SLT_WRN(slot, "DFlash reduced verify failed and logits unavailable; "
+                                        "discarding %d draft tokens and recovering\n",
+                                        (int) slot.spec_draft.size());
+                                dflash_reduced_verify_recovery = true;
+                            } else {
+                                ids = common_sampler_sample_and_accept_n(slot.smpl.get(), ctx_tgt, slot.spec_i_batch, slot.spec_draft, false, on_accept);
+                            }
                         }
                     }
                     profile_accept_lap(profile_accept_sample_us);
@@ -6802,6 +6965,16 @@ private:
                     n_accepted_draft = std::max(0, (int) ids.size() - (speculative_has_bonus ? 1 : 0));
                     n_hidden_keep = ids.empty() ? 0 : n_accepted_draft + 1;
 
+                    if (dflash_rx_diag_enabled()) {
+                        SRV_INF("dflash rx: slot=%d verify_result ids_size=%zu n_accepted_draft=%d n_hidden_keep=%d has_bonus=%d\n",
+                            slot.id, ids.size(), n_accepted_draft, n_hidden_keep,
+                            speculative_has_bonus ? 1 : 0);
+                    }
+                    if (dflash_token_trace_enabled()) {
+                        SRV_INF("dflash token trace: slot=%d verify ids=%s accepted=%d has_bonus=%d\n",
+                            slot.id, dflash_format_tokens(ids).c_str(), n_accepted_draft, speculative_has_bonus ? 1 : 0);
+                    }
+
                     if (params_base.speculative.type() == COMMON_SPECULATIVE_TYPE_DFLASH) {
                         llama_dflash_set_active_slot(ctx_tgt, slot.id);
                     }
@@ -6809,11 +6982,53 @@ private:
                     batch_tokens.push_back(slot.sampled);
                     batch_tokens.insert(batch_tokens.end(), slot.spec_draft.begin(), slot.spec_draft.end());
                     common_speculative_update_logits_deferred_dflash_kv(slot.get_spec(), ctx_tgt, batch_tokens, n_hidden_keep);
+                    if (dflash_rx_diag_enabled()) {
+                        SRV_INF("dflash rx: slot=%d update_logits_deferred called n_hidden_keep=%d batch_tokens=%zu\n",
+                            slot.id, n_hidden_keep, batch_tokens.size());
+                    }
                     profile_accept_lap(profile_accept_update_us);
                 }
 
+                if (dflash_server_crash_trace_enabled() && params_base.speculative.type() == COMMON_SPECULATIVE_TYPE_DFLASH) {
+                    SRV_DBG("dflash verify result: slot=%d ids=%zu n_accepted=%d n_draft=%zu reduced_ready=%d\n",
+                            slot.id, ids.size(), n_accepted_draft, n_draft,
+                            dflash_reduced_verify_ready ? 1 : 0);
+                }
                 GGML_ASSERT(slot.remaining_generation_budget(params_base) == -1 ||
                         (int32_t) ids.size() <= slot.remaining_generation_budget(params_base));
+
+                // When reduced verify failed, we have no logits or argmax output.
+                // Skip all speculative token processing (KV rollback, accept, output)
+                // but still reset the draft model's state so the next cycle is consistent.
+                if (dflash_reduced_verify_recovery) {
+                    if (params_base.speculative.type() == COMMON_SPECULATIVE_TYPE_DFLASH) {
+                        llama_dflash_set_active_slot(ctx_tgt, slot.id);
+                        common_speculative_accept(slot.get_spec(), 0);
+                        if (dflash_rx_diag_enabled()) {
+                            SRV_INF("dflash rx: slot=%d REDUCED_VERIFY_RECOVERY append_skipped=1 accept_reset=1 draft_size=%zu\n",
+                                slot.id, slot.spec_draft.size());
+                        }
+                    }
+                    // Clean up draft tokens from KV cache and prompt so the next cycle
+                    // starts from a consistent position. The draft was already decoded
+                    // into the KV cache, but we have no logits to verify against.
+                    {
+                        // Remove from n_pos_before_draft onwards (target + draft tokens)
+                        // Use llama_memory_seq_rm directly (not common_context_seq_rm) to
+                        // avoid abort on failure — recurrent memory may not support partial rm
+                        auto * mem = llama_get_memory(ctx_tgt);
+                        llama_memory_seq_rm(mem, slot.id, slot.n_pos_before_draft, -1);
+                        if (ctx_dft) {
+                            auto * mem_dft = llama_get_memory(ctx_dft.get());
+                            llama_memory_seq_rm(mem_dft, slot.id, slot.n_pos_before_draft, -1);
+                        }
+                        // Remove draft tokens + target token from prompt
+                        slot.prompt.tokens.keep_first(slot.prompt.n_tokens() - (size_t) slot.spec_draft.size() - 1);
+                    }
+                    dflash_skip_tg_slot_for_next_cycle(slot);
+                    slot.has_draft_backup = false;
+                    continue;
+                }
 
                 const int64_t t_current = ggml_time_us();
 
@@ -6962,8 +7177,20 @@ private:
 
                 // Plain MTP is handled by the dedicated block above (use_mtp_spec_accept).
                 // This path is only reached for DFlash, tree, or other speculative types.
+                if (dflash_server_crash_trace_enabled() && params_base.speculative.type() == COMMON_SPECULATIVE_TYPE_DFLASH) {
+                    SRV_INF("dflash before speculative_accept: slot=%d n_accepted_draft=%d\n",
+                            slot.id, n_accepted_draft);
+                }
                 {
                     common_speculative_accept(slot.get_spec(), n_accepted_draft);
+                }
+                if (dflash_rx_diag_enabled()) {
+                    SRV_INF("dflash rx: slot=%d speculative_accept called n_accepted_draft=%d\n",
+                        slot.id, n_accepted_draft);
+                }
+                if (dflash_server_crash_trace_enabled() && params_base.speculative.type() == COMMON_SPECULATIVE_TYPE_DFLASH) {
+                    SRV_INF("dflash after speculative_accept: slot=%d\n",
+                            slot.id);
                 }
 
                 if (is_draft_tree) {
@@ -6980,6 +7207,13 @@ private:
                     const llama_seq_id seq_backup = slot.seq_id_backup;
                     GGML_ASSERT(seq_backup >= 0);
                     const bool all_accepted_flat = (n_accepted_draft == (int) n_draft) && !had_dflash_padding;
+
+                    if (dflash_server_crash_trace_enabled() && params_base.speculative.type() == COMMON_SPECULATIVE_TYPE_DFLASH) {
+                        SRV_DBG("dflash rollback enter: slot=%d all_accepted_flat=%d n_accepted_draft=%d n_draft=%d "
+                                "n_hidden_keep=%d seq_backup=%d n_pos_before_draft=%d is_draft_tree=%d\n",
+                                slot.id, all_accepted_flat, n_accepted_draft, n_draft,
+                                n_hidden_keep, seq_backup, slot.n_pos_before_draft, is_draft_tree);
+                    }
 
                     if (params_base.speculative.type() == COMMON_SPECULATIVE_TYPE_DFLASH && is_draft_tree) {
                         llama_dflash_set_active_slot(ctx_tgt, slot.id);
@@ -7063,11 +7297,36 @@ private:
                             llama_memory_seq_rm(mem, slot.id, slot.prompt.tokens.pos_next(), -1);
                         } else {
                             llama_clear_tree_parent_ids(ctx_tgt);
-                            llama_dflash_rollback(ctx_tgt, slot.id, seq_backup, slot.n_pos_before_draft, n_hidden_keep);
+                            if (dflash_server_crash_trace_enabled()) {
+                                SRV_DBG("dflash before dflash_rollback: slot=%d n_hidden_keep=%d n_pos_before_draft=%d\n",
+                                        slot.id, n_hidden_keep, slot.n_pos_before_draft);
+                            }
+                            const int n_reeval = llama_dflash_rollback(ctx_tgt, slot.id, seq_backup, slot.n_pos_before_draft, n_hidden_keep);
+                            if (dflash_server_crash_trace_enabled()) {
+                                SRV_DBG("dflash after dflash_rollback: slot=%d n_reeval=%d\n",
+                                        slot.id, n_reeval);
+                            }
                             if (n_slots_drafted > 1) {
                                 // Multi-slot accept can immediately roll back another seq; make this
                                 // seq's async recurrent replay visible before the next mutation.
                                 llama_tape_replay_sync(ctx_tgt);
+                            }
+                            // When tape replay was unavailable (e.g., Vulkan), re-decode
+                            // the accepted positions to advance the recurrent state.
+                            // logits=false: we only need the state advance, not the output.
+                            if (n_reeval > 0) {
+                                llama_batch batch_reeval = llama_batch_init(n_reeval, 0, 1);
+                                for (int j = 0; j < n_reeval; ++j) {
+                                    const llama_pos pos = slot.n_pos_before_draft + j;
+                                    common_batch_add(batch_reeval, slot.prompt.tokens[slot.n_tokens_before_draft + j], pos, { slot.id }, false);
+                                }
+                                const int ret_reeval = llama_decode(ctx_tgt, batch_reeval);
+                                llama_batch_free(batch_reeval);
+                                if (ret_reeval != 0) {
+                                    SLT_WRN(slot, "re-decode of %d accepted tokens failed (ret=%d), "
+                                            "recurrent state may be inconsistent\n",
+                                            n_reeval, ret_reeval);
+                                }
                             }
                         }
                     } else {
