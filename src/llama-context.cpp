@@ -248,20 +248,22 @@ llama_context::llama_context(
                         __func__, cparams.n_rs_seq);
         cparams.n_rs_seq = 0;
     }
-    // QWEN35MOE workaround (DFlash regression on Vulkan): the DeltaNet recurrent-state
-    // RS-rollback snapshot builder (src/models/delta-net-base.cpp, the n_rs_seq>0 branch,
-    // tagged [TAG_RECURRENT_ROLLBACK_SPLITS]) assumes the last (n_rs_seq+1) tokens of a
-    // sequence are inside the same ubatch, which is incorrect under split_equal(). Raising
-    // n_rs_seq for the MoE (commit 9d09310cc) switched the 122B target from safe
-    // checkpoint-restore (n_rs_seq=0 -> use_ckpt_tgt=true, coherent) to the buggy RS partial
-    // rollback, corrupting the target output (garbage). Keep n_rs_seq=0 for QWEN35MOE so
-    // draft rejection uses checkpoint-restore (correct, slower) until the DeltaNet snapshot
-    // logic is fixed. QWEN35 dense (Qwen3.6) keeps n_rs_seq=8 because its RS path works.
-    if (cparams.n_rs_seq > 0 && model.arch == LLM_ARCH_QWEN35MOE) {
-        LLAMA_LOG_WARN("%s: n_rs_seq=%u clamped to 0 for QWEN35MOE (DeltaNet RS-rollback snapshot bug under split_equal; using checkpoint-restore for draft rejection)\n",
-                       __func__, cparams.n_rs_seq);
-        cparams.n_rs_seq = 0;
-    }
+    // QWEN35MOE (Qwen3.5-122B-A10B): keep n_rs_seq as requested by DFlash
+    // (common.cpp need_n_rs_seq() == draft.n_max, e.g. 4). Do NOT clamp to 0 here.
+    //
+    // Evidence (AMD Strix Halo / Vulkan, single-sequence DFlash, -np 1):
+    // clamping n_rs_seq=0 forces checkpoint-restore for draft rejection, but under
+    // the GPU cross-ring (GGML_DFLASH_GPU_RING=1) the target's DeltaNet recurrent-state
+    // cells desync from committed token positions (dozens of "non-consecutive token
+    // position N after N" warnings in llama-memory-recurrent.cpp) -> wrong drafts
+    // accepted -> repetition (rep=12). Keeping n_rs_seq=4 (RS partial rollback) makes
+    // BOTH ring=0 (CPU capture) and ring=1 (GPU ring) coherent (rep=0, zero desync
+    // warnings) and lets the GPU ring beat ring=0 (~16.0 vs ~14.6 tok/s). The earlier
+    // "n_rs_seq>0 -> garbage" note (commit 9d09310cc, DeltaNet RS-rollback snapshot bug
+    // under split_equal) is not reproduced in the single-sequence DFlash path; if
+    // split_equal multi-sequence regressions appear, fix the DeltaNet snapshot logic
+    // there, not by clamping n_rs_seq=0 here (which breaks the GPU cross-ring). QWEN35
+    // dense (Qwen3.6, n_rs_seq=8) was never clamped and its RS path already works.
     cparams.ctx_type                = params.ctx_type;
     cparams.yarn_ext_factor         = params.yarn_ext_factor  >= 0.0f ? params.yarn_ext_factor  : hparams.yarn_ext_factor;
     cparams.yarn_attn_factor        = params.yarn_attn_factor >= 0.0f ? params.yarn_attn_factor : hparams.yarn_attn_factor;
