@@ -629,20 +629,48 @@ ggml_tensor * llm_build_delta_net_base::build_recurrent_attn(
     cb(output, "attn_output", il);
 
     const size_t row_size = hparams.n_embd_s() * ggml_element_size(ssm_states_all);
+    // The gated_delta_net kernel only writes the last min(n_seq_tokens, K) snapshot
+    // slots of gdn_out; the leading slots are left untouched (caller-owned). For a
+    // full verify batch (n_seq_tokens >= K) every slot is populated, but for a
+    // decode / short batch (n_seq_tokens < K) the leading gdn_out slots are
+    // uninitialised. Writing them into ssm_states_all would clobber the older
+    // snapshot slots with garbage on every decode step. Under DFlash with stochastic
+    // sampling the adaptive controller drives spec depth to 0 once acceptance drops,
+    // so every step becomes a 1-token decode -> slots 1..K-1 stay garbage -> repeated
+    // draft-rejection rollbacks read stale recurrent state -> output degrades to
+    // gibberish (reproduced on Qwen3.6-35B-A3B, qwen35moe, n_rs_seq=4).
+    //
+    // Fix: write only the populated gdn_out slots (the newest n_pop states -> state
+    // slots 0..n_pop-1) and rotate the older snapshots down by n_pop slots
+    // (old slot s -> slot s + n_pop) so the recurrent-state history stays correct
+    // for rollback. Iterating k_i ascending reads each old slot before it is
+    // overwritten, so the in-place shift is safe (copies to the same persistent
+    // buffer are serialised by the scheduler).
+    const int64_t n_pop = (n_seq_tokens < K) ? n_seq_tokens : K; // kernel-populated slots
     for (int64_t k_i = 0; k_i < K; ++k_i) {
         const uint32_t cache_slot = (uint32_t) (K - 1 - k_i);
-        ggml_tensor * src = ggml_view_4d(ctx0, gdn_out,
-            S_v, S_v, H_v, n_seqs,
-            ggml_row_size(gdn_out->type, S_v),
-            ggml_row_size(gdn_out->type, S_v * S_v),
-            ggml_row_size(gdn_out->type, S_v * S_v * H_v),
-            ggml_row_size(gdn_out->type, attn_score_elems + k_i * state_size_per_snap));
-
         ggml_tensor * dst = ggml_view_2d(ctx0, ssm_states_all,
             hparams.n_embd_s(), n_seqs, ssm_states_all->nb[1],
             ((size_t) cache_slot * mem_size + kv_head) * row_size);
 
-        ggml_build_forward_expand(gf, ggml_cpy(ctx0, src, dst));
+        if (k_i >= K - n_pop) {
+            // gdn_out slot k_i holds the state after one of this batch's tokens.
+            ggml_tensor * src = ggml_view_4d(ctx0, gdn_out,
+                S_v, S_v, H_v, n_seqs,
+                ggml_row_size(gdn_out->type, S_v),
+                ggml_row_size(gdn_out->type, S_v * S_v),
+                ggml_row_size(gdn_out->type, S_v * S_v * H_v),
+                ggml_row_size(gdn_out->type, attn_score_elems + k_i * state_size_per_snap));
+            ggml_build_forward_expand(gf, ggml_cpy(ctx0, src, dst));
+        } else {
+            // gdn_out slot k_i is uninitialised (n_seq_tokens < K): rotate the older
+            // snapshot down so slot history is preserved for rollback.
+            const uint32_t old_slot = cache_slot - (uint32_t) n_pop;
+            ggml_tensor * src = ggml_view_2d(ctx0, ssm_states_all,
+                hparams.n_embd_s(), n_seqs, ssm_states_all->nb[1],
+                ((size_t) old_slot * mem_size + kv_head) * row_size);
+            ggml_build_forward_expand(gf, ggml_cpy(ctx0, src, dst));
+        }
     }
 
     return output;

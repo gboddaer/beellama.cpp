@@ -264,6 +264,12 @@ llama_context::llama_context(
     // split_equal multi-sequence regressions appear, fix the DeltaNet snapshot logic
     // there, not by clamping n_rs_seq=0 here (which breaks the GPU cross-ring). QWEN35
     // dense (Qwen3.6, n_rs_seq=8) was never clamped and its RS path already works.
+    //
+    // Update (2026-06): the DeltaNet RS-snapshot write-back bug that produced
+    // "n_rs_seq>0 -> garbage" is now fixed in build_recurrent_attn (delta-net-base.cpp):
+    // for n_seq_tokens < K the older snapshot slots are rotated down instead of being
+    // overwritten with uninitialised kernel output. This makes n_rs_seq>0 correct under
+    // stochastic sampling too (Qwen3.6-35B-A3B and Qwen3.5-122B-A10B, qwen35moe, rep=0).
     cparams.ctx_type                = params.ctx_type;
     cparams.yarn_ext_factor         = params.yarn_ext_factor  >= 0.0f ? params.yarn_ext_factor  : hparams.yarn_ext_factor;
     cparams.yarn_attn_factor        = params.yarn_attn_factor >= 0.0f ? params.yarn_attn_factor : hparams.yarn_attn_factor;
