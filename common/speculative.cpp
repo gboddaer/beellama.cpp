@@ -2238,11 +2238,27 @@ struct common_speculative_impl_dflash : public common_speculative_impl {
     }
 
     void update_drafter_kv_cache(int n_written) {
-        if (!gpu_ring_handle || n_written <= 0) {
+        if (n_written <= 0) {
             return;
         }
 
+        // The drafter KV slide is independent of the GPU cross-ring. The per-slot
+        // drafter ctx (n_ctx_dft, default 256) is intentionally small and the
+        // draft batch uses absolute positions on the target's timeline, so the
+        // oldest accepted-prefix cells must be evicted once committed_len grows
+        // past the window or every later flat/tree draft fails slot allocation
+        // (LLAMA_MEMORY_STATUS_FAILED_PREPARE -> llama_decode returns 1). The
+        // DFlash drafter's self-attention is block-local (non-causal over the
+        // query block) plus cross-attention to target hiddens, so evicting the
+        // oldest accepted-prefix cells is safe: that history is never attended.
+        // This previously ran only with the GPU ring enabled, which left the
+        // GGML_DFLASH_GPU_RING=0 (CPU cross) path filling its small KV and
+        // intermittently failing; the slide has no ring dependency.
         trim_drafter_prefix_window();
+
+        if (!gpu_ring_handle) {
+            return;
+        }
 
         const int n_update = std::min(n_written, cross_ctx);
         const int n_full_kv_update = std::min(n_update, drafter_prefix_window());
