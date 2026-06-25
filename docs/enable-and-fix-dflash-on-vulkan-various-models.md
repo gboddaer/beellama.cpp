@@ -5,11 +5,15 @@ Vulkan backend across the model set** tested on AMD Strix Halo (Radeon 8060S /
 RADV GFX1151, Mesa 25.0.7, Vulkan 1.4.309, 96 GB UMA). It consolidates the
 original Qwen3-Coder-Next enablement work with the later multi-model fixes
 (Qwen3.5-122B-A10B GPU cross-ring, Qwen3.6-35B-A3B stochastic-sampling
-corruption) and the per-model status/performance for Qwen3.6-27B and Gemma 4.
+corruption) and the per-model status/performance for Qwen3.6-27B, Gemma 4, and
+the 256K stress test results.
 
 It replaces the scattered investigation notes that were created while debugging
 the original 0% draft-token acceptance problem and the later qwen35moe
 recurrent-state regressions.
+
+**Current PR head**: `d6531e021` (`enable-dflash-qwen3-coder-next-on-vulkan`)
+**PR**: [Anbeeld/beellama.cpp#79](https://github.com/Anbeeld/beellama.cpp/pull/79)
 
 ## Summary
 
@@ -23,7 +27,7 @@ conflict.
 | Qwen3.6-27B | `qwen35` (dense) | Qwen3.6-27B-DFlash | worked | (no fix needed; performance characterized) |
 | Qwen3.5-122B-A10B | `qwen35moe` | qwen35-122b-a10b-dflash | GPU cross-ring recurrent-state desync under `n_rs_seq=0` | Keep `n_rs_seq` for QWEN35MOE (RS partial rollback) instead of clamping to 0 |
 | Qwen3.6-35B-A3B | `qwen35moe` | qwen36-35b-a3b-dflash | gibberish under stochastic sampling (0% acceptance) | Rotate DeltaNet RS snapshots for `n_seq_tokens < K` |
-| Gemma 4 31B | `gemma4` | gemma4-31b-it-dflash | worked; "own own own" under greedy, coherent under `--reasoning on`/temp=1.0 | (no runtime fix needed; sampling guidance) |
+| Gemma 4 31B | `gemma4` | gemma4-31b-it-dflash | works (FA off); FA on → "own" loop (Vulkan FA kernel ISWA bug) | `--flash-attn off` workaround; stochastic less sensitive |
 
 The two decisive runtime fixes layered on top of the coder-next enablement are:
 
@@ -66,6 +70,7 @@ The two decisive runtime fixes layered on top of the coder-next enablement are:
 | Qwen3.6-27B (dense) | 12.47 | 29.80 (0.835) | 29.94 (0.816) |
 | Qwen3-Coder-Next (MoE) | 53.26 | 34.07 (0.754) | 50.09 (0.621) |
 | Qwen3.5-122B-A10B (MoE) | 13.92 | 8.20 (0.189) | 14.92 (0.256) |
+| Gemma 4 31B | 11.34 | 17.57 (0.231) | 16.93 (0.185) |
 
 Interpretation:
 
@@ -79,10 +84,14 @@ Interpretation:
   dominates. ring=1 is at or slightly above baseline; ring=0 is slower (CPU
   capture overhead). These were already coherent; the fixes preserve that and
   make their stochastic-sampling paths coherent too.
+- **Gemma 4 31B** (`gemma4`, no DeltaNet recurrent state): DFlash is coherent
+  at ~1.5× speedup (11.34 → 17.57 tok/s) with `--flash-attn off`. ring=0 (CPU
+  capture) beats ring=1 for Gemma 4's large `n_embd` (5376). See the Gemma 4
+  section for the Vulkan DFlash + FA corruption issue.
 - **Gemma 4 31B** (`gemma4`, no DeltaNet recurrent state) is unaffected by the
-  recurrent-state fixes: ring=0 ~26.5 tok/s, ring=1 ~21.4, both coherent under
-  `--reasoning on`/temp=1.0. On Vulkan, ring=0 (CPU capture) beats ring=1 for
-  Gemma 4's large `n_embd` (5376), consistent with the quickstart guidance.
+  recurrent-state fixes. On Vulkan, ring=0 (CPU capture) beats ring=1 for Gemma 4's
+  large `n_embd` (5376). See the Gemma 4 section below for the Vulkan DFlash + FA
+  corruption issue and its workaround (`--flash-attn off`).
 
 ## Qwen3-Coder-Next enablement (`qwen3next` MoE)
 
@@ -417,40 +426,68 @@ Vulkan produces "own own own" repetition with extremely low vocabulary diversity
 (3% unique words over 512 tokens). The same prompt with `--flash-attn off` is
 fully coherent (64% unique words, correct C++ code).
 
+**Evidence table** (hard prompt, ~665 tokens, 512 generated, greedy `--temp 0`):
+
+| Configuration | Result | Vocabulary diversity |
+|---|---|---|
+| G4 baseline + FA on | ✅ Coherent C++ code | 66% unique words |
+| G4 + DFlash + FA **off** | ✅ Coherent C++ code | 64% unique words |
+| G4 + DFlash + FA **on** | ❌ "own" repetition | 3% unique words |
+
 **Root cause**: The Vulkan flash attention kernel produces incorrect attention
-weights during the DFlash draft-verification batch for Gemma 4's ISWA (Interleaved
-Sliding Window Attention) layers. Gemma 4 has a mix of SWA and FULL attention
-layers (`swa=4 full=2`), and the Vulkan FA kernel does not handle the
-attention mask correctly for the mixed SWA/FULL pattern under speculative
-decoding's draft-verification batch structure. This is consistent with:
+output during DFlash draft-verification for Gemma 4's ISWA (Interleaved Sliding
+Window Attention) layers. The precise mechanism is likely a combination of:
+(a) FA mask stride/tiling issues on ISWA's mixed SWA/FULL attention pattern,
+(b) fp16 precision accumulation during the verification batch, and
+(c) the unique batch shapes of speculative verification.
 
-- Known Vulkan FA kernel bugs: upstream PRs #12720 (unclamped mask loads),
-  #12853 (aligned mask loads) fixed mask stride issues, but the underlying
-  shader may still miscompute for the ISWA + draft-verification pattern.
-- Known Vulkan + Gemma 4 corruption: ollama#15261 documents garbled output on
-  Vulkan + Gemma 4 (fp16 MMQ precision bug, fixed in ollama v0.30.0-rc31).
-  The issue was an fp16 precision bug in the Vulkan quantized-matmul (MMQ)
-  kernel — Vulkan is explicitly noted as producing wrong answers for Gemma 4
-  under certain conditions.
-- The bug is specific to the FA kernel path during DFlash verification:
-  - Baseline (no DFlash) + FA: **coherent** (correct C++ code, 66% unique words)
-  - DFlash + FA on: **"own" repetition** (3% unique words, 499 tokens)
-  - DFlash + FA off: **coherent** (correct C++ code, 64% unique words)
+Gemma 4 has a mix of SWA and FULL attention layers (`swa=4 full=2`). The bug
+is consistent with known upstream issues:
+- Vulkan FA mask stride fixes (#12720, #12853) addressed mask loads but the
+  underlying shader may still miscompute for ISWA + draft-verification pattern
+- Vulkan + Gemma 4 fp16 MMQ precision bug (ollama#15261, fixed in ollama
+  v0.30.0-rc31) — Vulkan explicitly produces wrong answers for Gemma 4 under
+  certain conditions
+- The bug is specific to the FA kernel path during DFlash verification
+  (normal decoding with FA is correct)
 
-The FA kernel works fine for normal decoding (baseline is correct), but during
-DFlash draft verification the kernel computes wrong attention weights for the
-ISWA layers, causing the target model to accept garbage draft tokens that
-converge to "own" repetition.
+This is a **Vulkan backend limitation**, not a DFlash logic bug. On CUDA the
+issue does not reproduce. The bug may also affect other ISWA models (Gemma 3,
+Ministral 3) under similar conditions.
 
-**Workaround**: Use `--flash-attn off` for Gemma 4 DFlash on Vulkan, or use
-stochastic sampling (`--temp 1.0 --top-k 64 --top-p 0.95`) which is less
-sensitive to the numerical precision issue. The corruption only appears under
-greedy sampling (`--temp 0`) because the model's top token is the corrupted
-"own" token.
+**Workaround**: Use `--flash-attn off` for Gemma 4 DFlash on Vulkan. With FA
+off, DFlash produces coherent output at ~17-19 tok/s (ring=0) — still ~50%
+faster than baseline. Stochastic sampling (`--temp 1.0 --top-k 64 --top-p
+0.95`) is also less sensitive to the precision issue.
 
-**Note**: This is a Vulkan backend limitation, not a DFlash logic bug. On CUDA
-the issue does not reproduce because the CUDA FA kernel handles ISWA layers
-correctly.
+### GLM second-opinion review
+
+An independent review (glm-5.2:cloud via Ollama) confirmed:
+- The A/B evidence **strongly supports** the interaction between DFlash and FA
+  as the trigger
+- The workaround is **highly sound** (FA is a perf optimization, not required
+  for correctness)
+- The root cause statement was broadened from "ISWA mask corruption" to
+  "Vulkan FA precision/mask handling during DFlash verification batches" to
+  account for fp16 accumulation and batch-shape irregularities
+- The bug may affect other ISWA models (Gemma 3, Ministral 3) and should be
+  tested if those models are used with Vulkan DFlash
+
+### 256K context stress test
+
+At `-c 262144` (256K context) with the hard prompt (~665 tokens, 512 generated):
+- All 5 models fit at 256K, zero crashes, zero OOM
+- Gemma 4 ring=0 (FA off): coherent, 10.49 tok/s, acc 0.215
+- Gemma 4 ring=1 stochastic: 12.37 tok/s, acc 0.564 (above baseline)
+- Correctness (FA off): 131/200 unique words (66%), matching baseline quality
+
+| Model (256K) | Baseline gen | DFlash ring=0 | DFlash ring=1 | ring=1 stochastic | Result |
+|---|---|---|---|---|---|
+| Qwen3.6-27B | 12.36 tok/s | 21.72 (acc .746) | 21.42 (acc .743) | 14.55 (acc .434) | ✅ Best DFlash win (1.73×) |
+| 35B-A3B | 42.80 tok/s | 54.39 (acc .705) | 54.97 (acc .710) | 38.52 (acc .444) | ✅ Strong DFlash win (1.28×) |
+| Coder-Next | 53.22 tok/s | 30.25 (acc .328) | 46.68 (acc .478) | 45.29 (acc .284) | ✅ Stable, slower than baseline |
+| Gemma 4 31B | 11.33 tok/s | 10.49 (acc .215) | 10.83 (acc .185) | 12.37 (acc .564) | ✅ Stable; stochastic above baseline |
+| 122B-A10B | 19.04 tok/s | 9.67 (acc .144) | 13.22 (acc .146) | 16.23 (acc .164) | ✅ Stable, slower than baseline |
 
 ## Ruled-out or deprioritized hypotheses
 
@@ -570,6 +607,21 @@ const int output_len = n_draft + 1;
 
 and consumes only rows `1..output_len-1`.
 
+### Drafter KV slide without GPU cross-ring (commit `5b0e7533c`)
+
+Drafter KV cache is now slid correctly even without the GPU cross-ring, fixing
+the "drafter decode failed with 1" errors at 256K context. This is verified by
+the 256K regression test: all 20 runs (5 models × 4 configs) pass with zero
+crashes, zero OOM, and zero "failed to slide" warnings.
+
+### Regression unit tests (commit `da8806748`)
+
+Five new test functions in `tests/test-dflash-plumbing.cpp` guard all PR
+behavior changes. Each test was confirmed to FAIL when its corresponding fix is
+reverted. Production refactor: extracted `build_recurrent_attn`'s RS write-back
+slot decision into `llama_dflash_rs_writeback_slot_for_test()` in
+`llama-context.h` (minimal, behavior-identical).
+
 ## Diagnostics retained
 
 The following environment variables are useful for future Vulkan / Qwen3Next /
@@ -595,15 +647,41 @@ requests and the snapshot slot index selected.
 
 The Vulkan path enables DFlash across the model set by:
 
-- Coder-Next: making the drafter graph choose the correct target-context source
-  (GPU-ring → drafter KV cache; Vulkan/CPU-hidden → fresh `target_hidden`
-  projection), advancing Qwen3Next recurrent state during rollback, and keeping
-  the full query block.
-- 122B: keeping `n_rs_seq` for QWEN35MOE so the GPU cross-ring can roll back
-  DeltaNet recurrent state without desyncing.
-- 35B-A3B: rotating DeltaNet RS snapshots for `n_seq_tokens < K` so stochastic
-  sampling (which drives spec depth to 0 and turns every step into a decode)
-  does not clobber the snapshot history.
+- **Coder-Next**: making the drafter graph choose the correct target-context
+  source (GPU-ring → drafter KV cache; Vulkan/CPU-hidden → fresh
+  `target_hidden` projection), advancing Qwen3Next recurrent state during
+  rollback, and keeping the full query block.
+- **122B**: keeping `n_rs_seq` for QWEN35MOE so the GPU cross-ring can roll
+  back DeltaNet recurrent state without desyncing.
+- **35B-A3B**: rotating DeltaNet RS snapshots for `n_seq_tokens < K` so
+  stochastic sampling (which drives spec depth to 0 and turns every step into a
+  decode) does not clobber the snapshot history.
+- **Gemma 4**: Vulkan FA kernel corruption during DFlash verification for ISWA
+  layers documented; `--flash-attn off` workaround produces coherent output at
+  ~50% speedup over baseline.
+
+### PR head history
+
+| Commit | Description |
+|---|---|
+| `b788b4af1` | Original PR: dflash enable Qwen3-Coder-Next on Vulkan |
+| `648c0e9d6` | Original head: validate reduced-verify argmax on Vulkan |
+| `bcd42973f` | Sync Vulkan DFlash code from `vulkan-dflash-cross-ring` |
+| `ab2be17fd` | Keep `n_rs_seq` for QWEN35MOE (fix 122B GPU cross-ring corruption) |
+| `efb07137c` | Rotate DeltaNet RS snapshots for `n_seq_tokens < K` (fix 35B stochastic) |
+| `da8806748` | Regression unit tests + RS write-back slot helper extraction |
+| `5b0e7533c` | Slide drafter KV without GPU cross-ring (fix 256K decode fails) |
+| `d6531e021` | Document Gemma 4 Vulkan DFlash FA corruption root cause and workaround |
+
+### Verified across
+
+- **5 models** × **4 configs** (baseline, r0, r1, r1 stochastic) at both 4K and
+  256K context: all coherent, zero crashes, zero OOM
+- **Unit tests**: `test-dflash-plumbing.cpp` passes on PR head; each new test
+  confirmed to FAIL when its fix is reverted
+- **Build**: Vulkan Release, 0 errors, 50 benign warnings (no -Werror), all
+  binaries produced
+- **256K stress**: all 20 runs pass, zero "drafter decode failed with 1" errors
 
 Remaining low acceptance on out-of-distribution prompts is a drafter
 training/generalization limitation, tracked separately from the Vulkan
