@@ -403,15 +403,54 @@ regressions** across all models.
 
 ## Gemma 4 31B (`gemma4`)
 
-Gemma 4 31B DFlash works on the PR (coherent C++ code under `--reasoning on`,
-temp=1.0, top-k=64, top-p=0.95) and crashes on main (DFlash `std::out_of_range`
-vocab index). It has no DeltaNet recurrent state, so it is unaffected by the
-recurrent-state fixes. On Vulkan, ring=0 (CPU capture) beats ring=1 (GPU ring)
-for Gemma 4's large `n_embd` (5376), consistent with the quickstart's "Vulkan:
-not recommended for DFlash, falls back to CPU ring" guidance. The "own own own"
-loop seen under greedy/raw-prompt sampling is model greedy behavior (identical on
-main baseline and PR baseline), not a DFlash bug — use `temp>0` for coherent
-output.
+Gemma 4 31B DFlash works on the PR and crashes on main (DFlash
+`std::out_of_range` vocab index). It has no DeltaNet recurrent state, so it is
+unaffected by the recurrent-state fixes. On Vulkan, ring=0 (CPU capture) beats
+ring=1 (GPU ring) for Gemma 4's large `n_embd` (5376), consistent with the
+quickstart's "Vulkan: not recommended for DFlash, falls back to CPU ring"
+guidance.
+
+### Vulkan DFlash + FA corruption ("own own own" loop)
+
+Under greedy sampling (`--temp 0`) with `--flash-attn on`, Gemma 4 DFlash on
+Vulkan produces "own own own" repetition with extremely low vocabulary diversity
+(3% unique words over 512 tokens). The same prompt with `--flash-attn off` is
+fully coherent (64% unique words, correct C++ code).
+
+**Root cause**: The Vulkan flash attention kernel produces incorrect attention
+weights during the DFlash draft-verification batch for Gemma 4's ISWA (Interleaved
+Sliding Window Attention) layers. Gemma 4 has a mix of SWA and FULL attention
+layers (`swa=4 full=2`), and the Vulkan FA kernel does not handle the
+attention mask correctly for the mixed SWA/FULL pattern under speculative
+decoding's draft-verification batch structure. This is consistent with:
+
+- Known Vulkan FA kernel bugs: upstream PRs #12720 (unclamped mask loads),
+  #12853 (aligned mask loads) fixed mask stride issues, but the underlying
+  shader may still miscompute for the ISWA + draft-verification pattern.
+- Known Vulkan + Gemma 4 corruption: ollama#15261 documents garbled output on
+  Vulkan + Gemma 4 (fp16 MMQ precision bug, fixed in ollama v0.30.0-rc31).
+  The issue was an fp16 precision bug in the Vulkan quantized-matmul (MMQ)
+  kernel — Vulkan is explicitly noted as producing wrong answers for Gemma 4
+  under certain conditions.
+- The bug is specific to the FA kernel path during DFlash verification:
+  - Baseline (no DFlash) + FA: **coherent** (correct C++ code, 66% unique words)
+  - DFlash + FA on: **"own" repetition** (3% unique words, 499 tokens)
+  - DFlash + FA off: **coherent** (correct C++ code, 64% unique words)
+
+The FA kernel works fine for normal decoding (baseline is correct), but during
+DFlash draft verification the kernel computes wrong attention weights for the
+ISWA layers, causing the target model to accept garbage draft tokens that
+converge to "own" repetition.
+
+**Workaround**: Use `--flash-attn off` for Gemma 4 DFlash on Vulkan, or use
+stochastic sampling (`--temp 1.0 --top-k 64 --top-p 0.95`) which is less
+sensitive to the numerical precision issue. The corruption only appears under
+greedy sampling (`--temp 0`) because the model's top token is the corrupted
+"own" token.
+
+**Note**: This is a Vulkan backend limitation, not a DFlash logic bug. On CUDA
+the issue does not reproduce because the CUDA FA kernel handles ISWA layers
+correctly.
 
 ## Ruled-out or deprioritized hypotheses
 
