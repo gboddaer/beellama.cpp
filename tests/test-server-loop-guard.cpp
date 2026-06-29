@@ -349,5 +349,38 @@ int main() {
         assert(guard.seen(SERVER_LOOP_REGION_REASONING) == 1200);
     }
 
+    // Visible region: periodic tail detection
+    {
+        server_loop_guard guard(test_params());
+        accept_many(guard, std::vector<llama_token>(1200, 42), SERVER_LOOP_REGION_VISIBLE);
+        const auto result = guard.check(SERVER_LOOP_REGION_VISIBLE);
+        assert_triggered(result, "periodic_tail");
+        assert(result.period == 1);
+    }
+
+    // Visible region: independent from reasoning region
+    {
+        server_loop_guard guard(test_params());
+        accept_many(guard, std::vector<llama_token>(1200, 42), SERVER_LOOP_REGION_REASONING);
+        const auto r1 = guard.check(SERVER_LOOP_REGION_REASONING);
+        assert_triggered(r1, "periodic_tail");
+        const auto r2 = guard.check(SERVER_LOOP_REGION_VISIBLE);
+        assert_not_triggered(r2);
+    }
+
+    // Visible region: no loop with varied output
+    {
+        server_loop_guard guard(test_params());
+        std::vector<llama_token> tokens;
+        tokens.reserve(1200);
+        std::mt19937 rng(5678);
+        std::uniform_int_distribution<int> dist(0, 500);
+        for (int i = 0; i < 1200; ++i) {
+            tokens.push_back((llama_token) dist(rng));
+        }
+        accept_many(guard, tokens, SERVER_LOOP_REGION_VISIBLE);
+        assert_not_triggered(guard.check(SERVER_LOOP_REGION_VISIBLE));
+    }
+
     return 0;
 }

@@ -136,3 +136,32 @@ def test_reasoning_loop_guard_force_close_intervenes_then_continues():
     assert res.body["visible_completion_tokens"] > 0
     assert res.body["loop_guard"]["triggered"] is True
     assert res.body["loop_guard"]["action"] == "force-close"
+
+
+def test_reasoning_loop_guard_stop_triggers_on_visible_output_loop():
+    """Regression test: visible output loops (e.g. repeated Assistant: snippets)
+    should be detected by the loop guard even when no reasoning tags are used."""
+    global server
+    server.start()
+
+    res = server.make_request("POST", "/completion", data={
+        "prompt": "Assistant:\n\n<think>\n\n</think>\n\nAssistant:\n\n<think>\n\n</think>\n\nAssistant:\n\n<think>\n\n</think>\n\nAssistant:\n\n",
+        "n_predict": 16,
+        "temperature": 0.0,
+        "logit_bias": _single_token_bias(" loop"),
+        "reasoning_loop_guard": "stop",
+        "reasoning_loop_min_tokens": 4,
+        "reasoning_loop_window": 8,
+        "reasoning_loop_max_period": 2,
+        "reasoning_loop_min_coverage": 3,
+        "reasoning_loop_check_interval": 1,
+        "reasoning_loop_interventions": 0,
+    })
+
+    assert res.status_code == 200
+    assert res.body["stop_type"] == "limit"
+    assert res.body["stop_detail"] == "reasoning_loop_guard"
+    assert res.body["tokens_predicted"] < 16
+    assert res.body["loop_guard"]["triggered"] is True
+    assert res.body["loop_guard"]["action"] == "stop"
+    assert res.body["loop_guard"]["reason"] == "periodic_tail"

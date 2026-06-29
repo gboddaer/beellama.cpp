@@ -54,7 +54,9 @@ bool server_loop_guard::should_check(server_loop_guard_region region, bool token
         return false;
     }
     const int32_t n_seen = seen(region);
-    if (region == SERVER_LOOP_REGION_REASONING && n_seen < params.min_reasoning_tokens) {
+    const int32_t min_tokens = (region == SERVER_LOOP_REGION_REASONING)
+        ? params.min_reasoning_tokens : params.min_reasoning_tokens;
+    if (n_seen < min_tokens) {
         return false;
     }
     return n_seen > 0 && n_seen % params.check_interval == 0;
@@ -64,7 +66,10 @@ server_loop_guard_result server_loop_guard::check(server_loop_guard_region regio
     if (params.mode == COMMON_REASONING_LOOP_GUARD_OFF) {
         return {};
     }
-    if (region == SERVER_LOOP_REGION_REASONING && reasoning_seen < params.min_reasoning_tokens) {
+    const int32_t n_seen = seen(region);
+    const int32_t min_tokens = (region == SERVER_LOOP_REGION_REASONING)
+        ? params.min_reasoning_tokens : params.min_reasoning_tokens;
+    if (n_seen < min_tokens) {
         return {};
     }
 

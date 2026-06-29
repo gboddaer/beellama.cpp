@@ -3316,8 +3316,7 @@ private:
     bool loop_guard_accept_enabled(const server_slot & slot) const {
         return slot.task &&
                slot.smpl &&
-               slot.task->params.reasoning_loop_guard.mode != COMMON_REASONING_LOOP_GUARD_OFF &&
-               slot.task->params.sampling.reasoning_budget_tracking;
+               slot.task->params.reasoning_loop_guard.mode != COMMON_REASONING_LOOP_GUARD_OFF;
     }
 
     bool handle_loop_guard_accept(server_slot & slot, const common_sampler_accept_info & info) {
@@ -3330,7 +3329,6 @@ private:
             slot.reasoning_output_tokens++;
         } else {
             slot.visible_output_tokens++;
-            return true;
         }
 
         const bool forcing_reasoning_end = info.reasoning_state_before == REASONING_BUDGET_FORCING ||
@@ -3339,14 +3337,18 @@ private:
             return true;
         }
 
-        slot.loop_guard.accept(info.token, SERVER_LOOP_REGION_REASONING);
+        const server_loop_guard_region region = is_reasoning
+            ? SERVER_LOOP_REGION_REASONING
+            : SERVER_LOOP_REGION_VISIBLE;
+
+        slot.loop_guard.accept(info.token, region);
 
         const bool token_is_eog = llama_vocab_is_eog(vocab, info.token);
-        if (!slot.loop_guard.should_check(SERVER_LOOP_REGION_REASONING, token_is_eog, forcing_reasoning_end)) {
+        if (!slot.loop_guard.should_check(region, token_is_eog, forcing_reasoning_end)) {
             return true;
         }
 
-        const auto check = slot.loop_guard.check(SERVER_LOOP_REGION_REASONING);
+        const auto check = slot.loop_guard.check(region);
         if (!check.triggered) {
             return true;
         }
@@ -3355,7 +3357,8 @@ private:
         slot.loop_guard_reason = server_loop_guard_reason_to_string(check);
 
         const auto & params = slot.task->params.reasoning_loop_guard;
-        if (params.mode == COMMON_REASONING_LOOP_GUARD_FORCE_CLOSE &&
+        if (region == SERVER_LOOP_REGION_REASONING &&
+                params.mode == COMMON_REASONING_LOOP_GUARD_FORCE_CLOSE &&
                 slot.loop_guard_interventions < params.interventions_max &&
                 common_sampler_force_reasoning_end(slot.smpl.get())) {
             slot.loop_guard_interventions++;
