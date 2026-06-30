@@ -899,6 +899,25 @@ struct common_speculative_impl_draft_eagle3 : public common_speculative_impl {
     }
 };
 
+common_dflash_ring_write common_dflash_ring_write_plan(int ring_size, int ring_pos, int n_tokens) {
+    if (ring_size <= 0 || n_tokens <= 0) {
+        return { 0, 0, 0 };
+    }
+
+    int normalized_pos = ring_pos % ring_size;
+    if (normalized_pos < 0) {
+        normalized_pos += ring_size;
+    }
+
+    if (n_tokens <= ring_size) {
+        return { normalized_pos, n_tokens, 0 };
+    }
+
+    const int src_token_offset = n_tokens - ring_size;
+    normalized_pos = (normalized_pos + src_token_offset) % ring_size;
+    return { normalized_pos, ring_size, src_token_offset };
+}
+
 // DFlash: block-diffusion drafting with a draft-side KV cache injection
 struct common_speculative_impl_draft_dflash : public common_speculative_impl {
     common_params_speculative_draft params;

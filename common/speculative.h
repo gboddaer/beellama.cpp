@@ -20,6 +20,15 @@ enum common_speculative_type common_speculative_type_from_name(const std::string
 // convert type to string
 std::string common_speculative_type_to_str(enum common_speculative_type type);
 
+// DFlash ring buffer write plan
+typedef struct common_dflash_ring_write {
+    int ring_pos;
+    int n_tokens;
+    int src_token_offset;
+} common_dflash_ring_write;
+
+common_dflash_ring_write common_dflash_ring_write_plan(int ring_size, int ring_pos, int n_tokens);
+
 // return the max number of draft tokens based on the speculative parameters
 int32_t common_speculative_n_max(const common_params_speculative * spec);
 

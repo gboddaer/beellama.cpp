@@ -276,7 +276,7 @@ static bool test_gated_delta_net_snapshot_contract() {
     ggml_tensor * beta = mk4(1,    H, n_tokens, n_seqs);
     // 3D snapshot state (D, K, n_seqs) - mirrors build_recurrent_attn's s_3d_pad.
     ggml_tensor * state = ggml_new_tensor_3d(gctx, GGML_TYPE_F32, D, K, n_seqs);
-    ggml_tensor * result = ggml_gated_delta_net(gctx, q, k, v, g, beta, state, 1);
+    ggml_tensor * result = ggml_gated_delta_net(gctx, q, k, v, g, beta, state, K);
     ok &= expect(q && k && v && g && beta && state && result, "gated_delta_net test: tensor creation");
     if (!ok) { ggml_free(gctx); free(mem); ggml_backend_free(backend); return ok; }
 
