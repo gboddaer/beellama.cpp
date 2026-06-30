@@ -1159,6 +1159,8 @@ extern "C" {
     // cache and forces a reserve on next decode.
     LLAMA_API void llama_set_dflash_n_slots(struct llama_context * ctx, int n);
 
+    LLAMA_API void llama_set_dflash_target_kv_available(struct llama_context * ctx, bool avail);
+
     // DFlash: enable/disable tape recording for DeltaNet rollback
     // When enabled, the eval callback records per-token DeltaNet inputs (k, v, gate, beta)
     // during verification decode for efficient state replay instead of full re-evaluation
@@ -1200,12 +1202,23 @@ extern "C" {
     //   - KV cache: trims rejected draft positions (keeps accepted tokens' KV entries)
     //   - Recurrent state: restores from backup + tape replay for accepted tokens
     // This replaces the manual seq_rm/seq_cp + tape_replay sequence
-    LLAMA_API void llama_dflash_rollback(
+    // Returns the number of positions that were NOT advanced by tape replay
+    // and need re-decoding (e.g., when tape replay is unavailable on the backend).
+    // A return value of 0 means the rollback was fully successful.
+    LLAMA_API int llama_dflash_rollback(
             struct llama_context * ctx,
             llama_seq_id           seq_id,
             llama_seq_id           seq_backup,
             int                    n_past_before,
             int                    n_accepted);
+
+    // Debug-only: dump a checksum of the committed recurrent state (s_l for the
+    // first recurrent layer) for seq_id. Used to compare tape-replay vs re-decode
+    // state advancement. No-op effect on the state.
+    LLAMA_API void llama_dflash_dump_recurrent_state_dbg(
+            struct llama_context * ctx,
+            llama_seq_id           seq_id,
+            const char *           tag);
 
     // DFlash: wait for async tape replay to complete (must be called before next verify)
     LLAMA_API void llama_tape_replay_sync(struct llama_context * ctx);
@@ -1265,6 +1278,19 @@ extern "C" {
 
     LLAMA_API void   llama_dflash_cross_ring_gpu_synchronize(void * handle);
     LLAMA_API bool   llama_dflash_cross_ring_gpu_snapshot(void * handle, int ring_write_pos, int ring_filled, int ctx_window, float * data, int n_tokens, int n_layers, int n_embd);
+    // DFlash: dump captured hidden states to a file for drafter training.
+    // Format: one line per token, tab-separated:
+    //   slot_layer_idx_token_pos<tab>n_embd<tab>f1_f2_..._fn_embd
+    // Returns number of tokens written.
+    LLAMA_API int64_t llama_dflash_dump_hidden_states(struct llama_context * ctx, const char * path);
+
+    // DFlash: query captured hidden state counts.
+    // Returns total tokens captured across all layers for a given slot.
+    LLAMA_API int64_t llama_dflash_hidden_state_count(const struct llama_context * ctx, int slot);
+
+    // DFlash: layer IDs being captured (returns count, fills array if provided)
+    LLAMA_API int llama_dflash_capture_layer_ids(const struct llama_context * ctx, int32_t * out, int out_size);
+
     LLAMA_API void   llama_dflash_cross_ring_gpu_set_cross(struct llama_context * ctx, void * handle, llama_seq_id seq_id, int ring_write_pos, int ring_filled, int n_layers, int n_embd, int ctx_window);
     LLAMA_API bool   llama_dflash_kv_cache_init(struct llama_context * ctx, int ctx_size);
     LLAMA_API void   llama_dflash_kv_cache_reset(struct llama_context * ctx);

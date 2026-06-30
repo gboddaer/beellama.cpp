@@ -211,8 +211,21 @@ llama_model_qwen35::graph::graph(const llama_model & model, const llm_graph_para
         cur = build_cvec(cur, il);
         cb(cur, "l_out", il);
 
+#ifdef GGML_DFLASH_DEBUG
+        // [DIAG] GGML_DFLASH_CAPTURE_SKIP: 0=off, 1=skip recurrent layers, 2=skip all layers
+        static int dflash_capture_skip_mode = ([]() {
+            const char * e = std::getenv("GGML_DFLASH_CAPTURE_SKIP");
+            return e ? std::atoi(e) : 0; }());
+        const bool dflash_capture_skip_this =
+            (dflash_capture_skip_mode == 2) ||
+            (dflash_capture_skip_mode == 1 && hparams.is_recurrent(il));
+        if (cparams.hidden_gpu_n_seqs > 0 &&
+            !dflash_capture_skip_this &&
+            cur->ne[1] == dflash_capture_n_tokens * dflash_capture_n_seqs) {
+#else
         if (cparams.hidden_gpu_n_seqs > 0 &&
             cur->ne[1] == dflash_capture_n_tokens * dflash_capture_n_seqs) {
+#endif
             for (int s = 0; s < (int) dflash_capture_n_seqs && s < cparams.hidden_gpu_n_seqs; ++s) {
                 auto * hgpu = cparams.hidden_gpu_seqs[s];
                 if (!hgpu) {
@@ -234,11 +247,12 @@ llama_model_qwen35::graph::graph(const llama_model & model, const llm_graph_para
                     cur->ne[0], dflash_capture_n_tokens,
                     cur->nb[1],
                     (size_t) s * (size_t) dflash_capture_n_tokens * cur->nb[1]);
-                ggml_tensor * h_cont = ggml_cont(ctx0, h_slice);
                 ggml_tensor * h_dst = ggml_view_2d(ctx0, hgpu->layers[hi],
                     hgpu->layers[hi]->ne[0], (int64_t) dflash_capture_n_tokens,
                     hgpu->layers[hi]->nb[1], 0);
-                ggml_build_forward_expand(gf, ggml_cpy(ctx0, h_cont, h_dst));
+                // [FIX-TRY] drop ggml_cont: cpy the strided view directly so the scheduler
+                // does not allocate a cont temp that can alias the recurrent RS snapshot buffer.
+                ggml_build_forward_expand(gf, ggml_cpy(ctx0, h_slice, h_dst));
             }
         }
 

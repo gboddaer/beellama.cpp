@@ -21,6 +21,7 @@ static inline bool llama_dflash_gpu_hidden_supported_arch(llm_arch arch) {
     switch (arch) {
         case LLM_ARCH_QWEN35:
         case LLM_ARCH_QWEN35MOE:
+        case LLM_ARCH_QWEN3NEXT:
         case LLM_ARCH_GEMMA4:
             return true;
         default:
@@ -94,6 +95,59 @@ static inline bool llama_dflash_view_span_in_bounds_for_test(
     return offset_bytes <= total_bytes && n_bytes <= total_bytes - offset_bytes;
 }
 
+// DFlash DeltaNet RS-snapshot write-back slot decision.
+//
+// build_recurrent_attn() (src/models/delta-net-base.cpp) writes the K recurrent-state
+// snapshot slots back into ssm_states_all after a gated_delta_net step. The kernel
+// only populates the last min(n_seq_tokens, K) gdn_out snapshot slots; for a decode /
+// short batch (n_seq_tokens < K) the leading gdn_out slots are uninitialised, so the
+// older state snapshots must be rotated down by n_pop slots (old slot s -> s + n_pop)
+// instead of being clobbered with garbage. This helper captures that decision as a
+// pure function so it is unit-testable (see tests/test-dflash-plumbing.cpp) and so the
+// production write-back loop and the test share one source of truth.
+//
+// For each output slot index k_i in [0, K):
+//   cache_slot = K - 1 - k_i            (destination state slot)
+//   n_pop     = min(n_seq_tokens, K)    (kernel-populated gdn_out slots)
+//   if k_i >= K - n_pop: from_gdn=true, gdn_slot = k_i   (new state from this batch)
+//   else:                from_gdn=false, old_slot = cache_slot - n_pop  (rotated older snapshot)
+// Iterating k_i ascending visits cache_slot descending, so each old_slot is read before
+// it is overwritten by a later iteration (in-place shift is safe).
+//
+// Returns false (and leaves outputs untouched) if k_i is out of range [0, K) or the
+// inputs are invalid (K < 1, n_seq_tokens < 0, n_pop == 0).
+struct llama_dflash_rs_slot_src {
+    bool     from_gdn;   // true: source is gdn_out snapshot slot gdn_slot; false: rotate from old state slot old_slot
+    int64_t  gdn_slot;   // valid when from_gdn == true
+    uint32_t old_slot;   // valid when from_gdn == false; the older state slot to rotate FROM
+};
+
+static inline bool llama_dflash_rs_writeback_slot_for_test(
+        int64_t  K,
+        int64_t  n_seq_tokens,
+        int64_t  k_i,
+        uint32_t & cache_slot,
+        llama_dflash_rs_slot_src & src) {
+    if (K < 1 || n_seq_tokens < 0 || k_i < 0 || k_i >= K) {
+        return false;
+    }
+    const int64_t n_pop = (n_seq_tokens < K) ? n_seq_tokens : K; // kernel-populated slots
+    if (n_pop == 0) {
+        return false;
+    }
+    cache_slot = (uint32_t) (K - 1 - k_i);
+    if (k_i >= K - n_pop) {
+        src.from_gdn = true;
+        src.gdn_slot = k_i;
+        src.old_slot = 0;
+    } else {
+        src.from_gdn = false;
+        src.gdn_slot = 0;
+        src.old_slot = cache_slot - (uint32_t) n_pop; // rotate older snapshot down by n_pop
+    }
+    return true;
+}
+
 class llama_memory_recurrent;
 
 struct llama_model;
@@ -109,6 +163,7 @@ struct llama_memory_context_i;
 // DFlash: hidden state buffer for captured layer activations
 struct dflash_layer_hidden_buf {
     std::vector<float> data;
+    std::vector<int32_t> token_ids;  // token ID at each position (for training data)
     int64_t n_embd = 0;
     int64_t n_tokens = 0;
 };
@@ -700,6 +755,11 @@ public:
     void set_dflash_consume_reduced(bool enabled);
     void set_dflash_n_slots(int n);
 
+    // DFlash: mark whether the drafter's normal KV cache is populated with TARGET
+    // context K/V (GPU cross ring available). When false, the drafter graph must
+    // fall back to fresh Kcur_ctx = wk(fused_target) instead of reading the cache.
+    void set_dflash_target_kv_available(bool avail);
+
     // DFlash: reset hidden-state capture for a fresh decode() call so the
     // eval callback accumulates across this call's ubatches
     void dflash_reset_hidden_capture();
@@ -708,6 +768,11 @@ public:
     // Returns false when the eval callback was suppressed on a meta backend.
     bool dflash_hidden_capture_available() const;
     const char * dflash_hidden_capture_unavailable_reason() const;
+
+    // DFlash: dump captured hidden states to file for drafter training
+    int64_t dflash_dump_hidden_states(const char * path);
+    int64_t dflash_hidden_state_count(int slot) const;
+    int dflash_capture_layer_ids(int32_t * out, int out_size) const;
 
     // DFlash: enable/disable tape recording for DeltaNet state rollback
     void set_tape_recording(bool enable);
@@ -733,7 +798,9 @@ public:
     void set_active_dflash_slot(int slot_idx);
 
     // DFlash: replay tape data to reconstruct DeltaNet state for n_accepted tokens
-    void tape_replay(llama_seq_id seq_id, int n_accepted);
+    // Returns 0 if tape replay succeeded, or n_accepted if it was skipped (e.g., Vulkan)
+    // and the server needs to re-decode the accepted positions.
+    int tape_replay(llama_seq_id seq_id, int n_accepted);
     void tape_replay_sync();
     bool tape_replay_conv_gpu(llama_memory_recurrent * mem_recurrent, int32_t cell_idx, int n_accepted);
     bool tape_replay_conv_gpu(llama_memory_recurrent * mem_recurrent, int32_t cell_idx, int n_accepted, bool advance_pos);
@@ -741,11 +808,16 @@ public:
     bool tape_replay_gdn_direct_from_cpu_tape(llama_memory_recurrent * mem_recurrent, int32_t cell_idx, int n_accepted);
     bool tape_replay_conv_gpu_from_cpu_tape(llama_memory_recurrent * mem_recurrent, int32_t cell_idx, int n_accepted, llama_seq_id seq_id);
     void tape_replay_conv(llama_memory_recurrent * mem_recurrent, int32_t cell_idx, int n_accepted, llama_seq_id seq_id = 0);
-    void tape_replay_cpu(llama_memory_recurrent * mem_recurrent, int32_t cell_idx, int n_accepted);
+    int tape_replay_cpu(llama_memory_recurrent * mem_recurrent, int32_t cell_idx, int n_accepted);
     bool dflash_memory_seq_cp_recurrent_ordered(llama_seq_id seq_id_src, llama_seq_id seq_id_dst, llama_pos p0, llama_pos p1);
 
     // DFlash: complete rollback for hybrid models (KV trim + recurrent restore + tape replay)
-    void dflash_rollback(llama_seq_id seq_id, llama_seq_id seq_backup, int n_past_before, int n_accepted);
+    // Returns the number of positions that need re-decoding after rollback.
+    // 0 means tape replay succeeded; >0 means the server must re-decode.
+    int dflash_rollback(llama_seq_id seq_id, llama_seq_id seq_backup, int n_past_before, int n_accepted);
+
+    // DFlash debug: dump committed recurrent state checksum for seq_id (no-op on state)
+    void dflash_dump_recurrent_state_dbg(llama_seq_id seq_id, const char * tag);
 
     // DFlash: prepare DeltaNet state for branch verification (recurrent restore + tape replay, no KV touch)
     void dflash_prepare_branch(llama_seq_id seq_id, llama_seq_id seq_backup, int depth);
@@ -766,15 +838,17 @@ public:
     bool prefill_gpu_write_hidden(void * handle, int slot, int layer, int ring_pos, int src_offset, int n_tokens, int n_embd);
 
     // DFlash GPU ring: set GPU device pointer as cross data source (D2D path)
-    using set_tensor_d2d_fn_t = void (*)(void *, const void *, size_t, size_t);
+    using set_tensor_d2d_fn_t        = void (*)(void *, const void *, size_t, size_t);
+    using set_tensor_d2d_tensor_fn_t = void (*)(ggml_tensor *, const void *, size_t, size_t);
     void set_cross_data_gpu(llama_seq_id seq_id, const void * d_staging, int cross_len,
-                            int n_layers, int n_embd, set_tensor_d2d_fn_t fn_d2d);
+                            int n_layers, int n_embd, set_tensor_d2d_fn_t fn_d2d,
+                            set_tensor_d2d_tensor_fn_t fn_d2d_tensor = nullptr);
 
     bool dflash_kv_cache_init(int ctx_size);
     void dflash_kv_cache_reset();
     bool dflash_kv_cache_update(int n_tokens);
-    bool dflash_kv_cache_update_gpu(const void * d_hidden, int n_tokens, int n_layers, int n_embd_layer, set_tensor_d2d_fn_t fn_d2d);
-    bool dflash_target_kv_cache_update_gpu(llama_seq_id seq_id, llama_pos start_pos, const void * d_hidden, int n_tokens, int n_layers, int n_embd_layer, set_tensor_d2d_fn_t fn_d2d);
+    bool dflash_kv_cache_update_gpu(const void * d_hidden, int n_tokens, int n_layers, int n_embd_layer, set_tensor_d2d_fn_t fn_d2d, set_tensor_d2d_tensor_fn_t fn_d2d_tensor = nullptr);
+    bool dflash_target_kv_cache_update_gpu(llama_seq_id seq_id, llama_pos start_pos, const void * d_hidden, int n_tokens, int n_layers, int n_embd_layer, set_tensor_d2d_fn_t fn_d2d, set_tensor_d2d_tensor_fn_t fn_d2d_tensor = nullptr);
     bool dflash_kv_cache_prepare(int ctx_window);
     bool dflash_kv_cache_prepare_batch(const llama_seq_id * seq_ids, int n_seq, int ctx_window);
     dflash_kv_cache_data * dflash_kv_cache_active();

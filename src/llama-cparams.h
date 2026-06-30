@@ -71,6 +71,16 @@ struct llama_cparams {
     // DFlash: cross-attention window in tokens (how many target hidden states the drafter sees)
     int dflash_cross_ctx = 512;
 
+    // DFlash drafter: true when the drafter's normal KV cache is actually populated
+    // with TARGET context K/V (via the GPU cross ring + update_drafter_kv_cache).
+    // When false (e.g. Vulkan where the GPU cross ring is unavailable and CPU
+    // hidden capture is used), the full-attention if-branch would read an
+    // empty/stale KV cache and get NO target context -> 0%% acceptance for
+    // all-full-attention cross-attention drafters (e.g. Z-Lab Qwen3-Coder-Next).
+    // In that case the graph MUST fall back to the else branch (fresh
+    // Kcur_ctx = wk(fused_target) from the CPU-captured target_hidden).
+    bool dflash_target_kv_available = false;
+
     // DFlash drafter: number of concurrent slots the batched drafter graph is reserved
     // for. ctx_len in the drafter graph = dflash_n_slots * dflash_cross_ctx,
     // and drafter n_tokens reservation = dflash_n_slots * block_size. Set on the

@@ -6,6 +6,7 @@
 #include <algorithm>
 #include <atomic>
 #include <cstdlib>
+#include <cstdio>
 #include <cstring>
 #include <vector>
 
@@ -308,6 +309,14 @@ static dflash_kv_cache_mode dflash_kv_cache_mode_env() {
     return mode;
 }
 
+static bool dflash_rx_diag_enabled() {
+    static const bool enabled = [] {
+        const char * env = getenv("GGML_DFLASH_RX_DIAG");
+        return env && std::atoi(env) != 0;
+    }();
+    return enabled;
+}
+
 static bool dflash_input_shape_debug() {
     static const bool v = [] {
         const char * e = getenv("GGML_DFLASH_INPUT_DEBUG");
@@ -422,7 +431,8 @@ void llm_graph_input_dflash_update::set_input(const llama_ubatch * ubatch) {
 
     const float * src_data = nullptr;
     const void *  src_gpu  = nullptr;
-    auto          fn_d2d   = cross ? cross->fn_set_tensor_d2d : nullptr;
+    auto          fn_d2d        = cross ? cross->fn_set_tensor_d2d        : nullptr;
+    auto          fn_d2d_tensor = cross ? cross->fn_set_tensor_d2d_tensor : nullptr;
     int64_t       src_real = 0;
     int64_t       n_feat   = 0;
 
@@ -432,6 +442,7 @@ void llm_graph_input_dflash_update::set_input(const llama_ubatch * ubatch) {
             src_gpu = cross->dflash_kv_update_gpu;
             src_real = cross->dflash_kv_update_n_enc_real;
             fn_d2d = cross->dflash_kv_update_fn_set_tensor_d2d;
+            fn_d2d_tensor = cross->dflash_kv_update_fn_set_tensor_d2d_tensor;
         } else if (cross->v_embd_gpu) {
             n_feat = cross->n_embd;
             src_gpu = cross->v_embd_gpu;
@@ -449,8 +460,9 @@ void llm_graph_input_dflash_update::set_input(const llama_ubatch * ubatch) {
 
     if (n_copy > 0 && n_feat == target_hidden->ne[0] && (src_gpu || src_data)) {
         const size_t actual_bytes = std::min(copy_bytes, tensor_bytes);
-        if (src_gpu && fn_d2d) {
-            fn_d2d(target_hidden->data, src_gpu, 0, actual_bytes);
+        if (src_gpu && (fn_d2d || fn_d2d_tensor)) {
+            if (fn_d2d_tensor) { fn_d2d_tensor(target_hidden, src_gpu, 0, actual_bytes); }
+            else               { fn_d2d(target_hidden->data, src_gpu, 0, actual_bytes); }
         } else {
             ggml_backend_tensor_set(target_hidden, src_data, 0, actual_bytes);
         }
@@ -504,6 +516,21 @@ void llm_graph_input_dflash::set_input(const llama_ubatch * ubatch) {
         const int64_t n_copy  = std::min(src_real, ctx_len);
         const int64_t win_off = (src_real > ctx_len) ? (src_real - ctx_len) : 0;
 
+        if (dflash_rx_diag_enabled()) {
+            fprintf(stderr,
+                "DFLASH_RX set_input single: n_seqs=%d src_data=%s src_gpu=%s src_n_real=%lld src_real=%lld ctx_len=%lld n_copy=%lld win_off=%lld cross_n_embd=%lld use_kv_cache=%d\n",
+                n_seqs,
+                src_data ? "nonnull" : "null",
+                src_gpu ? "nonnull" : "null",
+                (long long) src_n_real,
+                (long long) src_real,
+                (long long) ctx_len,
+                (long long) n_copy,
+                (long long) win_off,
+                (long long) (cross ? cross->n_embd : 0),
+                use_kv_cache ? 1 : 0);
+        }
+
         const bool skip_target_hidden_upload =
             use_kv_cache && dflash_kv_cache_mode_env() == DFLASH_KV_CACHE_BOTH;
 
@@ -526,10 +553,14 @@ void llm_graph_input_dflash::set_input(const llama_ubatch * ubatch) {
                 const size_t copy_bytes  = (size_t) n_feat * (size_t) n_copy * sizeof(float);
                 const size_t actual_bytes = std::min(copy_bytes, tensor_bytes);
 
-                if (src_gpu && cross->fn_set_tensor_d2d) {
+                if (src_gpu && (cross->fn_set_tensor_d2d || cross->fn_set_tensor_d2d_tensor)) {
                     // GPU D2D path
                     const void * gpu_src = (const char *)src_gpu + (size_t)win_off * n_feat * sizeof(float);
-                    cross->fn_set_tensor_d2d(target_hidden->data, gpu_src, 0, actual_bytes);
+                    if (cross->fn_set_tensor_d2d_tensor) {
+                        cross->fn_set_tensor_d2d_tensor(target_hidden, gpu_src, 0, actual_bytes);
+                    } else {
+                        cross->fn_set_tensor_d2d(target_hidden->data, gpu_src, 0, actual_bytes);
+                    }
                 } else {
                     // CPU H2D path (fallback)
                     const float * src = src_data + win_off * n_feat;
@@ -544,6 +575,43 @@ void llm_graph_input_dflash::set_input(const llama_ubatch * ubatch) {
         }
 
         const int64_t n_real = n_copy;
+
+        if (const char * dump_path = getenv("GGML_DFLASH_CROSS_DUMP"); dump_path && dump_path[0] != '\0') {
+            const int64_t n_feat_dump = cross ? cross->n_embd : 0;
+            if (src_data && n_copy > 0 && n_feat_dump > 0) {
+                static std::atomic<int> dump_count{0};
+                // Dump the first ALL-REAL cycle (n_copy == ctx_len, no padding) so the
+                // PyTorch replay matches the W=ctx_len all-real training regime.
+                const bool all_real = (n_copy >= ctx_len) && (ctx_len >= 512);
+                if (all_real && dump_count.fetch_add(1) == 0) {
+                    FILE * f = fopen(dump_path, "w");
+                    if (f) {
+                        const int token0 = (ubatch && ubatch->token && ubatch->n_tokens > 0) ? (int) ubatch->token[0] : -1;
+                        const int pos0   = (ubatch && ubatch->pos   && ubatch->n_tokens > 0) ? (int) ubatch->pos[0]   : -1;
+                        fprintf(f, "# token0=%d pos0=%d n_copy=%lld n_feat=%lld ctx_len=%lld n_block=%lld win_off=%lld src_n_real=%lld\n",
+                                token0, pos0, (long long) n_copy, (long long) n_feat_dump,
+                                (long long) ctx_len, (long long) n_block, (long long) win_off,
+                                (long long) src_n_real);
+                        for (int64_t r = 0; r < n_copy; ++r) {
+                            const float * row = src_data + (win_off + r) * n_feat_dump;
+                            fprintf(f, "%lld", (long long) r);
+                            for (int64_t j = 0; j < n_feat_dump; ++j) {
+                                fprintf(f, " %.9g", (double) row[j]);
+                            }
+                            fprintf(f, "\n");
+                        }
+                        fclose(f);
+                    }
+                }
+            }
+        }
+
+        // RX diagnostic: log n_real at set_input time (before mask fill)
+        if (getenv("GGML_DFLASH_RX_DIAG")) {
+            fprintf(stderr, "[dflash-rx] set_input: n_real=%lld n_copy=%lld ctx_len=%lld n_block=%lld\n",
+                    (long long)n_real, (long long)n_copy, (long long)ctx_len, (long long)n_block);
+            fflush(stderr);
+        }
 
         const bool have_pos = (ubatch != nullptr) && (ubatch->pos != nullptr)
                            && ((int64_t) ubatch->n_tokens >= n_block);
@@ -569,6 +637,13 @@ void llm_graph_input_dflash::set_input(const llama_ubatch * ubatch) {
         }
 
         if (kq_mask && kq_mask->buffer) {
+            // RX diagnostic: log n_real at mask fill time
+            if (getenv("GGML_DFLASH_RX_DIAG")) {
+                fprintf(stderr, "[dflash-rx] mask fill: n_real=%lld ctx_len=%lld n_block=%lld (cross visible=%lld/%lld)\n",
+                        (long long)n_real, (long long)ctx_len, (long long)n_block,
+                        (long long)std::min(n_real, (int64_t)ctx_len), (long long)ctx_len);
+                fflush(stderr);
+            }
             dflash_fill_kq_mask(kq_mask, [&](auto * data) {
                 const int64_t n_kv = ctx_len + n_block;
                 for (int64_t q = 0; q < n_block; ++q) {
@@ -651,6 +726,23 @@ void llm_graph_input_dflash::set_input(const llama_ubatch * ubatch) {
             slot_win_off[s] = (nr > per_slot_ctx) ? (nr - per_slot_ctx) : 0;
         }
 
+        if (dflash_rx_diag_enabled()) {
+            fprintf(stderr,
+                "DFLASH_RX set_input multi: n_seqs=%d ctx_len=%lld per_slot_ctx=%d n_feat=%zu",
+                n_seqs, (long long) ctx_len, per_slot_ctx, n_feat);
+            for (int s = 0; s < n_seqs && s < LLAMA_DFLASH_MAX_SLOTS; s++) {
+                fprintf(stderr,
+                    " slot%d{gpu=%d,cpu=%d,n_real=%lld,n_copy=%lld,win_off=%lld}",
+                    s,
+                    slot_info[s].gpu ? 1 : 0,
+                    slot_info[s].data ? 1 : 0,
+                    (long long) slot_info[s].n_real,
+                    (long long) slot_n_copy[s],
+                    (long long) slot_win_off[s]);
+            }
+            fprintf(stderr, "\n");
+        }
+
         if (target_hidden && target_hidden->buffer && target_hidden->data && n_feat > 0) {
             ggml_backend_tensor_memset(target_hidden, 0, 0, ggml_nbytes(target_hidden));
 
@@ -665,16 +757,24 @@ void llm_graph_input_dflash::set_input(const llama_ubatch * ubatch) {
                     const size_t dst_offset =
                         (size_t) s * (size_t) per_slot_ctx * n_feat * sizeof(float);
 
-                    if (slot_info[s].gpu && cross && cross->fn_set_tensor_d2d) {
+                    if (slot_info[s].gpu && cross && (cross->fn_set_tensor_d2d || cross->fn_set_tensor_d2d_tensor)) {
                         const void * gpu_src =
                             (const char *) slot_info[s].gpu +
                             (size_t) slot_win_off[s] * n_feat * sizeof(float);
 
-                        cross->fn_set_tensor_d2d(
-                            target_hidden->data,
-                            gpu_src,
-                            dst_offset,
-                            copy_bytes);
+                        if (cross->fn_set_tensor_d2d_tensor) {
+                            cross->fn_set_tensor_d2d_tensor(
+                                target_hidden,
+                                gpu_src,
+                                dst_offset,
+                                copy_bytes);
+                        } else {
+                            cross->fn_set_tensor_d2d(
+                                target_hidden->data,
+                                gpu_src,
+                                dst_offset,
+                                copy_bytes);
+                        }
                     } else if (slot_info[s].data) {
                         const float * src =
                             slot_info[s].data + slot_win_off[s] * n_feat;
@@ -880,8 +980,13 @@ llm_build_dflash_draft::llm_build_dflash_draft(
     // Full-attention draft layers consume accepted-prefix K/V from the normal
     // drafter KV cache. Sliding layers still read the current target-hidden
     // window directly because their context is already bounded by SWA.
+    // ONLY build this KV-cache input when the cache will actually be populated
+    // with TARGET context K/V (GPU cross ring available). Otherwise (e.g. Vulkan,
+    // CPU hidden capture) the cache would be empty and the if-branch below would
+    // self-attend with NO target context -> 0%% acceptance for all-full-attention
+    // cross-attention drafters. Fall back to the else branch (fresh Kcur_ctx).
     llm_graph_input_attn_kv * inp_attn_kv_full = nullptr;
-    if (mctx) {
+    if (mctx && cparams.dflash_target_kv_available) {
         const bool rebind_base_from_iswa = hparams.swa_type != LLAMA_SWA_TYPE_NONE;
         const llama_kv_cache_context * base_ctx =
             rebind_base_from_iswa
@@ -892,6 +997,7 @@ llm_build_dflash_draft::llm_build_dflash_draft(
 
     // --- Fusion layer: project concatenated target hidden states ---
     ggml_tensor * fused_target = build_lora_mm(model.dflash_fc, target_hidden);
+
     fused_target = build_norm(fused_target, model.dflash_hidden_norm, nullptr, LLM_NORM_RMS, -1);
     cb(fused_target, "fused_target", -1);
 
@@ -1132,7 +1238,8 @@ llm_build_dflash_kv_update::llm_build_dflash_kv_update(
     for (int il = 0; il < n_layer; ++il) {
         ggml_tensor * Kcur_ctx = build_lora_mm(model.layers[il].wk, fused_target);
         Kcur_ctx = ggml_reshape_3d(ctx0, Kcur_ctx, n_embd_head, n_head_kv, n_tokens);
-        Kcur_ctx = build_norm(Kcur_ctx, model.layers[il].attn_k_norm, nullptr, LLM_NORM_RMS, il);
+        // Store raw K (k_norm applied after concat in the attention block)
+        cb(Kcur_ctx, "dflash_kv_update_k_raw", il);
         ggml_tensor * Vcur_ctx = build_lora_mm(model.layers[il].wv, fused_target);
         Vcur_ctx = ggml_reshape_3d(ctx0, Vcur_ctx, n_embd_head, n_head_kv, n_tokens);
 

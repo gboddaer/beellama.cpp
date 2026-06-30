@@ -76,6 +76,22 @@ static bool common_dflash_debug_logs_enabled() {
     return enabled;
 }
 
+static bool common_dflash_rx_diag_enabled() {
+    static const bool enabled = [] {
+        const char * env = std::getenv("GGML_DFLASH_RX_DIAG");
+        return env && std::atoi(env) != 0;
+    }();
+    return enabled;
+}
+
+static bool common_dflash_topk_trace_enabled() {
+    static const bool enabled = [] {
+        const char * env = std::getenv("GGML_DFLASH_TOPK_TRACE");
+        return env && std::atoi(env) != 0;
+    }();
+    return enabled;
+}
+
 static bool common_dflash_kv_cache_disabled() {
     static const bool disabled = [] {
         const char * env = std::getenv("GGML_DFLASH_DISABLE_KV_CACHE");
@@ -2222,11 +2238,27 @@ struct common_speculative_impl_dflash : public common_speculative_impl {
     }
 
     void update_drafter_kv_cache(int n_written) {
-        if (!gpu_ring_handle || n_written <= 0) {
+        if (n_written <= 0) {
             return;
         }
 
+        // The drafter KV slide is independent of the GPU cross-ring. The per-slot
+        // drafter ctx (n_ctx_dft, default 256) is intentionally small and the
+        // draft batch uses absolute positions on the target's timeline, so the
+        // oldest accepted-prefix cells must be evicted once committed_len grows
+        // past the window or every later flat/tree draft fails slot allocation
+        // (LLAMA_MEMORY_STATUS_FAILED_PREPARE -> llama_decode returns 1). The
+        // DFlash drafter's self-attention is block-local (non-causal over the
+        // query block) plus cross-attention to target hiddens, so evicting the
+        // oldest accepted-prefix cells is safe: that history is never attended.
+        // This previously ran only with the GPU ring enabled, which left the
+        // GGML_DFLASH_GPU_RING=0 (CPU cross) path filling its small KV and
+        // intermittently failing; the slide has no ring dependency.
         trim_drafter_prefix_window();
+
+        if (!gpu_ring_handle) {
+            return;
+        }
 
         const int n_update = std::min(n_written, cross_ctx);
         const int n_full_kv_update = std::min(n_update, drafter_prefix_window());
@@ -2574,6 +2606,19 @@ struct common_speculative_impl_dflash : public common_speculative_impl {
             llama_set_dflash_gpu_capture(ctx_tgt, false);
             LOG_WRN("dflash: GPU cross ring unavailable; using CPU hidden capture\n");
         }
+        // Tell the drafter graph whether its normal KV cache will be populated with
+        // TARGET context K/V from the ring. This needs the backend's KV D2D helpers
+        // (dflash_kv_cache_write_d2d / _append_d2d / _interleave), which are
+        // CUDA-only today; Vulkan does not register them, so llama_dflash_kv_cache_init
+        // returns false there (the function lookup fails before any allocation).
+        // Enabling the target-KV path without a populated cache makes the drafter
+        // self-attend with empty target KV -> ~0% acceptance (the ring-ON regression:
+        // Coder-Next ring-ON went from ~1.2% to ~58% once this was gated on the actual
+        // KV-cache availability instead of just the ring handle). Gate the flag on
+        // the real KV-cache availability, not merely on the ring handle existing.
+        llama_dflash_kv_cache_set_active_seq(ctx_dft, 0);
+        const bool drafter_kv_cache_ok = llama_dflash_kv_cache_init(ctx_dft, cross_ctx);
+        llama_set_dflash_target_kv_available(ctx_dft, gpu_ring_handle != nullptr && drafter_kv_cache_ok);
     }
 
     ~common_speculative_impl_dflash() override {
@@ -2656,7 +2701,17 @@ struct common_speculative_impl_dflash : public common_speculative_impl {
         if (!validate_target_hiddens("begin")) {
             return;
         }
+        if (common_dflash_rx_diag_enabled()) {
+            LOG_INF("DFLASH_RX begin: pre_capture seq=%d ring_filled=%d committed_len=%d prefill_flushed=%d prefill_flush_written=%d prefill_suffix_seen=%d\n",
+                seq_id, ring_filled, committed_len,
+                prefill_flushed ? 1 : 0, prefill_flush_written,
+                prefill_suffix_seen ? 1 : 0);
+        }
         capture_target_hiddens();
+        if (common_dflash_rx_diag_enabled()) {
+            LOG_INF("DFLASH_RX begin: post_capture seq=%d ring_filled=%d committed_len=%d\n",
+                seq_id, ring_filled, committed_len);
+        }
     }
 
     bool process(const llama_batch & /*batch*/) override {
@@ -2982,10 +3037,25 @@ struct common_speculative_impl_dflash : public common_speculative_impl {
             const llama_token id_last = dp.id_last;
             const int32_t n_max_eff = dp.n_max > 0 ? dp.n_max : (block_size - 1);
             const int n_draft = std::min(block_size - 1, n_max_eff);
+
+            if (common_dflash_rx_diag_enabled()) {
+                LOG_INF("DFLASH_RX draft: seq=%d precheck committed_len=%d ring_filled=%d ring_write_pos=%d cpu_ring_valid=%d gpu_ring=%d n_draft=%d\n",
+                    seq_id, committed_len, ring_filled, ring_write_pos,
+                    cpu_ring_valid ? 1 : 0, gpu_ring_handle ? 1 : 0, n_draft);
+            }
+
             if (committed_len == 0) {
+                if (common_dflash_rx_diag_enabled()) {
+                    LOG_INF("DFLASH_RX draft: seq=%d SKIP reason=committed_len_zero ring_filled=%d\n",
+                        seq_id, ring_filled);
+                }
                 continue;
             }
             if (invalid_reduced_logits_fail_closed) {
+                if (common_dflash_rx_diag_enabled()) {
+                    LOG_INF("DFLASH_RX draft: seq=%d SKIP reason=invalid_reduced_logits_fail_closed committed_len=%d ring_filled=%d\n",
+                        seq_id, committed_len, ring_filled);
+                }
                 continue;
             }
 
@@ -2996,7 +3066,16 @@ struct common_speculative_impl_dflash : public common_speculative_impl {
             common_dflash_align_drafter_seq_or_clear(ctx_dft, seq_id, committed_len, "flat draft");
 
             int cross_len = build_cross_data(ctx_dft);
+            if (common_dflash_rx_diag_enabled()) {
+                LOG_INF("DFLASH_RX draft: seq=%d after_build_cross_data cross_len=%d committed_len=%d ring_filled=%d cpu_ring_valid=%d gpu_ring=%d\n",
+                    seq_id, cross_len, committed_len, ring_filled,
+                    cpu_ring_valid ? 1 : 0, gpu_ring_handle ? 1 : 0);
+            }
             if (cross_len <= 0) {
+                if (common_dflash_rx_diag_enabled()) {
+                    LOG_INF("DFLASH_RX draft: seq=%d SKIP reason=cross_len_nonpositive cross_len=%d committed_len=%d ring_filled=%d\n",
+                        seq_id, cross_len, committed_len, ring_filled);
+                }
                 continue;
             }
 
@@ -3005,13 +3084,18 @@ struct common_speculative_impl_dflash : public common_speculative_impl {
             // build drafter batch: [id_last, mask, mask, ..., mask]
             // positions stay on the target model's absolute timeline so RoPE
             // tracks the accepted suffix instead of restarting at the window.
-            // batch size adapts to n_draft+1 (saves compute when n_max < block_size-1)
-            const int batch_len = n_draft + 1;
+            // IMPORTANT: DFlash attention is non-causal over the query block.
+            // The drafter was trained/inferred against a fixed full block, so
+            // truncating the batch to n_draft+1 changes the attention graph and
+            // can change even the first draft token. Keep the full block here
+            // and only consume the first n_draft predictions below.
+            const int batch_len = block_size;
+            const int output_len = n_draft + 1; // root + consumed draft positions
             const int draft_pos_base = committed_len;
             common_batch_clear(batch_dft);
             common_batch_add(batch_dft, id_last, draft_pos_base, { seq_id }, true);
             for (int i = 1; i < batch_len; ++i) {
-                common_batch_add(batch_dft, mask_token_id, draft_pos_base + i, { seq_id }, true);
+                common_batch_add(batch_dft, mask_token_id, draft_pos_base + i, { seq_id }, i < output_len);
             }
 
             const int64_t t2 = ggml_time_us();
@@ -3033,7 +3117,7 @@ struct common_speculative_impl_dflash : public common_speculative_impl {
                 const int argmax_rows = llama_get_logits_argmax_n(ctx_dft);
                 if (argmax) {
                     const int n_vocab = llama_vocab_n_tokens(llama_model_get_vocab(model_dft));
-                    if (!common_dflash_argmax_shape_valid(__func__, argmax_rows, batch_len, K_flat)) {
+                    if (!common_dflash_argmax_shape_valid(__func__, argmax_rows, output_len, K_flat)) {
                         if (dp.draft_log_probs) {
                             dp.draft_log_probs->clear();
                         }
@@ -3041,8 +3125,30 @@ struct common_speculative_impl_dflash : public common_speculative_impl {
                         continue;
                     }
 
+                    if (common_dflash_topk_trace_enabled() && output_len > 1) {
+                        const int row = 1;
+                        std::string ids = "[";
+                        std::string probs = "[";
+                        for (int k = 0; k < K_flat; ++k) {
+                            if (k) {
+                                ids += ",";
+                                probs += ",";
+                            }
+                            ids += std::to_string(argmax[row * K_flat + k]);
+                            if (argmax_probs) {
+                                probs += std::to_string(argmax_probs[row * K_flat + k]);
+                            } else {
+                                probs += "nan";
+                            }
+                        }
+                        ids += "]";
+                        probs += "]";
+                        LOG_INF("DFLASH_TOPK_TRACE flat seq=%d committed=%d id_last=%d row=%d K=%d ids=%s logp=%s\n",
+                                (int) seq_id, committed_len, (int) id_last, row, K_flat, ids.c_str(), probs.c_str());
+                    }
+
                     // GPU argmax path - only top-k ids/probs are transferred.
-                    for (int i = 1; i < batch_len && (int) result.size() < n_draft; ++i) {
+                    for (int i = 1; i < output_len && (int) result.size() < n_draft; ++i) {
                         const auto params = dp;
                         if (argmax_probs && p_min > 0.0f && (int) result.size() >= params.n_min) {
                             float log_prob = argmax_probs[i * K_flat];
@@ -3073,7 +3179,7 @@ struct common_speculative_impl_dflash : public common_speculative_impl {
                 } else {
                     // fallback: CPU argmax over full vocab
                     const int n_vocab_dft = llama_vocab_n_tokens(llama_model_get_vocab(model_dft));
-                    for (int i = 1; i < batch_len && (int) result.size() < n_draft; ++i) {
+                    for (int i = 1; i < output_len && (int) result.size() < n_draft; ++i) {
                         float * logits = llama_get_logits_ith(ctx_dft, i);
                         if (!logits) {
                             break;
@@ -3616,6 +3722,10 @@ private:
     // called after initial prefill — grab all hidden states
     void capture_target_hiddens() {
         if (!common_dflash_target_capture_ready_or_skip(ctx_tgt)) {
+            if (common_dflash_rx_diag_enabled()) {
+                LOG_INF("DFLASH_RX capture_target_hiddens: seq=%d EARLY_EXIT reason=capture_not_ready committed_len=%d ring_filled=%d\n",
+                    seq_id, committed_len, ring_filled);
+            }
             ring_write_pos = 0;
             ring_filled = 0;
             committed_len = 0;
@@ -3626,10 +3736,22 @@ private:
         llama_dflash_set_active_slot(ctx_tgt, seq_id);
 
         int32_t n_slots = llama_get_n_layer_hiddens(ctx_tgt);
-        if (n_slots == 0) return;
+        if (n_slots == 0) {
+            if (common_dflash_rx_diag_enabled()) {
+                LOG_INF("DFLASH_RX capture_target_hiddens: seq=%d EARLY_EXIT reason=n_slots_zero committed_len=%d ring_filled=%d\n",
+                    seq_id, committed_len, ring_filled);
+            }
+            return;
+        }
 
         int64_t n_tokens = llama_get_layer_hidden_n_tokens(ctx_tgt, 0);
-        if (n_tokens <= 0) return;
+        if (n_tokens <= 0) {
+            if (common_dflash_rx_diag_enabled()) {
+                LOG_INF("DFLASH_RX capture_target_hiddens: seq=%d EARLY_EXIT reason=n_tokens_nonpositive n_tokens=%lld committed_len=%d ring_filled=%d\n",
+                    seq_id, (long long) n_tokens, committed_len, ring_filled);
+            }
+            return;
+        }
 
         LOG_DBG("DFLASH_DBG capture_target_hiddens: n_tokens=%lld ring_write_pos=%d ring_filled=%d committed_len=%d\n",
             (long long) n_tokens, ring_write_pos, ring_filled, committed_len);
@@ -3643,10 +3765,19 @@ private:
         reset_invalid_reduced_logits_state();
         common_dflash_reset_drafter_seq_and_kv_cache(ctx_dft, seq_id, "capture target hiddens");
         const int actual_written = ring_write(to_store, start_offset, true);
+        if (common_dflash_rx_diag_enabled()) {
+            LOG_INF("DFLASH_RX capture_target_hiddens: seq=%d n_tokens=%lld start_offset=%d to_store=%d actual_written=%d ring_filled=%d ring_write_pos=%d discarded=%d\n",
+                seq_id, (long long) n_tokens, start_offset, to_store, actual_written,
+                ring_filled, ring_write_pos, ring_write_discarded ? 1 : 0);
+        }
         if (ring_write_discarded) {
             return;
         }
         committed_len = start_offset + actual_written;
+        if (common_dflash_rx_diag_enabled()) {
+            LOG_INF("DFLASH_RX capture_target_hiddens: seq=%d committed_after=%d ring_filled=%d\n",
+                seq_id, committed_len, ring_filled);
+        }
         update_drafter_kv_cache(actual_written);
     }
 
@@ -3659,7 +3790,18 @@ private:
         llama_dflash_set_active_slot(ctx_tgt, seq_id);
 
         int32_t n_slots = llama_get_n_layer_hiddens(ctx_tgt);
-        if (n_slots == 0 || n_accepted <= 0) {
+        if (n_slots == 0) {
+            if (common_dflash_rx_diag_enabled()) {
+                LOG_INF("DFLASH_RX append: seq=%d EARLY_EXIT reason=n_slots_zero requested=%d committed_len=%d ring_filled=%d\n",
+                    seq_id, n_accepted, committed_len, ring_filled);
+            }
+            return;
+        }
+        if (n_accepted <= 0) {
+            if (common_dflash_rx_diag_enabled()) {
+                LOG_INF("DFLASH_RX append: seq=%d EARLY_EXIT reason=request_zero requested=%d committed_len=%d ring_filled=%d\n",
+                    seq_id, n_accepted, committed_len, ring_filled);
+            }
             return;
         }
 
@@ -3678,7 +3820,19 @@ private:
                 last5[0], last5[1], last5[2], last5[3], last5[4]);
         }
 
+        const int ring_filled_before = ring_filled;
+        const int committed_before = committed_len;
+        const int write_pos_before = ring_write_pos;
+
         const int actual_written = ring_write(n_accepted);
+        if (common_dflash_rx_diag_enabled()) {
+            LOG_INF("DFLASH_RX append: seq=%d requested=%d actual_written=%d ring_filled_before=%d ring_filled_after=%d committed_before=%d write_pos_before=%d write_pos_after=%d discarded=%d defer_kv=%d\n",
+                seq_id, n_accepted, actual_written,
+                ring_filled_before, ring_filled,
+                committed_before, write_pos_before, ring_write_pos,
+                ring_write_discarded ? 1 : 0,
+                defer_drafter_kv_cache ? 1 : 0);
+        }
         if (ring_write_discarded) {
             return;
         }
@@ -3689,6 +3843,10 @@ private:
             return;
         }
         committed_len += actual_written;
+        if (common_dflash_rx_diag_enabled()) {
+            LOG_INF("DFLASH_RX append: seq=%d committed_after=%d ring_filled=%d deferred_kv_tokens=%d\n",
+                seq_id, committed_len, ring_filled, deferred_drafter_kv_tokens);
+        }
         if (defer_drafter_kv_cache) {
             defer_drafter_kv_cache_update(actual_written);
         } else {
@@ -4561,7 +4719,11 @@ void common_speculative_draft_batch(
     const llama_model * model_dft  = llama_get_model(ctx_dft);
     const int block_size           = llama_model_dflash_block_size(model_dft);
     const int n_draft              = std::min(block_size - 1, params.n_max);
-    const int batch_len            = n_draft + 1;
+    // Keep the full query block for flat/batched DFlash too. Tree drafting
+    // already does this. Non-causal attention over query tokens means shorter
+    // batches are not semantically equivalent to the trained full block.
+    const int batch_len            = block_size;
+    const int output_len           = n_draft + 1; // root + consumed draft positions
     const llama_token mask_tok     = (llama_token) llama_model_dflash_mask_token_id(model_dft);
 
     const int64_t t0 = ggml_time_us();
@@ -4641,7 +4803,7 @@ void common_speculative_draft_batch(
     for (const auto & rs : ready) {
         common_batch_add(batch, id_last_per_spec[rs.spec_idx], rs.draft_pos_base, { rs.seq_id }, true);
         for (int i = 1; i < batch_len; i++) {
-            common_batch_add(batch, mask_tok, rs.draft_pos_base + i, { rs.seq_id }, true);
+            common_batch_add(batch, mask_tok, rs.draft_pos_base + i, { rs.seq_id }, i < output_len);
         }
     }
 
@@ -4664,11 +4826,11 @@ void common_speculative_draft_batch(
         auto & rs     = ready[r];
         auto & result = result_per_spec[rs.spec_idx];
         std::vector<float> * log_probs = log_probs_per_spec ? &(*log_probs_per_spec)[rs.spec_idx] : nullptr;
-        const int offset = r * batch_len;
+        const int offset = r * output_len;
 
         if (argmax) {
             const int n_vocab = llama_vocab_n_tokens(llama_model_get_vocab(model_dft));
-            if (!common_dflash_argmax_shape_valid(__func__, argmax_rows, n_ready * batch_len, K_flat)) {
+            if (!common_dflash_argmax_shape_valid(__func__, argmax_rows, n_ready * output_len, K_flat)) {
                 if (log_probs) {
                     log_probs->clear();
                 }
@@ -4676,7 +4838,7 @@ void common_speculative_draft_batch(
                 return;
             }
 
-            for (int i = 1; i < batch_len && (int) result.size() < n_draft; i++) {
+            for (int i = 1; i < output_len && (int) result.size() < n_draft; i++) {
                 if (argmax_probs && params.p_min > 0.0f && (int) result.size() >= params.n_min) {
                     float log_prob = argmax_probs[(offset + i) * K_flat];
                     if (log_prob < logf(params.p_min)) {
@@ -4701,14 +4863,12 @@ void common_speculative_draft_batch(
                     log_probs->push_back(argmax_probs[(offset + i) * K_flat]);
                 }
             }
-        } else {
-            const int n_vocab = llama_vocab_n_tokens(llama_model_get_vocab(model_dft));
-            for (int i = 1; i < batch_len && (int) result.size() < n_draft; i++) {
+        } else {            const int n_vocab = llama_vocab_n_tokens(llama_model_get_vocab(model_dft));
+            for (int i = 1; i < output_len && (int) result.size() < n_draft; i++) {
                 float * logits = llama_get_logits_ith(ctx_dft, offset + i);
                 if (!logits) {
                     break;
-                }
-                llama_token best = (llama_token)(std::max_element(logits, logits + n_vocab) - logits);
+                }                llama_token best = (llama_token)(std::max_element(logits, logits + n_vocab) - logits);
                 result.push_back(best);
                 if (log_probs) {
                     log_probs->push_back(0.0f);
