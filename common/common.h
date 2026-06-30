@@ -25,6 +25,13 @@
 #define DIRECTORY_SEPARATOR '/'
 #endif // _WIN32
 
+#define COM_DBG(fmt, ...) LOG_DBG("cmn  %12.*s: " fmt, 12, __func__, __VA_ARGS__)
+#define COM_TRC(fmt, ...) LOG_TRC("cmn  %12.*s: " fmt, 12, __func__, __VA_ARGS__)
+#define COM_INF(fmt, ...) LOG_INF("cmn  %12.*s: " fmt, 12, __func__, __VA_ARGS__)
+#define COM_WRN(fmt, ...) LOG_WRN("cmn  %12.*s: " fmt, 12, __func__, __VA_ARGS__)
+#define COM_ERR(fmt, ...) LOG_ERR("cmn  %12.*s: " fmt, 12, __func__, __VA_ARGS__)
+#define COM_CNT(fmt, ...) LOG_CNT(""              fmt,               __VA_ARGS__)
+
 #define die(msg)          do { fputs("error: " msg "\n", stderr);                exit(1); } while (0)
 #define die_fmt(fmt, ...) do { fprintf(stderr, "error: " fmt "\n", __VA_ARGS__); exit(1); } while (0)
 
@@ -96,6 +103,7 @@ enum llama_example {
     LLAMA_EXAMPLE_FIT_PARAMS,
     LLAMA_EXAMPLE_RESULTS,
     LLAMA_EXAMPLE_EXPORT_GRAPH_OPS,
+    LLAMA_EXAMPLE_DOWNLOAD,
 
     LLAMA_EXAMPLE_COUNT,
 };
@@ -161,15 +169,12 @@ enum common_speculative_type {
     COMMON_SPECULATIVE_TYPE_DRAFT_SIMPLE,  // standalone draft model speculative decoding
     COMMON_SPECULATIVE_TYPE_DRAFT_EAGLE3,  // Eagle3 speculative decoding
     COMMON_SPECULATIVE_TYPE_DRAFT_MTP,     // Multi-token prediction
+    COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH,  // DFlash speculative decoding
     COMMON_SPECULATIVE_TYPE_NGRAM_SIMPLE,  // simple self-speculative decoding based on n-grams
     COMMON_SPECULATIVE_TYPE_NGRAM_MAP_K,   // self-speculative decoding with n-gram keys only
     COMMON_SPECULATIVE_TYPE_NGRAM_MAP_K4V, // self-speculative decoding with n-gram keys and 4 m-gram values
     COMMON_SPECULATIVE_TYPE_NGRAM_MOD,
     COMMON_SPECULATIVE_TYPE_NGRAM_CACHE,   // self-speculative decoding with 3-level n-gram cache
-    COMMON_SPECULATIVE_TYPE_SUFFIX,        // model-free suffix tree speculative decoding
-    COMMON_SPECULATIVE_TYPE_COPYSPEC,      // model-free copy-from-context speculative decoding
-    COMMON_SPECULATIVE_TYPE_RECYCLE,       // model-free token recycling (adjacency matrix)
-    COMMON_SPECULATIVE_TYPE_DFLASH,        // DFlash block-diffusion speculative decoding
     COMMON_SPECULATIVE_TYPE_COUNT          // number of types, unknown type
 };
 
@@ -281,7 +286,6 @@ struct common_params_sampling {
     std::vector<llama_token> reasoning_budget_end;             // end tag token sequence
     std::vector<llama_token> reasoning_budget_forced;          // forced sequence (message + end tag)
     std::string              reasoning_budget_message;         // message injected before end tag when budget exhausted
-    bool                     reasoning_budget_tracking = false; // track reasoning state even with unlimited budget
     bool                     reasoning_control = false;        // create the budget sampler on demand so reasoning can be ended at runtime
 
     bool backend_sampling = false;
@@ -295,12 +299,25 @@ struct common_params_sampling {
 };
 
 struct common_params_model {
-    std::string path        = ""; // model local path                                       // NOLINT
-    std::string url         = ""; // model url to download                                  // NOLINT
-    std::string hf_repo     = ""; // HF repo                                                // NOLINT
-    std::string hf_file     = ""; // HF file                                                // NOLINT
-    std::string docker_repo = ""; // Docker repo                                            // NOLINT
-    std::string name        = ""; // in format <user>/<model>[:<tag>] (tag is optional)     // NOLINT
+    std::string path        = ""; // model local path
+    std::string url         = ""; // model url to download
+    std::string hf_repo     = ""; // HF repo
+    std::string hf_file     = ""; // HF file
+    std::string docker_repo = ""; // Docker repo
+
+    std::string get_name() const {
+        if (!hf_repo.empty()) {
+            return hf_repo;
+        }
+        if (!docker_repo.empty()) {
+            return docker_repo;
+        }
+        return path;
+    }
+
+    bool empty() const {
+        return get_name().empty();
+    }
 };
 
 // draft-model-based speculative decoding parameters
@@ -329,10 +346,6 @@ struct common_params_speculative_draft {
     std::vector<ggml_backend_dev_t> devices; // devices to use for offloading
 
     std::vector<llama_model_tensor_buft_override> tensor_buft_overrides;
-
-    // fork: drafter context size override (0 = use model default)
-    int32_t n_ctx = 0;
-
 };
 
 struct common_params_speculative_ngram_mod {
@@ -374,136 +387,29 @@ struct common_params_speculative {
     common_params_speculative_ngram_cache ngram_cache;
 
     // DFlash-specific params (top-level for fork compat)
-    int32_t n_max        = 16; // maximum number of tokens to draft during speculative decoding
-    int32_t n_max_base   = 0;  // user's original --spec-draft-n-max before adaptive DM reduction (0 = use n_max)
-    int32_t n_min        = 0;  // minimum number of draft tokens to use for speculative decoding
-    bool    n_max_explicit = false; // user explicitly set draft max; preserve across DFlash normalization
-    int32_t branch_budget = 0; // DDTree branch nodes beyond the main draft path (0 = flat DFlash)
-    bool    branch_budget_explicit = false;
-    bool    dflash_only_args_explicit = false; // preserve DFlash-only args until draft-model auto-detect resolves
-    int32_t dflash_max_slots = 0; // max DFlash slots; 0 = match n_parallel / -np
-    float   p_split = 0.1f;   // speculative decoding split probability
-    float   p_min   = 0.0f;   // minimum speculative decoding probability (0 = disabled)
-    float   sample_temp = 0.0f; // drafter sampling temperature (0 = greedy, >0 = Gumbel sampling)
-    int32_t draft_topk  = 1;   // top-K candidates per drafter position (1 = argmax only)
-    int32_t dflash_cross_ctx = 512; // DFlash cross-attention window in target hidden-state tokens
+    int32_t branch_budget     = 0;     // DFlash tree branch budget (0 = flat DFlash)
+    int32_t draft_topk        = 1;     // DFlash drafter top-k sampling
+    int32_t dflash_cross_ctx  = 0;     // DFlash cross-attention context window (0 = unlimited)
+    float   sample_temp       = 1.0f;  // DFlash drafter sampling temperature
+    float   p_min             = 0.0f;  // DFlash minimum probability for greedy decoding
 
-    // adaptive draft-max management
-    bool    dm_adaptive         = true;  // enable adaptive draft-max
-    float   dm_fringe_min       = 0.30f; // fringe below this turns DFlash off after off-dwell
-    float   dm_fringe_max       = 0.50f; // fringe above this restores full base n_max
-    int32_t dm_off_dwell        = 8;     // consecutive weak cycles before going off
-    int32_t dm_explore_interval = 12;    // cycles between exploration drafts
-    int32_t dm_min_reach        = 3;     // fringe controller: min current-epoch samples before promotion
-    int32_t dm_probe_interval   = 16;    // cycles to wait before probing at n_max=0
-    float   dm_probe_fraction   = 0.25f; // fraction of base n_max to use as probe when disabled
-    int32_t dm_fringe_window    = 3;     // fringe controller: trailing positions to average over
-    common_speculative_dm_controller dm_controller = COMMON_SPECULATIVE_DM_CONTROLLER_PROFIT;
-    float   dm_profit_min          = 0.05f;
-    float   dm_profit_raise_margin = 0.05f;
-    float   dm_profit_lower_margin = 0.05f;
-    float   dm_profit_ewma_alpha   = 0.15f;
-    int32_t dm_profit_min_samples  = 3;
-    int32_t dm_profit_warmup       = 0;
-    int32_t dm_profit_baseline_interval = 1024;
-
-    // DFlash draft model (separate from upstream's draft.model)
-    struct common_params_model mparams_dft;
-    llama_model * model_dft = nullptr;
-    llama_context_params cparams_dft;
-
-    // copyspec: copy from context
-    int32_t copyspec_gamma      = 6;    // window size for rolling hash match
-
-    // token recycling: adjacency matrix
-    int32_t recycle_k            = 8;    // top-k successors per token
-
-    // suffix tree speculative decoding
-    int32_t suffix_max_depth    = 64;   // maximum depth of suffix tree
-    float   suffix_spec_factor  = 2.0f; // max_spec = factor * match_len + offset
-    float   suffix_spec_offset  = 0.0f; // additive offset for max speculative tokens
-    float   suffix_min_prob     = 0.1f; // prune branches below this probability
+    // Adaptive draft-max controller
+    enum common_speculative_dm_controller dm_controller = COMMON_SPECULATIVE_DM_CONTROLLER_PROFIT;
+    int32_t dm_n_max          = 8;    // current/initial draft_max
+    int32_t dm_n_min          = 0;    // floor for draft_max (0 = disable drafting)
+    int32_t dm_n_step         = 1;    // increment/decrement step size
+    int32_t dm_history_len     = 64;   // acceptance history window length
+    int32_t dm_explore_interval = 12; // cycles between exploration drafts
+    int32_t dm_min_reach        = 3;   // fringe controller: min current-epoch samples before promotion
+    int32_t dm_probe_interval   = 16;  // cycles to wait before probing at n_max=0
 
     bool has_dft() const {
-        return !draft.mparams.path.empty() || !draft.mparams.hf_repo.empty();
-    }
-
-    bool has_type(common_speculative_type t) const {
-        return std::find(types.begin(), types.end(), t) != types.end();
-    }
-
-    // fork: single-type compat helper (most fork code checks one type at a time)
-    common_speculative_type type() const {
-        if (types.empty() || (types.size() == 1 && types[0] == COMMON_SPECULATIVE_TYPE_NONE)) {
-            return COMMON_SPECULATIVE_TYPE_NONE;
-        }
-        return types.back();
-    }
-
-    void set_type(common_speculative_type t) {
-        types = { t };
-    }
-
-    void note_dflash_only_arg() {
-        dflash_only_args_explicit = true;
-    }
-
-    void apply_dflash_effective_defaults() {
-        if (!n_max_explicit) {
-            n_max = COMMON_SPECULATIVE_DFLASH_DEFAULT_N_MAX;
-            draft.n_max = n_max;
-        } else {
-            n_max = draft.n_max;
-        }
-        n_min = draft.n_min;
-        branch_budget = std::max(0, branch_budget);
-        if (branch_budget == 0) {
-            draft_topk = 1;
-        }
-    }
-
-    void reset_dflash_only_args() {
-        branch_budget = 0;
-        branch_budget_explicit = false;
-        dflash_max_slots = 0;
-        p_split = 0.1f;
-        sample_temp = 0.0f;
-        draft_topk = 1;
-        dflash_cross_ctx = 512;
-
-        dm_adaptive         = true;
-        dm_fringe_min       = 0.30f;
-        dm_fringe_max       = 0.50f;
-        dm_off_dwell        = 8;
-        dm_explore_interval = 12;
-        dm_min_reach        = 3;
-        dm_probe_interval   = 16;
-        dm_probe_fraction   = 0.25f;
-        dm_fringe_window    = 3;
-        dm_controller       = COMMON_SPECULATIVE_DM_CONTROLLER_PROFIT;
-        dm_profit_min          = 0.05f;
-        dm_profit_raise_margin = 0.05f;
-        dm_profit_lower_margin = 0.05f;
-        dm_profit_ewma_alpha   = 0.15f;
-        dm_profit_min_samples  = 3;
-        dm_profit_warmup       = 0;
-        dm_profit_baseline_interval = 1024;
-
-        dflash_only_args_explicit = false;
+        return !draft.mparams.empty();
     }
 
     uint32_t need_n_rs_seq() const {
-        // DFlash on a hybrid arch (e.g. Qwen3.5/Qwen3.6 with DeltaNet recurrent
-        // state) needs per-token recurrent-state snapshots to roll back after a
-        // partial draft rejection; without them (n_rs_seq=0) the recurrent state
-        // cannot roll back (RS-ROLLBACK-OVERFLOW), KV positions desynchronise, and
-        // the verify decode reads an uninitialized token id. The arch clamp in
-        // llama_context construction (src/llama-context.cpp) keeps n_rs_seq=0 for
-        // archs that do not support rs rollback (e.g. Qwen3Next/Coder-Next), so
-        // non-hybrid DFlash targets are unaffected.
         bool needs_rs_seq = std::any_of(types.begin(), types.end(), [&](auto t) {
-            return t == COMMON_SPECULATIVE_TYPE_DRAFT_MTP ||
-                   t == COMMON_SPECULATIVE_TYPE_DFLASH;
+            return t == COMMON_SPECULATIVE_TYPE_DRAFT_MTP || t == COMMON_SPECULATIVE_TYPE_DRAFT_EAGLE3 || t == COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH;
         });
 
         return needs_rs_seq ? draft.n_max : 0u;
@@ -542,22 +448,6 @@ enum common_reasoning_format {
     // do not extend this enum unless you absolutely have to
     // in most cases, use COMMON_REASONING_FORMAT_AUTO
     // see: https://github.com/ggml-org/llama.cpp/pull/15408
-};
-
-enum common_reasoning_loop_guard_mode {
-    COMMON_REASONING_LOOP_GUARD_OFF,
-    COMMON_REASONING_LOOP_GUARD_FORCE_CLOSE,
-    COMMON_REASONING_LOOP_GUARD_STOP,
-};
-
-struct common_reasoning_loop_guard_params {
-    common_reasoning_loop_guard_mode mode = COMMON_REASONING_LOOP_GUARD_FORCE_CLOSE;
-    int32_t min_reasoning_tokens = 1024;
-    int32_t window_tokens = 2048;
-    int32_t max_period = 512;
-    int32_t min_repeated_coverage = 768;
-    int32_t check_interval = 32;
-    int32_t interventions_max = 1;
 };
 
 
@@ -602,7 +492,6 @@ struct common_params {
 
     // offload params
     std::vector<ggml_backend_dev_t> devices; // devices to use for offloading
-    ggml_backend_dev_t output_device = nullptr; // device to use for the output tensor
 
     int32_t n_gpu_layers       = -1;    // number of layers to store in VRAM, -1 is auto, <= -2 is all
     int32_t main_gpu           = 0;     // the GPU that is used for scratch and small tensors
@@ -612,7 +501,7 @@ struct common_params {
     int32_t fit_params_min_ctx = 4096;  // minimum context size to set when trying to reduce memory use
 
     // margin per device in bytes for fitting parameters to free memory:
-    std::vector<size_t> fit_params_target = std::vector<size_t>(std::max<size_t>(llama_max_devices(), 1), 1024 * 1024*1024);
+    std::vector<size_t> fit_params_target = std::vector<size_t>(llama_max_devices(), 1024 * 1024*1024);
 
     enum llama_split_mode split_mode = LLAMA_SPLIT_MODE_LAYER; // how to split the model across GPUs
 
@@ -628,11 +517,9 @@ struct common_params {
     enum llama_pooling_type      pooling_type      = LLAMA_POOLING_TYPE_UNSPECIFIED; // pooling type for embeddings
     enum llama_attention_type    attention_type    = LLAMA_ATTENTION_TYPE_UNSPECIFIED; // attention type for embeddings
     enum llama_flash_attn_type   flash_attn_type   = LLAMA_FLASH_ATTN_TYPE_AUTO; // whether to use Flash Attention
-    bool no_fused_gdn = false;
 
     struct common_params_sampling    sampling;
     struct common_params_speculative speculative;
-    common_reasoning_loop_guard_params reasoning_loop_guard;
     struct common_params_vocoder     vocoder;
     struct common_params_diffusion   diffusion;
 
@@ -648,6 +535,7 @@ struct common_params {
     std::string input_prefix         = ""; // string to prefix user inputs with                             // NOLINT
     std::string input_suffix         = ""; // string to suffix user inputs with                             // NOLINT
     std::string logits_file          = ""; // file for saving *all* logits                                  // NOLINT
+    std::string path_prompts_log_dir = ""; // directory with logged prompts                                 // NOLINT
 
     // llama-debug specific options
     std::string logits_output_dir = "data"; // directory for saving logits output files                     // NOLINT
@@ -668,7 +556,6 @@ struct common_params {
     int32_t control_vector_layer_start = -1; // layer range for control vector
     int32_t control_vector_layer_end   = -1; // layer range for control vector
     bool    offline                    = false;
-    bool    skip_download              = false; // skip model file downloading
 
     int32_t ppl_stride      = 0;     // stride for perplexity calculations. If left at 0, the pre-existing approach will be used.
     int32_t ppl_output_type = 0;     // = 0 -> ppl output is as usual, = 1 -> ppl output is num_tokens, ppl, one per line
@@ -729,11 +616,11 @@ struct common_params {
     // multimodal models (see tools/mtmd)
     struct common_params_model mmproj;
     bool mmproj_use_gpu = true;     // use GPU for multimodal model
-    bool mmproj_gpu_swap = false;   // swap MTP↔mmproj VRAM on vision requests
     bool no_mmproj = false;         // explicitly disable multimodal model
-    std::vector<std::string> image; // path to image file(s)
+    std::vector<std::string> image; // path to image file(s) ; TODO: change the name to "media"
     int image_min_tokens = -1;
     int image_max_tokens = -1;
+    int mtmd_batch_max_tokens = 1024;
 
     // finetune
     struct lr_opt lr;
@@ -758,7 +645,7 @@ struct common_params {
     bool    cache_prompt        = true;  // whether to enable prompt caching
     bool    cache_idle_slots    = true;  // save and clear idle slots upon starting a new task
     int32_t n_ctx_checkpoints   = 32;    // max number of context checkpoints per slot
-    int32_t checkpoint_min_step = 256;   // minimum spacing between context checkpoints
+    int32_t checkpoint_min_step = 8192;  // minimum spacing between context checkpoints
     int32_t cache_ram_mib       = 8192;  // -1 = no limit, 0 - disable, 1 = 1 MiB, etc.
 
     std::string hostname      = "127.0.0.1";
@@ -782,12 +669,6 @@ struct common_params {
 
     // UI configs
     bool ui = true;
-
-    // Deprecated: use ui, ui_mcp_proxy, ui_config_json instead
-    bool webui = ui;
-    bool webui_mcp_proxy = false;
-    std::string webui_config_json;
-
     bool ui_mcp_proxy = false;
     std::string ui_config_json;
 
@@ -800,10 +681,11 @@ struct common_params {
     std::vector<std::string> server_tools;
 
     // router server configs
-    std::string models_dir    = ""; // directory containing models for the router server
-    std::string models_preset = ""; // directory containing model presets for the router server
-    int models_max = 4;             // maximum number of models to load simultaneously
-    bool models_autoload = true;    // automatically load models when requested via the router server
+    std::string models_dir    = "";     // directory containing models for the router server
+    std::string models_preset = "";     // directory containing model presets for the router server
+    int models_max = 4;                 // maximum number of models to load simultaneously
+    bool models_autoload = true;        // automatically load models when requested via the router server
+    std::string models_preset_hf = "";  // show a warning about remote presets on router loaded (if not empty)
 
     bool log_json = false;
 
@@ -1005,6 +887,9 @@ struct common_file_info {
 };
 std::vector<common_file_info> fs_list(const std::string & path, bool include_directories);
 
+// fs open, also handle UTF8 on Windows
+std::ifstream fs_open_ifstream(const std::string & fname, std::ios_base::openmode mode);
+
 //
 // TTY utils
 //
@@ -1119,15 +1004,6 @@ std::vector<llama_token> common_tokenize(
                         bool   add_special,
                         bool   parse_special = false);
 
-// Tokenizes text for sampler-internal sentinels. Some tokenizers add a dummy
-// leading whitespace token when tokenizing standalone non-whitespace text; that
-// token is not part of the literal sequence generated at the current cursor.
-std::vector<llama_token> common_tokenize_sampler_text(
-    const struct llama_vocab * vocab,
-           const std::string & text,
-                        bool   add_special,
-                        bool   parse_special = false);
-
 // tokenizes a token into a piece, optionally renders special/control tokens
 // should work similar to Python's `tokenizer.id_to_piece`
 std::string common_token_to_piece(
@@ -1230,7 +1106,10 @@ struct common_prompt_checkpoint {
 
     std::vector<uint8_t> data_tgt;
     std::vector<uint8_t> data_dft;
-    std::vector<uint8_t> ring_data; // fork: DFlash ring buffer state
+
+    // (optional) speculative-decoding implementation state stashed with the checkpoint
+    // (e.g. eagle3's deferred-boundary g_embd row)
+    std::vector<uint8_t> data_spec;
 
     size_t size() const;
 

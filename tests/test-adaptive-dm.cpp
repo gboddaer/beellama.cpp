@@ -468,7 +468,7 @@ int main() {
     state.reset_profit_if_config_changed(empty_spec, 1, 0);
     // actually need a proper spec struct; let's use the simpler check
     common_params_speculative spec;
-    spec.n_max = 8;
+    spec.draft.n_max = 8;
     spec.branch_budget = 0;
     spec.draft_topk = 1;
     spec.dflash_cross_ctx = 1024;
@@ -503,7 +503,7 @@ int main() {
     {
         server_adaptive_dm_state position;
         common_params_speculative position_spec;
-        position_spec.n_max = 16;
+        position_spec.draft.n_max = 16;
         position_spec.branch_budget = 0;
         position_spec.draft_topk = 1;
         position_spec.dflash_cross_ctx = 1024;
@@ -623,7 +623,7 @@ int main() {
         reprobe.dm_profit_min_samples = 1;
         reprobe.dm_profit_baseline_interval = 3;
         common_params_speculative reprobe_spec;
-        reprobe_spec.n_max = 8;
+        reprobe_spec.draft.n_max = 8;
         reprobe_spec.branch_budget = 0;
         reprobe_spec.draft_topk = 1;
         reprobe_spec.dflash_cross_ctx = 1024;
@@ -651,7 +651,7 @@ int main() {
         early.dm_profit_min_samples = 1;
         early.dm_profit_baseline_interval = 1;
         common_params_speculative early_spec;
-        early_spec.n_max = 8;
+        early_spec.draft.n_max = 8;
         early_spec.branch_budget = 0;
         early_spec.draft_topk = 1;
         early_spec.dflash_cross_ctx = 1024;

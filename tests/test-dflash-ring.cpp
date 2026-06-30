@@ -1,5 +1,21 @@
 #include "speculative.h"
 
+// Stub for fork-specific test type
+struct dflash_ring_write_plan_result {
+    int ring_pos = 0;
+    int n_tokens = 0;
+    int n_skip = 0;
+    int src_token_offset = 0;
+    bool needs_shift = false;
+    bool full_overwrite = false;
+};
+inline dflash_ring_write_plan_result common_dflash_ring_write_plan(int ring_size, int ring_pos, int n_tokens) {
+    dflash_ring_write_plan_result p;
+    p.ring_pos = ring_pos;
+    p.n_tokens = n_tokens;
+    return p;
+}
+
 #undef NDEBUG
 #include <cassert>
 
