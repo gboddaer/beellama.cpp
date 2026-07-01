@@ -2,17 +2,6 @@
 #include "llama-impl.h"
 #include "llama-kv-cache.h"
 #include "llama-kv-cache-iswa.h"
-#include "llama-graph.h"
-
-// Forward declarations for DFlash graph builders
-class llm_build_dflash_draft : public llm_graph_context {
-public:
-    llm_build_dflash_draft(const llama_model & model, const llm_graph_params & params);
-};
-class llm_build_dflash_kv_update : public llm_graph_context {
-public:
-    llm_build_dflash_kv_update(const llama_model & model, const llm_graph_params & params);
-};
 
 #include <algorithm>
 #include <atomic>
@@ -115,9 +104,9 @@ void llama_model_dflash_draft::load_arch_tensors(llama_model_loader & ml) {
 
 std::unique_ptr<llm_graph_context> llama_model_dflash_draft::build_arch_graph(const llm_graph_params & params) const {
     if (params.gtype == LLM_GRAPH_TYPE_DFLASH_KV_UPDATE) {
-        return std::make_unique<llm_build_dflash_kv_update>(*this, params);
+        return std::make_unique<graph_kv_update>(*this, params);
     }
-    return std::make_unique<llm_build_dflash_draft>(*this, params);
+    return std::make_unique<graph>(*this, params);
 }
 
 // Max cross-attention context for DFlash drafter (caps VRAM growth).
@@ -908,7 +897,7 @@ void llm_graph_input_dflash::set_input(const llama_ubatch * ubatch) {
     }
 }
 
-llm_build_dflash_draft::llm_build_dflash_draft(
+graph::graph(
         const llama_model & model, const llm_graph_params & params) :
     llm_graph_context(params) {
 
@@ -1216,7 +1205,7 @@ llm_build_dflash_draft::llm_build_dflash_draft(
     ggml_build_forward_expand(gf, res->t_logits_argmax);
 }
 
-llm_build_dflash_kv_update::llm_build_dflash_kv_update(
+graph_kv_update::graph_kv_update(
         const llama_model & model, const llm_graph_params & params) :
     llm_graph_context(params) {
 
