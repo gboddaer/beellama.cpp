@@ -10,6 +10,13 @@
 #include <cstring>
 #include <vector>
 
+// Forward declarations for graph classes defined later in this file
+struct graph_kv_update;
+struct graph;
+
+// Helper functions used by both graph classes
+static int64_t dflash_max_cross_ctx();
+
 void llama_model_dflash_draft::load_arch_hparams(llama_model_loader & ml) {
     auto & hparams = this->hparams;
 
