@@ -13,6 +13,7 @@
 
 llama_kv_cache_iswa::llama_kv_cache_iswa(
         const llama_model & model,
+        const llama_hparams & hparams,
                 ggml_type   type_k,
                 ggml_type   type_v,
                      bool   v_trans,
@@ -24,7 +25,7 @@ llama_kv_cache_iswa::llama_kv_cache_iswa(
                  uint32_t   n_ubatch,
                  uint32_t   n_pad,
     const layer_filter_cb & filter,
-    const  layer_reuse_cb & reuse) : hparams(model.hparams), unified(unified) {
+    const  layer_reuse_cb & reuse) : hparams(hparams), unified(unified) {
 
     // chain filters
     const layer_filter_cb filter_base = [&](int32_t il) {
@@ -75,6 +76,7 @@ llama_kv_cache_iswa::llama_kv_cache_iswa(
 // Fork-compatible constructor with mem_other and share
 llama_kv_cache_iswa::llama_kv_cache_iswa(
         const llama_model & model,
+        const llama_hparams & hparams,
                 ggml_type   type_k,
                 ggml_type   type_v,
                      bool   v_trans,
@@ -88,7 +90,7 @@ llama_kv_cache_iswa::llama_kv_cache_iswa(
         llama_memory_i * mem_other,
     const layer_filter_cb & filter,
     const  layer_reuse_cb & reuse,
-    const layer_share_cb & share) : llama_kv_cache_iswa(model, type_k, type_v, v_trans, offload, swa_full, unified, kv_size, n_seq_max, n_ubatch, n_pad, filter, reuse) {
+    layer_share_cb share) : llama_kv_cache_iswa(model, hparams, type_k, type_v, v_trans, offload, swa_full, unified, kv_size, n_seq_max, n_ubatch, n_pad, filter, reuse) {
     // mem_other and share are ignored for now (compatibility)
     (void)mem_other;
     (void)share;

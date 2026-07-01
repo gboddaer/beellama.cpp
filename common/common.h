@@ -169,12 +169,15 @@ enum common_speculative_type {
     COMMON_SPECULATIVE_TYPE_DRAFT_SIMPLE,  // standalone draft model speculative decoding
     COMMON_SPECULATIVE_TYPE_DRAFT_EAGLE3,  // Eagle3 speculative decoding
     COMMON_SPECULATIVE_TYPE_DRAFT_MTP,     // Multi-token prediction
-    COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH,  // DFlash speculative decoding
     COMMON_SPECULATIVE_TYPE_NGRAM_SIMPLE,  // simple self-speculative decoding based on n-grams
     COMMON_SPECULATIVE_TYPE_NGRAM_MAP_K,   // self-speculative decoding with n-gram keys only
     COMMON_SPECULATIVE_TYPE_NGRAM_MAP_K4V, // self-speculative decoding with n-gram keys and 4 m-gram values
     COMMON_SPECULATIVE_TYPE_NGRAM_MOD,
     COMMON_SPECULATIVE_TYPE_NGRAM_CACHE,   // self-speculative decoding with 3-level n-gram cache
+    COMMON_SPECULATIVE_TYPE_SUFFIX,        // model-free suffix tree speculative decoding
+    COMMON_SPECULATIVE_TYPE_COPYSPEC,      // model-free copy-from-context speculative decoding
+    COMMON_SPECULATIVE_TYPE_RECYCLE,       // model-free token recycling (adjacency matrix)
+    COMMON_SPECULATIVE_TYPE_DFLASH,        // DFlash block-diffusion speculative decoding
     COMMON_SPECULATIVE_TYPE_COUNT          // number of types, unknown type
 };
 
@@ -387,32 +390,85 @@ struct common_params_speculative {
     common_params_speculative_ngram_cache ngram_cache;
 
     // DFlash-specific params (top-level for fork compat)
-    int32_t branch_budget     = 0;     // DFlash tree branch budget (0 = flat DFlash)
-    int32_t draft_topk        = 1;     // DFlash drafter top-k sampling
-    int32_t dflash_cross_ctx  = 0;     // DFlash cross-attention context window (0 = unlimited)
-    float   sample_temp       = 1.0f;  // DFlash drafter sampling temperature
-    float   p_min             = 0.0f;  // DFlash minimum probability for greedy decoding
+    int32_t n_max            = 16;  // maximum number of tokens to draft
+    int32_t n_max_base       = 0;  // user's original --spec-draft-n-max before adaptive DM reduction
+    int32_t n_min            = 0;  // minimum number of draft tokens
+    bool    n_max_explicit   = false;
+    int32_t branch_budget    = 0; // DDTree branch nodes beyond the main draft path
+    bool    branch_budget_explicit = false;
+    bool    dflash_only_args_explicit = false;
+    int32_t dflash_max_slots = 0;
+    float   p_split          = 0.1f;
+    float   p_min            = 0.0f;
+    float   sample_temp      = 0.0f;
+    int32_t draft_topk       = 1;
+    int32_t dflash_cross_ctx = 512;
 
-    // Adaptive draft-max controller
+    // adaptive draft-max management
+    bool    dm_adaptive             = true;
+    float   dm_fringe_min           = 0.30f;
+    float   dm_fringe_max           = 0.50f;
+    int32_t dm_off_dwell            = 8;
+    int32_t dm_explore_interval     = 12;
+    int32_t dm_min_reach            = 3;
+    int32_t dm_probe_interval       = 16;
+    float   dm_probe_fraction       = 0.25f;
+    int32_t dm_fringe_window        = 3;
     enum common_speculative_dm_controller dm_controller = COMMON_SPECULATIVE_DM_CONTROLLER_PROFIT;
-    int32_t dm_n_max          = 8;    // current/initial draft_max
-    int32_t dm_n_min          = 0;    // floor for draft_max (0 = disable drafting)
-    int32_t dm_n_step         = 1;    // increment/decrement step size
-    int32_t dm_history_len     = 64;   // acceptance history window length
-    int32_t dm_explore_interval = 12; // cycles between exploration drafts
-    int32_t dm_min_reach        = 3;   // fringe controller: min current-epoch samples before promotion
-    int32_t dm_probe_interval   = 16;  // cycles to wait before probing at n_max=0
+    float   dm_profit_min           = 0.05f;
+    float   dm_profit_raise_margin  = 0.05f;
+    float   dm_profit_lower_margin  = 0.05f;
+    float   dm_profit_ewma_alpha    = 0.15f;
+    int32_t dm_profit_min_samples   = 3;
+    int32_t dm_profit_warmup        = 0;
+    int32_t dm_profit_baseline_interval = 1024;
+
+    // DFlash draft model
+    struct common_params_model mparams_dft;
+    llama_model * model_dft = nullptr;
+    llama_context_params cparams_dft;
+
+    // copyspec
+    int32_t copyspec_gamma = 6;
+
+    // token recycling
+    int32_t recycle_k = 8;
+
+    // suffix tree
+    int32_t suffix_max_depth   = 64;
+    float   suffix_spec_factor = 2.0f;
+    float   suffix_spec_offset = 0.0f;
+    float   suffix_min_prob    = 0.1f;
 
     bool has_dft() const {
-        return !draft.mparams.empty();
+        return !draft.mparams.path.empty() || !draft.mparams.hf_repo.empty();
+    }
+
+    bool has_type(common_speculative_type t) const {
+        return std::find(types.begin(), types.end(), t) != types.end();
+    }
+
+    common_speculative_type type() const {
+        if (types.empty() || (types.size() == 1 && types[0] == COMMON_SPECULATIVE_TYPE_NONE)) {
+            return COMMON_SPECULATIVE_TYPE_NONE;
+        }
+        return types.back();
+    }
+
+    void set_type(common_speculative_type t) {
+        types = { t };
+    }
+
+    void note_dflash_only_arg() {
+        dflash_only_args_explicit = true;
     }
 
     uint32_t need_n_rs_seq() const {
         bool needs_rs_seq = std::any_of(types.begin(), types.end(), [&](auto t) {
-            return t == COMMON_SPECULATIVE_TYPE_DRAFT_MTP || t == COMMON_SPECULATIVE_TYPE_DRAFT_EAGLE3 || t == COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH;
+            return t == COMMON_SPECULATIVE_TYPE_DRAFT_MTP || t == COMMON_SPECULATIVE_TYPE_DRAFT_EAGLE3 || t == COMMON_SPECULATIVE_TYPE_DFLASH;
         });
 
-        return needs_rs_seq ? draft.n_max : 0u;
+        return needs_rs_seq ? n_max : 0u;
     }
 };
 

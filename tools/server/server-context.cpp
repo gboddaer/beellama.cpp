@@ -2977,14 +2977,13 @@ private:
 
                         slot.spec_prompt = slot.prompt.tokens.get_text_tokens();
 
-                        common_speculative_get_draft_params(spec.get(), slot.id) = {
-                            /* .drafting = */ true,
-                            /* .n_max    = */ n_draft_max,
-                            /* .n_past   = */ slot.prompt.n_tokens(),
-                            /* .id_last  = */ slot.sampled,
-                            /* .prompt   = */ &slot.spec_prompt,
-                            /* .result   = */ &slot.spec_draft,
-                        };
+                        auto & draft_params = common_speculative_get_draft_params(spec.get(), slot.id);
+                        draft_params.drafting = true;
+                        draft_params.n_max = n_draft_max;
+                        draft_params.n_past = slot.prompt.n_tokens();
+                        draft_params.id_last = slot.sampled;
+                        draft_params.prompt = &slot.spec_prompt;
+                        draft_params.result = &slot.spec_draft;
 
                         drafting.push_back(&slot);
                     }

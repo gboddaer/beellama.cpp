@@ -212,3 +212,7 @@ common_speculative_tree common_speculative_draft_tree(
 // fork: draft length params
 int32_t common_speculative_n_max(const common_speculative * spec, const common_params_speculative & params);
 int32_t common_speculative_n_min(const common_speculative * spec, const common_params_speculative & params);
+
+// State management stubs (to be implemented)
+void common_speculative_get_state(common_speculative * spec, uint32_t seq_id, std::vector<uint8_t> & state);
+void common_speculative_set_state(common_speculative * spec, uint32_t seq_id, const std::vector<uint8_t> & state);

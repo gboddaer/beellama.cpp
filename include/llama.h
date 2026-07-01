@@ -661,7 +661,7 @@ extern "C" {
     LLAMA_API bool llama_model_is_diffusion(const struct llama_model * model);
 
     // Share tensors from src (target) to dst (drafter) for DFlash
-    LLAMA_API void llama_model_share_tensors(llama_model * dst, const llama_model * src);
+    LLAMA_API void llama_model_share_tensors(struct llama_model * dst, const struct llama_model * src);
 
     // Returns 0 on success
     LLAMA_API uint32_t llama_model_quantize(
@@ -1654,6 +1654,39 @@ extern "C" {
     LLAMA_API void   llama_dflash_kv_cache_reset(struct llama_context * ctx);
     LLAMA_API void   llama_dflash_kv_cache_set_active_seq(struct llama_context * ctx, llama_seq_id seq_id);
     LLAMA_API bool   llama_dflash_kv_cache_update(struct llama_context * ctx, int n_tokens);
+
+    // DFlash logit helpers
+    LLAMA_API int32_t * llama_get_logits_argmax(struct llama_context * ctx);
+    LLAMA_API int32_t * llama_get_logits_argmax_ith(struct llama_context * ctx, int32_t i);
+    LLAMA_API int32_t   llama_get_logits_argmax_n(struct llama_context * ctx);
+    LLAMA_API int32_t   llama_get_logits_argmax_k(struct llama_context * ctx);
+    LLAMA_API float *   llama_get_logits_argmax_probs(struct llama_context * ctx);
+    LLAMA_API float *   llama_get_logits_argmax_probs_ith(struct llama_context * ctx, int32_t i);
+
+    // DFlash layer hidden state access
+    LLAMA_API float * llama_get_layer_hidden(struct llama_context * ctx, int slot);
+    LLAMA_API int64_t llama_get_layer_hidden_n_tokens(struct llama_context * ctx, int slot);
+    LLAMA_API int64_t llama_get_layer_hidden_n_embd(struct llama_context * ctx, int slot);
+    LLAMA_API int32_t llama_get_n_layer_hiddens(struct llama_context * ctx);
+
+    // DFlash cross-data and ring buffer updates
+    LLAMA_API void llama_set_cross_data(struct llama_context * ctx, const float * data, int64_t n_embd, int64_t n_tokens);
+    LLAMA_API void llama_set_cross_data_seq(struct llama_context * ctx, llama_seq_id seq_id, const float * data, int64_t n_embd, int64_t n_tokens);
+    LLAMA_API bool   llama_dflash_target_kv_cache_update_from_ring(
+            struct llama_context * ctx, void * handle,
+            int ring_write_pos, int ring_filled,
+            int n_layers, int n_embd, int n_tokens,
+            llama_seq_id seq_id, llama_pos start_pos);
+    LLAMA_API bool   llama_dflash_kv_cache_update_from_ring_seq(
+            struct llama_context * ctx, void * handle,
+            int ring_write_pos, int ring_filled,
+            int n_layers, int n_embd, int n_tokens,
+            llama_seq_id seq_id);
+    LLAMA_API bool   llama_dflash_kv_cache_prepare_batch(
+            struct llama_context * ctx,
+            const llama_seq_id * seq_ids,
+            int n_seq,
+            int ctx_window);
 
 #ifdef __cplusplus
 }

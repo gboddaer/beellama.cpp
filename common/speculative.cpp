@@ -5104,3 +5104,18 @@ int32_t common_speculative_n_min(const common_speculative * spec, const common_p
     }
     return params.n_min;
 }
+
+// State management stubs
+void common_speculative_get_state(common_speculative * spec, uint32_t seq_id, std::vector<uint8_t> & state) {
+    // TODO: implement state serialization
+    (void)spec;
+    (void)seq_id;
+    state.clear();
+}
+
+void common_speculative_set_state(common_speculative * spec, uint32_t seq_id, const std::vector<uint8_t> & state) {
+    // TODO: implement state deserialization
+    (void)spec;
+    (void)seq_id;
+    (void)state;
+}

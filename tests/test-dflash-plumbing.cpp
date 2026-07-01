@@ -182,12 +182,12 @@ static bool test_need_n_rs_seq() {
         s.draft.n_max = n_max;
         return s.need_n_rs_seq();
     };
-    ok &= expect(make({COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH}, 4) == 4u,  "DFlash -> need_n_rs_seq == draft.n_max");
+    ok &= expect(make({COMMON_SPECULATIVE_TYPE_DFLASH}, 4) == 4u,  "DFlash -> need_n_rs_seq == draft.n_max");
     ok &= expect(make({COMMON_SPECULATIVE_TYPE_DRAFT_MTP}, 3) == 3u, "MTP -> need_n_rs_seq == draft.n_max");
     ok &= expect(make({}, 4) == 0u,                                  "no speculative types -> need_n_rs_seq == 0");
-    ok &= expect(make({COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH, COMMON_SPECULATIVE_TYPE_DRAFT_MTP}, 5) == 5u,
+    ok &= expect(make({COMMON_SPECULATIVE_TYPE_DFLASH, COMMON_SPECULATIVE_TYPE_DRAFT_MTP}, 5) == 5u,
                      "DFlash+MTP -> need_n_rs_seq == draft.n_max");
-    ok &= expect(make({COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH}, 0) == 0u,   "DFlash with draft.n_max=0 -> 0");
+    ok &= expect(make({COMMON_SPECULATIVE_TYPE_DFLASH}, 0) == 0u,   "DFlash with draft.n_max=0 -> 0");
     return ok;
 }
 
@@ -1543,7 +1543,7 @@ int main(int argc, char ** argv) {
     ok &= expect(server_context.find("shrunk recurrent state to %d cells before draft load") != std::string::npos, "server must shrink recurrent backup cells before draft model load");
     ok &= expect(server_context.find("expanded recurrent state to %d cells before speculative GPU buffers") != std::string::npos, "server must expand recurrent backup cells before DFlash slot/GPU buffer init");
     ok &= expect(server_context.find("const bool needs_backup_sequences") != std::string::npos &&
-                 server_context.find("ctx_tgt_seq_rm_type != COMMON_CONTEXT_SEQ_RM_TYPE_RS && params_base.speculative.type() == COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH") != std::string::npos,
+                 server_context.find("ctx_tgt_seq_rm_type != COMMON_CONTEXT_SEQ_RM_TYPE_RS && params_base.speculative.type() == COMMON_SPECULATIVE_TYPE_DFLASH") != std::string::npos,
         "server must use Bee backup rollback only for DFlash on non-RS contexts; MTP uses checkpoint-based accept path");
     ok &= expect(common_h.find("return needs_rs_seq ? draft.n_max : 0u;") != std::string::npos,
         "MTP target context must enable bounded recurrent snapshots for upstream rollback");
@@ -2135,7 +2135,7 @@ int main(int argc, char ** argv) {
         "server must fairly rotate one-slot DFlash multi-row verifier cycles instead of always starting at slot 0");
     ok &= expect(server_context.find("dflash_has_pending_prompt") != std::string::npos &&
                  server_context.find("dflash_has_pending_prompt && slot.can_speculate()") != std::string::npos &&
-                 server_context.find("params_base.speculative.type() == COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH &&\n            needs_reeval &&\n            std::any_of(slots.begin(), slots.end(), [](const server_slot & slot) {\n                return slot.state == SLOT_STATE_STARTED || slot.state == SLOT_STATE_PROCESSING_PROMPT;\n            })") == std::string::npos,
+                 server_context.find("params_base.speculative.type() == COMMON_SPECULATIVE_TYPE_DFLASH &&\n            needs_reeval &&\n            std::any_of(slots.begin(), slots.end(), [](const server_slot & slot) {\n                return slot.state == SLOT_STATE_STARTED || slot.state == SLOT_STATE_PROCESSING_PROMPT;\n            })") == std::string::npos,
         "DFlash must prioritize unfinished prompt prefill before TG rows on all target types, not only recurrent/hybrid targets");
     ok &= expect(server_context.find("dflash_has_profit_baseline_slot") != std::string::npos &&
                  server_context.find("dflash_force_profit_baseline_cycle") != std::string::npos &&

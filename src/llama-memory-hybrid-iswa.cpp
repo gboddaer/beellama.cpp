@@ -33,6 +33,7 @@ llama_memory_hybrid_iswa::llama_memory_hybrid_iswa(
     hparams(model.hparams),
     mem_attn(new llama_kv_cache_iswa(
         model,
+        model.hparams,
         type_k,
         type_v,
         v_trans,

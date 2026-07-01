@@ -2201,6 +2201,7 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                                 reuse);
                     } else if (hparams.swa_type != LLAMA_SWA_TYPE_NONE) {
                         GGML_ASSERT(hparams.is_swa_any());
+                        llama_kv_cache::layer_share_cb share = nullptr;
 
                         if (arch == LLM_ARCH_GEMMA4_ASSISTANT) {
                             llama_memory_t mem_other = llama_get_memory(cparams.ctx_other);
@@ -2217,6 +2218,7 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
 
                             res = new llama_kv_cache_iswa(
                                     *this,
+                                    hparams,
                                     params.type_k,
                                     params.type_v,
                                     !cparams.flash_attn,
@@ -2234,6 +2236,7 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                         } else {
                             res = new llama_kv_cache_iswa(
                                     *this,
+                                    hparams,
                                     params.type_k,
                                     params.type_v,
                                     !cparams.flash_attn,
