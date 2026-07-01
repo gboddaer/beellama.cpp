@@ -660,6 +660,9 @@ extern "C" {
     // Returns true if the model is diffusion-based (like LLaDA, Dream, etc.)
     LLAMA_API bool llama_model_is_diffusion(const struct llama_model * model);
 
+    // Share tensors from src (target) to dst (drafter) for DFlash
+    LLAMA_API void llama_model_share_tensors(llama_model * dst, const llama_model * src);
+
     // Returns 0 on success
     LLAMA_API uint32_t llama_model_quantize(
             const char * fname_inp,
@@ -1425,6 +1428,9 @@ extern "C" {
                             size_t num_trigger_patterns,
                const llama_token * trigger_tokens,
                             size_t num_trigger_tokens);
+
+    /// Check if a grammar sampler is active
+    LLAMA_API bool llama_sampler_grammar_is_active(const struct llama_sampler * smpl);
 
 
     /// NOTE: Avoid using on the full vocabulary as searching for repeated tokens can become slow. For example, apply top-k or top-p sampling first.

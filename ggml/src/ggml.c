@@ -124,7 +124,7 @@ static void ggml_print_backtrace_symbols(void) {
 
     for (int idx = 0; idx < count; ++idx) {
         const void * addr = buffer[idx];
-        const char * symbol = ";
+        const char * symbol = "";
 
         Dl_info info;
         if (dladdr(addr, &info) && info.dli_sname) {

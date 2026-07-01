@@ -4718,7 +4718,7 @@ static bool dflash_eval_callback(struct ggml_tensor * t, bool ask, void * user_d
         }
         if (cap->tape_enabled) {
             if (dflash_diagnostic_debug_enabled()) {
-                const char * nm = t->name ? t->name : "";
+                const char * nm = t->name;
                 if (strstr(nm, "qkv") || strstr(nm, "mixed")) {
                     fprintf(stderr, "[dflash-tape-cb] check name='%s' in_map=%d\n", nm, (int)cap->tape_name_map.count(t->name));
                 }
