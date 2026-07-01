@@ -48,6 +48,7 @@
 #define LLAMA_STATE_SEQ_MAGIC   LLAMA_FILE_MAGIC_GGSQ
 #define LLAMA_STATE_SEQ_VERSION 2
 
+
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -1693,3 +1694,26 @@ extern "C" {
 #endif
 
 #endif // LLAMA_H
+    LLAMA_API void llama_set_tape_recording(struct llama_context * ctx, bool value);
+    LLAMA_API void llama_set_force_split_seq(struct llama_context * ctx, bool value);
+    LLAMA_API void llama_tape_replay(struct llama_context * ctx, llama_seq_id seq_id, int value);
+    LLAMA_API void llama_tape_replay_sync(struct llama_context * ctx);
+    LLAMA_API bool llama_dflash_memory_seq_cp_recurrent_ordered(struct llama_context * ctx, llama_seq_id src_seq_id, llama_seq_id dst_seq_id, llama_pos src_pos, llama_pos dst_pos);
+    LLAMA_API int llama_dflash_rollback(struct llama_context * ctx, llama_seq_id seq_id, llama_seq_id seq_backup, int n_past_before, int n_accepted);
+    LLAMA_API void llama_dflash_dump_recurrent_state_dbg(struct llama_context * ctx, llama_seq_id seq_id, const char * path);
+    LLAMA_API void llama_dflash_prepare_branch(struct llama_context * ctx, llama_seq_id src_seq_id, llama_seq_id dst_seq_id, int value);
+    LLAMA_API bool llama_dflash_kv_cache_update_from_ring(struct llama_context * ctx, void * handle, int ring_write_pos, int ring_filled, int n_layers, int n_embd, int n_tokens);
+    LLAMA_API void llama_set_tree_mask(struct llama_context * ctx, const uint8_t * visibility, int n_tree_tokens);
+    LLAMA_API void llama_clear_tree_mask(struct llama_context * ctx);
+    LLAMA_API void llama_set_tree_parent_ids(struct llama_context * ctx, const int32_t * parent_ids, int n_tree_tokens);
+    LLAMA_API void llama_clear_tree_parent_ids(struct llama_context * ctx);
+    LLAMA_API void llama_allocate_tree_buffers(struct llama_context * ctx, int n_tree_tokens);
+    LLAMA_API void llama_tree_rollback(struct llama_context * ctx, int n_nodes, const int32_t * parents, int n_tree_tokens);
+    LLAMA_API void llama_tree_rollback_seq(struct llama_context * ctx, llama_seq_id src_seq_id, llama_seq_id dst_seq_id, int n_nodes, const int32_t * parents, int n_tree_tokens);
+    LLAMA_API bool llama_memory_seq_rm_cell(llama_memory_t mem, llama_seq_id seq_id, uint32_t cell_idx);
+    LLAMA_API int llama_memory_cells_at_pos(llama_memory_t mem, llama_seq_id seq_id, llama_pos pos, uint32_t * cells, int n_cells);
+    LLAMA_API void llama_memory_seq_cp_recurrent(llama_memory_t mem, llama_seq_id src_seq_id, llama_seq_id dst_seq_id, llama_pos src_pos, llama_pos dst_pos);
+    LLAMA_API bool llama_memory_recurrent_expand(llama_memory_t mem, uint32_t n_rs_seq);
+    LLAMA_API bool llama_memory_recurrent_shrink(llama_memory_t mem, uint32_t n_rs_seq);
+    LLAMA_API bool llama_context_recurrent_expand(struct llama_context * ctx, uint32_t n_rs_seq);
+    LLAMA_API bool llama_context_recurrent_shrink(struct llama_context * ctx, uint32_t n_rs_seq);

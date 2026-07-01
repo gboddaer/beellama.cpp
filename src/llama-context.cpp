@@ -6850,47 +6850,10 @@ const char * llama_context::dflash_hidden_capture_unavailable_reason() const {
 
 // Readers return data from the active DFlash slot; multi-slot callers must
 // call llama_dflash_set_active_slot() before reading.
-float * llama_context::get_layer_hidden(int layer_idx) {
-    auto * sh = dflash_capture ? dflash_capture->active_slot_hiddens() : nullptr;
-    if (!sh || layer_idx < 0 || layer_idx >= (int) sh->size()) {
-        return nullptr;
-    }
-    auto & buf = (*sh)[layer_idx];
-    if (buf.n_tokens <= 0 || buf.data.empty()) {
-        return nullptr;
-    }
-    return buf.data.data();
-}
 
 
-float * llama_context::get_logits_argmax_probs() {
-    synchronize();
-    output_reorder();
-    if (logits_argmax_prob_buf.empty()) {
-        return nullptr;
-    }
-    return logits_argmax_prob_buf.data();
-}
 
 
-float * llama_context::get_logits_argmax_probs_ith(int32_t i) {
-    synchronize();
-    output_reorder();
-    if (logits_argmax_prob_buf.empty()) {
-        return nullptr;
-    }
-    try {
-        const int64_t j = output_resolve_row(i);
-        return logits_argmax_prob_buf.data() + j * logits_argmax_k;
-    } catch (const std::exception & err) {
-        LLAMA_LOG_ERROR("%s: invalid argmax prob id %d, reason: %s\n", __func__, i, err.what());
-#ifndef NDEBUG
-        GGML_ABORT("fatal error");
-#else
-        return nullptr;
-#endif
-    }
-}
 
 
 // DFlash: get capture layer IDs
@@ -9208,3 +9171,582 @@ llama_memory_breakdown llama_get_memory_breakdown(const struct llama_context * c
 llama_context * llama_get_ctx_other(struct llama_context * ctx) {
     return ctx->get_cparams().ctx_other;
 }
+int32_t * llama_context::get_logits_argmax() {
+    synchronize();
+    output_reorder();
+    if (logits_argmax_buf.empty()) {
+        return nullptr;
+    }
+    return logits_argmax_buf.data();
+}
+
+int32_t * llama_context::get_logits_argmax_ith(int32_t i) {
+    synchronize();
+    output_reorder();
+    if (logits_argmax_buf.empty()) {
+        return nullptr;
+    }
+    try {
+        const int64_t j = output_resolve_row(i);
+        return logits_argmax_buf.data() + j * logits_argmax_k;
+    } catch (const std::exception & err) {
+        LLAMA_LOG_ERROR("%s: invalid argmax logits id %d, reason: %s\n", __func__, i, err.what());
+#ifndef NDEBUG
+        GGML_ABORT("fatal error");
+#else
+        return nullptr;
+#endif
+    }
+}
+
+int32_t llama_context::get_logits_argmax_n() {
+    return logits_argmax_count;
+}
+
+int32_t llama_context::get_logits_argmax_k() {
+    return logits_argmax_k;
+}
+
+
+
+
+
+
+
+
+
+// Readers return data from the active DFlash slot; multi-slot callers must
+// call llama_dflash_set_active_slot() before reading.
+
+int64_t llama_context::get_layer_hidden_n_tokens(int layer_idx) const {
+    auto * sh = dflash_capture ? dflash_capture->active_slot_hiddens() : nullptr;
+    if (sh && layer_idx >= 0 && layer_idx < (int) sh->size() && (*sh)[layer_idx].n_tokens > 0) {
+        return (*sh)[layer_idx].n_tokens;
+    }
+    auto * hgpu = dflash_capture ? dflash_capture->active_hidden_gpu() : nullptr;
+    if (hgpu && layer_idx >= 0 && layer_idx < (int) hgpu->layers.size()) {
+        return hgpu->n_tokens;
+    }
+    if (!sh || layer_idx < 0 || layer_idx >= (int) sh->size()) {
+        return 0;
+    }
+    return (*sh)[layer_idx].n_tokens;
+}
+
+int64_t llama_context::get_layer_hidden_n_embd(int layer_idx) const {
+    auto * sh = dflash_capture ? dflash_capture->active_slot_hiddens() : nullptr;
+    if (sh && layer_idx >= 0 && layer_idx < (int) sh->size() &&
+            (*sh)[layer_idx].n_tokens > 0 && (*sh)[layer_idx].n_embd > 0) {
+        return (*sh)[layer_idx].n_embd;
+    }
+    auto * hgpu = dflash_capture ? dflash_capture->active_hidden_gpu() : nullptr;
+    if (hgpu && layer_idx >= 0 && layer_idx < (int) hgpu->layers.size()) {
+        return hgpu->n_embd;
+    }
+    if (!sh || layer_idx < 0 || layer_idx >= (int) sh->size()) {
+        return 0;
+    }
+    return (*sh)[layer_idx].n_embd;
+}
+
+}
+
+int32_t * llama_get_logits_argmax(llama_context * ctx) {
+    ctx->synchronize();
+    return ctx->get_logits_argmax();
+}
+
+int32_t * llama_get_logits_argmax_ith(llama_context * ctx, int32_t i) {
+    ctx->synchronize();
+    return ctx->get_logits_argmax_ith(i);
+}
+
+int32_t llama_get_logits_argmax_n(llama_context * ctx) {
+    return ctx->get_logits_argmax_n();
+}
+
+int32_t llama_get_logits_argmax_k(llama_context * ctx) {
+    return ctx->get_logits_argmax_k();
+}
+
+float * llama_get_logits_argmax_probs(llama_context * ctx) {
+    ctx->synchronize();
+    return ctx->get_logits_argmax_probs();
+}
+
+float * llama_get_logits_argmax_probs_ith(llama_context * ctx, int32_t i) {
+    ctx->synchronize();
+    return ctx->get_logits_argmax_probs_ith(i);
+}
+
+float * llama_get_embeddings(llama_context * ctx) {
+    ctx->synchronize();
+
+    return ctx->get_embeddings();
+}
+
+float * llama_get_embeddings_ith(llama_context * ctx, int32_t i) {
+    ctx->synchronize();
+
+    return ctx->get_embeddings_ith(i);
+}
+
+float * llama_get_embeddings_seq(llama_context * ctx, llama_seq_id seq_id) {
+    ctx->synchronize();
+
+    return ctx->get_embeddings_seq(seq_id);
+}
+
+void llama_set_embeddings_nextn(llama_context * ctx, bool value, bool masked) {
+    ctx->set_embeddings_nextn(value, masked);
+}
+
+float * llama_get_embeddings_nextn(llama_context * ctx) {
+    ctx->synchronize();
+
+    return ctx->get_embeddings_nextn();
+}
+
+float * llama_get_embeddings_nextn_ith(llama_context * ctx, int32_t i) {
+    ctx->synchronize();
+
+    return ctx->get_embeddings_nextn_ith(i);
+}
+
+float * llama_get_layer_hidden(llama_context * ctx, int slot) {
+    ctx->synchronize();
+    return ctx->get_layer_hidden(slot);
+}
+
+int64_t llama_get_layer_hidden_n_tokens(llama_context * ctx, int slot) {
+    return ctx->get_layer_hidden_n_tokens(slot);
+}
+
+int64_t llama_get_layer_hidden_n_embd(llama_context * ctx, int slot) {
+    return ctx->get_layer_hidden_n_embd(slot);
+}
+
+int32_t llama_get_n_layer_hiddens(llama_context * ctx) {
+    return ctx->get_n_layer_hiddens();
+}
+
+void llama_set_dflash_capture(llama_context * ctx, const int32_t * layer_ids, int32_t n_layers) {
+    ctx->set_dflash_capture(layer_ids, n_layers);
+}
+
+void llama_set_dflash_capture_active(llama_context * ctx, bool active) {
+    ctx->set_dflash_capture_active(active);
+}
+
+void llama_set_dflash_gpu_capture(llama_context * ctx, bool enabled) {
+    ctx->set_dflash_gpu_capture(enabled);
+}
+
+bool llama_dflash_hidden_capture_available(const struct llama_context * ctx) {
+    return ctx ? ctx->dflash_hidden_capture_available() : false;
+}
+
+const char * llama_dflash_hidden_capture_unavailable_reason(const struct llama_context * ctx) {
+    return ctx ? ctx->dflash_hidden_capture_unavailable_reason() : "null context";
+}
+
+void llama_set_dflash_sample_temp(llama_context * ctx, float temp) {
+    ctx->set_dflash_sample_temp(temp);
+}
+
+void llama_set_dflash_topk(llama_context * ctx, int k) {
+    ctx->set_dflash_topk(k);
+}
+
+void llama_set_dflash_verify_logits(llama_context * ctx, bool enabled, int top_k) {
+    ctx->set_dflash_verify_logits(enabled, top_k);
+}
+
+void llama_set_dflash_consume_reduced(llama_context * ctx, bool enabled) {
+    ctx->set_dflash_consume_reduced(enabled);
+}
+
+void llama_set_dflash_n_slots(llama_context * ctx, int n) {
+    ctx->set_dflash_n_slots(n);
+}
+
+void llama_set_dflash_target_kv_available(llama_context * ctx, bool avail) {
+    ctx->set_dflash_target_kv_available(avail);
+}
+
+void llama_set_tape_recording(llama_context * ctx, bool enable) {
+    ctx->set_tape_recording(enable);
+}
+
+void llama_set_force_split_seq(llama_context * ctx, bool force) {
+    auto * mem = llama_get_memory(ctx);
+    if (mem) {
+        mem->set_force_split_seq(force);
+    }
+}
+
+void llama_dflash_allocate_slots(llama_context * ctx, int n_slots) {
+    ctx->allocate_tape_gpu(n_slots, LLAMA_DFLASH_MAX_VERIFY_TOKENS);
+}
+
+void llama_dflash_set_active_slot(llama_context * ctx, int slot_idx) {
+    ctx->set_active_dflash_slot(slot_idx);
+}
+
+void llama_tape_replay(llama_context * ctx, llama_seq_id seq_id, int n_accepted) {
+    ctx->tape_replay(seq_id, n_accepted);
+}
+
+void llama_tape_replay_sync(llama_context * ctx) {
+    ctx->tape_replay_sync();
+}
+
+bool llama_dflash_memory_seq_cp_recurrent_ordered(
+        llama_context * ctx,
+        llama_seq_id   seq_id_src,
+        llama_seq_id   seq_id_dst,
+        llama_pos      p0,
+        llama_pos      p1) {
+    return ctx ? ctx->dflash_memory_seq_cp_recurrent_ordered(seq_id_src, seq_id_dst, p0, p1) : false;
+}
+
+int llama_dflash_rollback(llama_context * ctx, llama_seq_id seq_id, llama_seq_id seq_backup, int n_past_before, int n_accepted) {
+    return ctx->dflash_rollback(seq_id, seq_backup, n_past_before, n_accepted);
+}
+
+void llama_dflash_dump_recurrent_state_dbg(llama_context * ctx, llama_seq_id seq_id, const char * tag) {
+    if (ctx) ctx->dflash_dump_recurrent_state_dbg(seq_id, tag);
+}
+
+void llama_dflash_prepare_branch(llama_context * ctx, llama_seq_id seq_id, llama_seq_id seq_backup, int depth) {
+    ctx->dflash_prepare_branch(seq_id, seq_backup, depth);
+}
+
+void llama_set_cross_data(llama_context * ctx, const float * data, int64_t n_embd, int64_t n_tokens) {
+    ctx->set_cross_data(data, n_embd, n_tokens);
+}
+
+void llama_set_cross_data_seq(llama_context * ctx, llama_seq_id seq_id, const float * data, int64_t n_embd, int64_t n_tokens) {
+    ctx->set_cross_data_seq(seq_id, data, n_embd, n_tokens);
+}
+
+// --- DFlash GPU cross-attention ring ---
+
+struct dflash_cross_ring_handle {
+    void * gpu_ring;
+    void   (*fn_free)(void *);
+    void   (*fn_write)(void *, int, int, const float *, int, int);
+    bool   (*fn_write_d2d)(void *, int, int, const void *, int, int);
+    void   (*fn_synchronize)(void *);
+    bool   (*fn_snapshot)(void *, int, int, int, float *, int, int, int);
+    const float * (*fn_interleave)(void *, int, int, int);
+    void   (*fn_set_tensor)(void *, const void *, size_t, size_t);
+    // Tensor-variant fn pointers (Vulkan): resolve vk_buffer from ggml_tensor*.
+    // Null on CUDA (CUDA uses the raw-ptr variants above); the raw variants are null on Vulkan.
+    void   (*fn_set_tensor_tensor)(ggml_tensor *, const void *, size_t, size_t);
+    bool   (*fn_write_d2d_tensor)(void *, int, int, ggml_tensor *, int, int, int);
+};
+
+void * llama_context::init_cross_ring_gpu(int n_layers, int n_embd, int ring_size) {
+    ggml_backend_reg_t cuda_reg = dflash_gpu_backend_reg();
+    if (!cuda_reg) {
+        if (dflash_multi_gpu_debug_enabled() || dflash_diagnostic_debug_enabled()) {
+            LLAMA_LOG_WARN("%s: dflash GPU ring unavailable: CUDA/ROCm/Vulkan backend registry not found\n", __func__);
+        }
+        return nullptr;
+    }
+
+    if (dflash_multi_gpu_debug_enabled() || dflash_diagnostic_debug_enabled()) {
+        LLAMA_LOG_INFO("%s: dflash GPU ring using backend registry %s\n",
+            __func__, ggml_backend_reg_name(cuda_reg));
+    }
+
+    // resolve all function pointers
+    using alloc_fn_t      = void * (*)(int, int, int);
+    using alloc_device_fn_t = void * (*)(int, int, int, int);
+    using free_fn_t       = void   (*)(void *);
+    using write_fn_t      = void   (*)(void *, int, int, const float *, int, int);
+    using write_d2d_fn_t  = bool   (*)(void *, int, int, const void *, int, int);
+    using sync_fn_t       = void   (*)(void *);
+    using snapshot_fn_t   = bool   (*)(void *, int, int, int, float *, int, int, int);
+    using interleave_fn_t = const float * (*)(void *, int, int, int);
+    using set_tensor_fn_t = void   (*)(void *, const void *, size_t, size_t);
+    using set_tensor_tensor_fn_t = void (*)(ggml_tensor *, const void *, size_t, size_t);
+    using write_d2d_tensor_fn_t  = bool (*)(void *, int, int, ggml_tensor *, int, int, int);
+
+    auto fn_alloc_device = (alloc_device_fn_t)
+        ggml_backend_reg_get_proc_address(cuda_reg, "dflash_cross_ring_gpu_alloc_device");
+    auto fn_alloc      = (alloc_fn_t)      ggml_backend_reg_get_proc_address(cuda_reg, "dflash_cross_ring_gpu_alloc");
+    auto fn_free       = (free_fn_t)       ggml_backend_reg_get_proc_address(cuda_reg, "dflash_cross_ring_gpu_free");
+    auto fn_write      = (write_fn_t)      ggml_backend_reg_get_proc_address(cuda_reg, "dflash_cross_ring_gpu_write");
+    auto fn_write_d2d  = (write_d2d_fn_t)  ggml_backend_reg_get_proc_address(cuda_reg, "dflash_cross_ring_gpu_write_d2d");
+    auto fn_sync       = (sync_fn_t)       ggml_backend_reg_get_proc_address(cuda_reg, "dflash_cross_ring_gpu_synchronize");
+    auto fn_snapshot   = (snapshot_fn_t)   ggml_backend_reg_get_proc_address(cuda_reg, "dflash_cross_ring_gpu_snapshot");
+    auto fn_interleave = (interleave_fn_t) ggml_backend_reg_get_proc_address(cuda_reg, "dflash_cross_ring_gpu_interleave");
+    auto fn_set_tensor = (set_tensor_fn_t) ggml_backend_reg_get_proc_address(cuda_reg, "dflash_cross_ring_gpu_set_tensor");
+    // Tensor variants (Vulkan-only). Null on CUDA, which uses the raw variants above.
+    auto fn_set_tensor_tensor = (set_tensor_tensor_fn_t) ggml_backend_reg_get_proc_address(cuda_reg, "dflash_cross_ring_gpu_set_tensor_tensor");
+    auto fn_write_d2d_tensor  = (write_d2d_tensor_fn_t)  ggml_backend_reg_get_proc_address(cuda_reg, "dflash_cross_ring_gpu_write_d2d_tensor");
+
+    // Need the 7 shared fns, plus at least one of each {set_tensor, set_tensor_tensor} / {write_d2d, write_d2d_tensor} pair.
+    if (!fn_alloc || !fn_free || !fn_write || !fn_sync || !fn_snapshot || !fn_interleave) {
+        return nullptr;
+    }
+    if (!fn_write_d2d && !fn_write_d2d_tensor) return nullptr;
+    if (!fn_set_tensor && !fn_set_tensor_tensor) return nullptr;
+
+    const int ring_device = dflash_gpu_ring_device_override();
+
+    void * gpu_ring = nullptr;
+    if (fn_alloc_device && ring_device >= 0) {
+        gpu_ring = fn_alloc_device(ring_device, n_layers, n_embd, ring_size);
+    } else {
+        gpu_ring = fn_alloc(n_layers, n_embd, ring_size);
+    }
+    if (!gpu_ring) return nullptr;
+
+    auto * handle = new dflash_cross_ring_handle();
+    handle->gpu_ring      = gpu_ring;
+    handle->fn_free       = fn_free;
+    handle->fn_write      = fn_write;
+    handle->fn_write_d2d  = fn_write_d2d;
+    handle->fn_synchronize = fn_sync;
+    handle->fn_snapshot   = fn_snapshot;
+    handle->fn_interleave = fn_interleave;
+    handle->fn_set_tensor = fn_set_tensor;
+    handle->fn_set_tensor_tensor = fn_set_tensor_tensor;
+    handle->fn_write_d2d_tensor  = fn_write_d2d_tensor;
+    return handle;
+}
+
+void * llama_dflash_cross_ring_gpu_init(llama_context * ctx, int n_layers, int n_embd, int ring_size) {
+    return ctx->init_cross_ring_gpu(n_layers, n_embd, ring_size);
+}
+
+void llama_dflash_cross_ring_gpu_free(void * handle) {
+    if (!handle) return;
+    auto * h = (dflash_cross_ring_handle *)handle;
+    h->fn_free(h->gpu_ring);
+    delete h;
+}
+
+void llama_dflash_cross_ring_gpu_write(void * handle, int layer, int ring_pos, const float * data, int n_tokens, int n_embd) {
+    if (!handle) return;
+    auto * h = (dflash_cross_ring_handle *)handle;
+    h->fn_write(h->gpu_ring, layer, ring_pos, data, n_tokens, n_embd);
+}
+
+static bool dflash_gpu_hidden_span_in_bounds(
+        const ggml_tensor * tensor,
+        int                 src_offset,
+        int                 n_tokens,
+        int                 n_embd,
+        const char *        where) {
+    if (!tensor || !tensor->data || src_offset < 0 || n_tokens <= 0 || n_embd <= 0) {
+        LLAMA_LOG_WARN("%s: invalid DFlash hidden tensor span request tensor=%p src_offset=%d n_tokens=%d n_embd=%d\n",
+            where, (const void *) tensor, src_offset, n_tokens, n_embd);
+        return false;
+    }
+    if (tensor->type != GGML_TYPE_F32) {
+        LLAMA_LOG_WARN("%s: invalid DFlash hidden tensor type %s, expected f32\n",
+            where, ggml_type_name(tensor->type));
+        return false;
+    }
+
+    const size_t n_embd_size = (size_t) n_embd;
+    if (n_embd_size > std::numeric_limits<size_t>::max() / sizeof(float)) {
+        LLAMA_LOG_WARN("%s: DFlash hidden tensor row-size overflow n_embd=%d\n",
+            where, n_embd);
+        return false;
+    }
+
+    const size_t row_bytes = n_embd_size * sizeof(float);
+    if ((size_t) src_offset > std::numeric_limits<size_t>::max() / row_bytes ||
+            (size_t) n_tokens > std::numeric_limits<size_t>::max() / row_bytes) {
+        LLAMA_LOG_WARN("%s: DFlash hidden tensor span overflow src_offset=%d n_tokens=%d n_embd=%d\n",
+            where, src_offset, n_tokens, n_embd);
+        return false;
+    }
+
+    const size_t src_offset_bytes = (size_t) src_offset * row_bytes;
+    const size_t n_bytes = (size_t) n_tokens * row_bytes;
+    if (src_offset_bytes > std::numeric_limits<size_t>::max() - n_bytes ||
+            !(src_offset_bytes + n_bytes <= ggml_nbytes(tensor))) {
+        LLAMA_LOG_WARN("%s: DFlash hidden tensor span out of bounds offset=%zu size=%zu tensor_bytes=%zu ne=[%" PRId64 ",%" PRId64 ",%" PRId64 ",%" PRId64 "]\n",
+            where, src_offset_bytes, n_bytes, ggml_nbytes(tensor),
+            tensor->ne[0], tensor->ne[1], tensor->ne[2], tensor->ne[3]);
+        return false;
+    }
+
+    return true;
+}
+
+bool llama_context::cross_ring_gpu_write_hidden(void * handle, int layer, int ring_pos, int src_offset, int n_tokens, int n_embd) {
+    if (!handle || !dflash_capture) {
+        return false;
+    }
+    auto * hgpu = dflash_capture->active_hidden_gpu();
+    if (!hgpu || layer < 0 || layer >= (int) hgpu->layers.size()) {
+        return false;
+    }
+    if (src_offset < 0 || n_tokens <= 0 || n_embd != hgpu->n_embd ||
+            src_offset + n_tokens > hgpu->n_tokens) {
+        return false;
+    }
+
+    auto * tensor = hgpu->layers[layer];
+    if (!tensor || !tensor->data) {
+        return false;
+    }
+    if (!dflash_gpu_hidden_span_in_bounds(tensor, src_offset, n_tokens, n_embd, __func__)) {
+        return false;
+    }
+
+    auto * h = (dflash_cross_ring_handle *)handle;
+    // Vulkan: tensor-variant D2D resolves the target hidden vk_buffer from ggml_tensor*
+    // and takes src_offset explicitly (the raw variant bakes the offset into the pointer,
+    // which is a Vulkan sentinel and cannot be used). CUDA leaves fn_write_d2d_tensor null.
+    if (h->fn_write_d2d_tensor &&
+        h->fn_write_d2d_tensor(h->gpu_ring, layer, ring_pos, tensor, src_offset, n_tokens, n_embd)) {
+        return true;
+    }
+    // CUDA: raw-ptr D2D (offset baked into the pointer; tensor->data is a real device address).
+    const size_t src_offset_bytes = (size_t) src_offset * (size_t) n_embd * sizeof(float);
+    const void * src = (const char *) tensor->data + src_offset_bytes;
+    if (h->fn_write_d2d && h->fn_write_d2d(h->gpu_ring, layer, ring_pos, src, n_tokens, n_embd)) {
+        return true;
+    }
+
+    static bool warned_d2h_fallback = false;
+    if (!warned_d2h_fallback) {
+        LLAMA_LOG_WARN("%s: GPU hidden D2D ring write unavailable; falling back to GPU readback + H2D ring upload\n",
+            __func__);
+        warned_d2h_fallback = true;
+    }
+
+    const size_t n_bytes = (size_t) n_tokens * (size_t) n_embd * sizeof(float);
+    std::vector<float> staging((size_t) n_tokens * (size_t) n_embd);
+    ggml_backend_tensor_get(tensor, staging.data(), src_offset_bytes, n_bytes);
+    h->fn_write(h->gpu_ring, layer, ring_pos, staging.data(), n_tokens, n_embd);
+    h->fn_synchronize(h->gpu_ring);
+    return true;
+}
+
+bool llama_dflash_cross_ring_gpu_write_hidden(void * handle, llama_context * ctx, int layer, int ring_pos, int src_offset, int n_tokens, int n_embd) {
+    if (!ctx) return false;
+    return ctx->cross_ring_gpu_write_hidden(handle, layer, ring_pos, src_offset, n_tokens, n_embd);
+}
+
+bool llama_context::prefill_gpu_write_hidden(void * handle, int slot, int layer, int ring_pos, int src_offset, int n_tokens, int n_embd) {
+    if (!handle || !dflash_capture) {
+        return false;
+    }
+    if (slot < 0 || slot >= (int) dflash_capture->prefill_gpu.size()) {
+        return false;
+    }
+    auto * pgpu = dflash_capture->prefill_gpu[slot].get();
+    if (!pgpu || layer < 0 || layer >= (int) pgpu->layers.size()) {
+        return false;
+    }
+    if (src_offset < 0 || n_tokens <= 0 || n_embd != pgpu->n_embd ||
+            src_offset + n_tokens > pgpu->n_tokens) {
+        return false;
+    }
+
+    auto * tensor = pgpu->layers[layer];
+    if (!tensor || !tensor->data) {
+        return false;
+    }
+    if (!dflash_gpu_hidden_span_in_bounds(tensor, src_offset, n_tokens, n_embd, __func__)) {
+        return false;
+    }
+
+    auto * h = (dflash_cross_ring_handle *)handle;
+    // Vulkan: tensor-variant D2D (see cross_ring_gpu_write_hidden). CUDA leaves it null.
+    if (h->fn_write_d2d_tensor &&
+        h->fn_write_d2d_tensor(h->gpu_ring, layer, ring_pos, tensor, src_offset, n_tokens, n_embd)) {
+        return true;
+    }
+    const size_t src_offset_bytes = (size_t) src_offset * (size_t) n_embd * sizeof(float);
+    const void * src = (const char *) tensor->data + src_offset_bytes;
+    if (h->fn_write_d2d && h->fn_write_d2d(h->gpu_ring, layer, ring_pos, src, n_tokens, n_embd)) {
+        return true;
+    }
+
+    static bool warned_prefill_d2h_fallback = false;
+    if (!warned_prefill_d2h_fallback) {
+        LLAMA_LOG_WARN("%s: prefill GPU D2D ring write unavailable; falling back to GPU readback + H2D ring upload\n",
+            __func__);
+        warned_prefill_d2h_fallback = true;
+    }
+
+    const size_t n_bytes = (size_t) n_tokens * (size_t) n_embd * sizeof(float);
+    std::vector<float> staging((size_t) n_tokens * (size_t) n_embd);
+    ggml_backend_tensor_get(tensor, staging.data(), src_offset_bytes, n_bytes);
+    h->fn_write(h->gpu_ring, layer, ring_pos, staging.data(), n_tokens, n_embd);
+    h->fn_synchronize(h->gpu_ring);
+    return true;
+}
+
+bool llama_dflash_prefill_gpu_write_hidden(void * handle, llama_context * ctx, int slot, int layer, int ring_pos, int src_offset, int n_tokens, int n_embd) {
+    if (!ctx) return false;
+    return ctx->prefill_gpu_write_hidden(handle, slot, layer, ring_pos, src_offset, n_tokens, n_embd);
+}
+
+bool llama_dflash_prefill_gpu_active(llama_context * ctx) {
+    if (!ctx) return false;
+    return ctx->prefill_gpu_active();
+}
+
+int64_t llama_dflash_prefill_gpu_n_tokens(llama_context * ctx, int slot) {
+    if (!ctx) return 0;
+    return ctx->prefill_gpu_n_tokens(slot);
+}
+
+void llama_dflash_prefill_capture_begin(llama_context * ctx, llama_seq_id seq_id, int32_t capture_begin, int32_t capture_end) {
+    if (!ctx) return;
+    ctx->dflash_prefill_capture_begin(seq_id, capture_begin, capture_end);
+}
+
+void llama_dflash_prefill_capture_end(llama_context * ctx) {
+    if (!ctx) return;
+    ctx->dflash_prefill_capture_end();
+}
+
+bool llama_dflash_prefill_capture_info(llama_context * ctx, llama_seq_id seq_id, int32_t * n_tokens, int32_t * n_written) {
+    if (!ctx) return false;
+    return ctx->dflash_prefill_capture_info(seq_id, n_tokens, n_written);
+}
+
+void llama_dflash_cross_ring_gpu_synchronize(void * handle) {
+    if (!handle) return;
+    auto * h = (dflash_cross_ring_handle *)handle;
+    h->fn_synchronize(h->gpu_ring);
+}
+
+bool llama_dflash_cross_ring_gpu_snapshot(
+        void * handle, int ring_write_pos, int ring_filled, int ctx_window,
+        float * data, int n_tokens, int n_layers, int n_embd) {
+    if (!handle) return false;
+    auto * h = (dflash_cross_ring_handle *)handle;
+    return h->fn_snapshot(h->gpu_ring, ring_write_pos, ring_filled, ctx_window,
+            data, n_tokens, n_layers, n_embd);
+}
+
+void llama_dflash_cross_ring_gpu_set_cross(
+        llama_context * ctx, void * handle, llama_seq_id seq_id,
+        int ring_write_pos, int ring_filled,
+        int n_layers, int n_embd, int ctx_window) {
+    if (!handle || !ctx) return;
+    auto * h = (dflash_cross_ring_handle *)handle;
+
+    const float * d_staging = h->fn_interleave(h->gpu_ring, ring_write_pos, ring_filled, ctx_window);
+    if (!d_staging) return;
+
+    int cross_len = ring_filled < ctx_window ? ring_filled : ctx_window;
+    ctx->set_cross_data_gpu(seq_id, d_staging, cross_len, n_layers, n_embd, h->fn_set_tensor, h->fn_set_tensor_tensor);
+}
+
+// DFlash: dump captured hidden states to file for drafter training
+int64_t llama_context::dflash_dump_hidden_states(const char * path) {
+    auto * cap = dflash_capture.get();
