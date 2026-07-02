@@ -325,3 +325,31 @@ behavioral test for decoder_n_ubatch could be added as follow-up.
   627fb18ab) local HEAD 09ab0643a to overwrite; nothing valuable lost (WIP was
   superseded by the completed systematic merge). All three refs now at
   09ab0643a.
+
+## gboddaer/main reset (2026-07-02)
+
+Context: the llama.cpp merge exercise work had been pushed to gboddaer/main
+incrementally (per an earlier "push to gboddaer main after each phase" instruction).
+User decided main should hold only the fork's pre-exercise state (DFlash-on-Vulkan
+feature), with the llama.cpp merge living on the PR branch merge_llama_into_beellama_2.
+
+Full topology verified:
+- A = 85e22ea0b "ci: remove v0.3.2 one-time workflows" (remote main at first fetch)
+- B = adb92b36a "Merge 'enable-dflash-qwen3-coder-next-on-vulkan' into main"
+  (fork's local main WITH DFlash pr-79 feature, 15 commits, by Gert Boddaert)
+- PR HEAD = 92a00ebd1 = B + 381 commits (llama.cpp upstream merge + dflash
+  re-integration + Phase 1-5h bug fixes + mtmd port)
+- B is an ancestor of PR HEAD; dflash fully present on PR (dflash_draft.cpp,
+  common_speculative_impl_dflash, llama_set_cross_data_seq, dflash-server-utils,
+  ggml-turbo-quant, test-dflash-decode). PR work safe on gboddaer/merge_llama_into_beellama_2.
+
+Action: force-pushed gboddaer/main backward 09ab0643a -> adb92b36a (Candidate B)
+with --force-with-lease=main:09ab0643a (verified remote unchanged first).
+- Removes 380 llama.cpp-merge commits from main; keeps the 15 pr-79 DFlash commits.
+- Nothing lost: PR work intact on gboddaer/merge_llama_into_beellama_2 (92a00ebd1).
+Candidate A (85e22ea0b) rejected: would strip the fork's own DFlash feature from main.
+
+Result:
+- gboddaer/main = adb92b36a (fork main with DFlash, pre llama.cpp merge)
+- gboddaer/merge_llama_into_beellama_2 = 92a00ebd1 (PR, unchanged)
+- The PR (merge_llama_into_beellama_2 -> main) will bring merged-base dflash to main.
