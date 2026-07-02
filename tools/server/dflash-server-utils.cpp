@@ -23,6 +23,22 @@
 
 // DFlash server utility implementations
 
+namespace dflash {
+
+std::atomic<bool> g_enabled{false};
+
+void init() {
+    // Check if DFlash is enabled via params or env
+    // For now, default to disabled until params are parsed
+    g_enabled.store(false, std::memory_order_release);
+}
+
+void shutdown() {
+    g_enabled.store(false, std::memory_order_release);
+}
+
+} // namespace dflash
+
 namespace dflash_server_utils {
 
 // Profile and trace enabled checks

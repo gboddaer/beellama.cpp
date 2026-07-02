@@ -21,6 +21,7 @@
 #include "src/dflash-profile.h"
 #include "src/llama-ext.h"
 #include "src/llama-memory.h"
+#include "dflash-server-utils.h"
 
 #include <algorithm>
 #include <cstddef>
@@ -3976,6 +3977,10 @@ void server_context::start_loop() {
 }
 
 void server_context::terminate() {
+    // DFlash cleanup
+    if (dflash::enabled()) {
+        dflash::shutdown();
+    }
     impl->queue_tasks.terminate();
 }
 

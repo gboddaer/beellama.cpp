@@ -6,9 +6,28 @@
 #include "src/llama-ext.h"
 #include "src/llama-memory.h"
 
+#include <atomic>
 #include <cstdint>
 #include <string>
 #include <vector>
+
+namespace dflash {
+
+// Thread-safe atomic flag — set once at init, never toggled mid-decode
+extern std::atomic<bool> g_enabled;
+
+// Cheap atomic check (~1ns) — use at every hook site
+inline bool enabled() {
+    return g_enabled.load(std::memory_order_acquire);
+}
+
+// Initialization (called once at server startup)
+void init();
+
+// Cleanup (called once at server shutdown)
+void shutdown();
+
+} // namespace dflash
 
 // DFlash server utility functions
 // These encapsulate DFlash-specific logic separate from core server code
