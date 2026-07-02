@@ -279,3 +279,35 @@ regression (draft.n_max). All 4 backends 0 errors. No test regressions introduce
 Deferred (out of scope): mtmd decoder_n_ubatch propagation (tracked as fork
 follow-up); full fork source-text integration-guard parity (anti-pattern, not
 restored — behavioral tests preferred).
+
+## Phase 5h: Port mtmd decoder_n_ubatch feature (2026-07-02)
+
+User decided to port the deferred mtmd decoder_n_ubatch feature (was deferred
+in Phase 5g). Ported against the current merged tree (not the fork's old base).
+
+### Hard facts
+- HF-021: mtmd decoder_n_ubatch feature ported across 5 files, 147 insertions.
+  Proof: commit 616b588cc; grep decoder_n_ubatch/decode_requirements present in
+  tools/mtmd/{mtmd.h,clip.h,mtmd.cpp,clip.cpp} + tools/server/server-context.cpp.
+- HF-022: All 4 backends build 0 errors after port. Proof: build-ci-{cuda,rocm,
+  vulkan,debug} grep error: = 0 each, 2026-07-02.
+- HF-023: CI-equivalent ctest -L main -E test-llama-archs: 98% pass, 1 fail
+  (test-tokenizers-ggml-vocabs, network-gated, unchanged). No regressions;
+  test-mtmd-c-api still passes. Proof: ctest run 2026-07-02.
+
+### Design decisions (port)
+- Additive + gated: decoder_n_ubatch defaults to 0 (unknown = current behavior).
+  The batch raise and image-token cap activate ONLY for non-causal projectors
+  (needs_non_causal_full_batch). Causal models unaffected.
+- Preserved current GEMMA4V min=40 (did NOT adopt fork's 252) to avoid changing
+  existing image-token floor; only ADDED the ubatch cap. Fork's 252 min was a
+  separate tuning; the decoder_n_ubatch feature is the cap, not the min change.
+- decoder_n_ubatch set from params_base.n_ubatch (post-adjust) since ctx_tgt is
+  created AFTER mparams setup in load_model; the adjust step raises n_ubatch
+  first, so mparams.decoder_n_ubatch reflects the raised value.
+
+### Completion (mtmd feature)
+Feature fully ported and building. The previously-deleted test-mtmd-plumbing
+text-grep guards are NOT restored (they were an anti-pattern per GLM); the
+feature is validated by build + test-mtmd-c-api + the real code path. A
+behavioral test for decoder_n_ubatch could be added as follow-up.
