@@ -497,6 +497,11 @@ struct server_slot {
 
             state = SLOT_STATE_IDLE;
 
+            // DFlash cleanup: release per-slot DFlash state
+            if (dflash::enabled()) {
+                // TODO: call dflash::on_slot_release(*this) when implemented
+            }
+
             // do not keep context of the child slots - the parent's context is enough
             if (task->is_child()) {
                 prompt_clear(false);
@@ -2770,6 +2775,11 @@ private:
 #endif
 
     void update_slots() {
+        // DFlash per-request hook: update DFlash state for each slot
+        if (dflash::enabled()) {
+            // TODO: call dflash::on_slot_update(slot) for each slot when implemented
+        }
+
 #ifdef DEBUG_TIMINGS
         static int64_t t_prev = 0;
         int64_t t_start = ggml_time_us();
@@ -3710,6 +3720,11 @@ private:
     }
 
     void post_decode(int32_t n_batch_tokens, int32_t off, llama_batch & batch_view) {
+        // DFlash post-decode hook: coordinate drafter/reviewer
+        if (dflash::enabled()) {
+            // TODO: call dflash::post_decode(slots, batch_view) when implemented
+        }
+
         // for checking if a given batch index is inside batch_view
         auto is_inside_view = [&](int32_t idx) {
             return idx >= off && idx < off + n_batch_tokens;
