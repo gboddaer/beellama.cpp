@@ -2831,6 +2831,42 @@ private:
         try {
             scoped_timer t(t_pre_decode, n_pre_decode);
             pre_decode();
+            // DFlash: add draft tokens to batch before render
+            // Draft tokens go after regular batch tokens, with logits=true on last
+            bool dflash_snapshot = dflash::enabled();
+            if (dflash_snapshot) {
+                int32_t dflash_added = 0;
+                for (auto & slot : slots) {
+                    if (slot.dflash_state.active && slot.dflash_state.dft_ctx) {
+                        // Generate draft token from the last accepted token
+                        auto draft = dflash::generate_draft(
+                            slot.dflash_state.dft_ctx,
+                            slot.dflash_state,
+                            1
+                        );
+                        if (!draft.empty()) {
+                            // Add draft token(s) to the batch
+                            for (int i = 0; i < (int)draft.size() - 1; ++i) {
+                                if (!batch.add(slot.id, draft[i],
+                                    slot.prompt.tokens.pos_next(),
+                                    false)) {
+                                    break; // batch full
+                                }
+                            }
+                            // Last draft token gets logits=true for verification
+                            if (draft.size() > 0) {
+                                batch.add(slot.id, draft.back(),
+                                    slot.prompt.tokens.pos_next(),
+                                    true);
+                            }
+                            dflash_added += draft.size();
+                        }
+                    }
+                }
+                if (dflash_added > 0) {
+                    SRV_DBG("dflash: added %d draft tokens to batch\n", dflash_added);
+                }
+            }
             batch.render();
         } catch (const std::exception & e) {
             SRV_ERR("pre_decode() failed: %s\n", e.what());
@@ -3640,20 +3676,6 @@ private:
             n_empty_consecutive = 0;
         }
 
-        // DFlash pre-decode: generate draft tokens if enabled
-        bool dflash_snapshot = dflash::enabled();
-        if (dflash_snapshot) {
-            // TODO: Wire actual draft generation here
-            // For now, this is a placeholder that will be activated
-            // when DFlash models are loaded and slots are configured
-            // iterate(slots, [&](server_slot & slot) {
-            //     if (slot.dflash_state.active && slot.ctx_dft) {
-            //         auto draft = dflash::generate_draft(slot.ctx_dft, slot.dflash_state, 1);
-            //         // TODO: Add draft tokens to batch with logits=true on last
-            //     }
-            // });
-        }
-
         const int ret = llama_decode(ctx_tgt, batch_view);
 
         metrics.on_decoded(slots);
@@ -3748,17 +3770,20 @@ private:
         // DFlash post-decode hook: verify draft tokens and accept/rollback
         bool dflash_snapshot = dflash::enabled();
         if (dflash_snapshot) {
-            // TODO: Wire actual draft verification here
-            // For now, this is a placeholder that will be activated
-            // when DFlash models are loaded and slots are configured
-            // iterate(slots, [&](server_slot & slot) {
-            //     if (slot.dflash_state.active && !slot.dflash_state.draft_tokens.empty()) {
-            //         int n_accepted = dflash::verify_draft(slot.ctx_tgt, slot.dflash_state, slot.i_batch);
-            //         if (n_accepted == 0) {
-            //             dflash::rollback(slot.ctx_tgt, slot.dflash_state);
-            //         }
-            //     }
-            // });
+            for (auto & slot : slots) {
+                if (slot.dflash_state.active && !slot.dflash_state.draft_tokens.empty()) {
+                    // Verify target output against draft
+                    int n_accepted = dflash::verify_draft(
+                        ctx_tgt,
+                        slot.dflash_state,
+                        slot.i_batch
+                    );
+                    if (n_accepted == 0) {
+                        // Rollback rejected draft tokens
+                        dflash::rollback(ctx_tgt, slot.dflash_state);
+                    }
+                }
+            }
         }
 
         // for checking if a given batch index is inside batch_view
