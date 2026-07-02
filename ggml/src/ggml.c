@@ -1138,8 +1138,11 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "cross_entropy_loss_back(x,y)",
     "adamw(x)",
     "sgd(x)",
+    "sgd(x)",
 
     "glu(x)",
+    "adamw(x)",  // OPT_STEP_ADAMW
+    "sgd(x)",   // OPT_STEP_SGD
 };
 
 
@@ -1243,6 +1246,7 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "OPT_STEP_ADAMW",
     "OPT_STEP_SGD",
     "GLU",
+    "GLU",  // Added for index 99
 };
 static const char * GGML_UNARY_OP_NAME[GGML_UNARY_OP_COUNT] = {
     "ABS",
