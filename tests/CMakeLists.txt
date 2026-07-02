@@ -266,7 +266,11 @@ llama_build_and_test(test-dflash-plumbing.cpp ARGS ${PROJECT_SOURCE_DIR})
 target_include_directories(test-dflash-plumbing PRIVATE ${PROJECT_SOURCE_DIR}/src)
 llama_build_and_test(test-dflash-decode.cpp ${PROJECT_SOURCE_DIR}/tools/server/dflash-server-utils.cpp)
 target_include_directories(test-dflash-decode PRIVATE ${PROJECT_SOURCE_DIR}/tools/server ${PROJECT_SOURCE_DIR}/src ${PROJECT_SOURCE_DIR}/tools/mtmd ${PROJECT_SOURCE_DIR})
-llama_build_and_test(test-mtmd-plumbing.cpp ARGS ${PROJECT_SOURCE_DIR})
+# test-mtmd-plumbing asserts fork-only mtmd decoder_n_ubatch propagation that this
+# DFlash-scoped merge did NOT port (upstream mtmd kept). Relabeled out of the CI
+# `main` set so it does not gate CI; retained as a fork re-benchmark reference for
+# the deferred mtmd decoder_n_ubatch feature. (GLM review: out-of-scope, defer.)
+llama_build_and_test(test-mtmd-plumbing.cpp ARGS ${PROJECT_SOURCE_DIR} LABEL fork-integration)
 llama_build_and_test(test-perplexity-plumbing.cpp ARGS ${PROJECT_SOURCE_DIR})
 
 if (NOT LLAMA_SANITIZE_ADDRESS AND NOT GGML_SCHED_NO_REALLOC)
