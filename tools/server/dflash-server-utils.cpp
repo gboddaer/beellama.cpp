@@ -74,42 +74,124 @@ void cleanup_slot_dflash(dflash_slot_state & state) {
 }
 
 llama_tokens generate_draft(llama_context * ctx_dft, dflash_slot_state & state, int n_draft) {
-    (void)ctx_dft;
-    (void)n_draft;
-    
-    // TODO: Implement draft generation
-    // For MVP (n_draft=1):
-    // 1. llama_batch b = llama_batch_get_one(&last_accepted_token, 1);
-    // 2. llama_decode(ctx_dft, b);
-    // 3. float * logits = llama_get_logits_ith(ctx_dft, b.n_tokens - 1);
-    // 4. llama_token next = llama_token_best(ctx_dft, b.n_tokens - 1);
-    // 5. state.draft_tokens.push_back(next);
-    // 6. return state.draft_tokens;
-    
-    // For multi-draft (n_draft>1):
-    // Loop n_draft times, each time feeding previous draft token
-    
     state.draft_tokens.clear();
+    
+    if (!ctx_dft || n_draft <= 0) {
+        return state.draft_tokens;
+    }
+    
+    // Cap n_draft to avoid batch overflow
+    n_draft = std::min(n_draft, 8); // TODO: make configurable
+    
+    // Autoregressive draft generation: loop n_draft times
+    // Each iteration decodes one token on the draft context, then argmax
+    for (int i = 0; i < n_draft; ++i) {
+        // Get the last token to feed into the draft context
+        llama_token cur;
+        if (state.draft_tokens.empty()) {
+            // First draft token: use last_accepted from state
+            // TODO: this needs to be set by the caller before calling generate_draft
+            // For now, skip if no last_accepted is available
+            break;
+        } else {
+            cur = state.draft_tokens.back();
+        }
+        
+        // Create a single-token batch for the draft context
+        llama_batch b = llama_batch_get_one(&cur, 1);
+        
+        // Decode on the draft context
+        int rc = llama_decode(ctx_dft, b);
+        if (rc < 0) {
+            // Fatal error - abort draft generation
+            fprintf(stderr, "dflash: draft decode failed at step %d, rc=%d\n", i, rc);
+            break;
+        }
+        if (rc > 0) {
+            // Batch full or context exceeded - stop drafting
+            fprintf(stderr, "dflash: draft batch full at step %d\n", i);
+            break;
+        }
+        
+        // Get logits from the draft context
+        const float * logits = llama_get_logits_ith(ctx_dft, b.n_tokens - 1);
+        if (!logits) {
+            fprintf(stderr, "dflash: no draft logits at step %d\n", i);
+            break;
+        }
+        
+        // Argmax over the draft vocab to get the next token
+        // llama_get_logits_argmax_ith returns int32_t* (pointer to argmax array)
+        const int32_t * argmax_ptr = llama_get_logits_argmax_ith(ctx_dft, b.n_tokens - 1);
+        if (!argmax_ptr) {
+            fprintf(stderr, "dflash: no argmax at step %d\n", i);
+            break;
+        }
+        llama_token next = (llama_token) *argmax_ptr;
+        
+        state.draft_tokens.push_back(next);
+        state.n_draft++;
+    }
+    
     return state.draft_tokens;
 }
 
 void rollback(llama_context * ctx_tgt, dflash_slot_state & state) {
-    (void)ctx_tgt;
+    if (!ctx_tgt) {
+        state.draft_tokens.clear();
+        state.n_draft = 0;
+        state.n_accepted = 0;
+        state.active = false;
+        return;
+    }
     
-    // TODO: Implement rollback
-    // 1. Use llama_memory_seq_rm to remove rejected slots from KV cache
-    // 2. Reset draft state
-    // 3. Update counters
+    // Remove rejected draft tokens from target KV cache
+    int n_reject = state.n_draft - state.n_accepted;
+    if (n_reject > 0) {
+        // Get the memory handle for the target context
+        llama_memory_t mem = llama_get_memory(ctx_tgt);
+        if (mem) {
+            // Remove positions [n_accepted, n_draft) from the KV cache
+            // Using seq_id 0 for single-sequence MVP
+            // TODO: use proper seq_id from slot
+            llama_pos p0 = (llama_pos) state.n_accepted;
+            llama_pos p1 = (llama_pos) state.n_draft;
+            llama_memory_seq_rm(mem, 0, p0, p1);
+        }
+    }
     
-    // For MVP:
-    // - Remove slots n_accepted to n_draft-1 from both ctx_tgt and ctx_dft KV
-    // - Clear draft_tokens
-    // - Reset n_draft, n_accepted, active
+    // TODO: Also rollback the draft context KV if it exists
+    // For MVP, we only rollback the target context
     
     state.draft_tokens.clear();
     state.n_draft = 0;
     state.n_accepted = 0;
     state.active = false;
+}
+
+int verify_draft(llama_context * ctx_tgt, dflash_slot_state & state, int batch_idx) {
+    if (!ctx_tgt || state.draft_tokens.empty()) {
+        return 0;
+    }
+    
+    // Get the target logits argmax at the batch position
+    // llama_get_logits_argmax_ith returns int32_t* (pointer to argmax array)
+    const int32_t * argmax_ptr = llama_get_logits_argmax_ith(ctx_tgt, batch_idx);
+    if (!argmax_ptr) {
+        return 0;
+    }
+    llama_token tgt_tok = (llama_token) *argmax_ptr;
+    
+    // Compare with the first draft token
+    if (tgt_tok == state.draft_tokens[0]) {
+        // Accepted!
+        state.n_accepted = 1;
+        return 1;
+    }
+    
+    // Rejected - need to rollback
+    state.n_accepted = 0;
+    return 0;
 }
 
 } // namespace dflash

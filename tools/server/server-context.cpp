@@ -3640,6 +3640,20 @@ private:
             n_empty_consecutive = 0;
         }
 
+        // DFlash pre-decode: generate draft tokens if enabled
+        bool dflash_snapshot = dflash::enabled();
+        if (dflash_snapshot) {
+            // TODO: Wire actual draft generation here
+            // For now, this is a placeholder that will be activated
+            // when DFlash models are loaded and slots are configured
+            // iterate(slots, [&](server_slot & slot) {
+            //     if (slot.dflash_state.active && slot.ctx_dft) {
+            //         auto draft = dflash::generate_draft(slot.ctx_dft, slot.dflash_state, 1);
+            //         // TODO: Add draft tokens to batch with logits=true on last
+            //     }
+            // });
+        }
+
         const int ret = llama_decode(ctx_tgt, batch_view);
 
         metrics.on_decoded(slots);
@@ -3731,9 +3745,20 @@ private:
     }
 
     void post_decode(int32_t n_batch_tokens, int32_t off, llama_batch & batch_view) {
-        // DFlash post-decode hook: coordinate drafter/reviewer
-        if (dflash::enabled()) {
-            // TODO: call dflash::post_decode(slots, batch_view) when implemented
+        // DFlash post-decode hook: verify draft tokens and accept/rollback
+        bool dflash_snapshot = dflash::enabled();
+        if (dflash_snapshot) {
+            // TODO: Wire actual draft verification here
+            // For now, this is a placeholder that will be activated
+            // when DFlash models are loaded and slots are configured
+            // iterate(slots, [&](server_slot & slot) {
+            //     if (slot.dflash_state.active && !slot.dflash_state.draft_tokens.empty()) {
+            //         int n_accepted = dflash::verify_draft(slot.ctx_tgt, slot.dflash_state, slot.i_batch);
+            //         if (n_accepted == 0) {
+            //             dflash::rollback(slot.ctx_tgt, slot.dflash_state);
+            //         }
+            //     }
+            // });
         }
 
         // for checking if a given batch index is inside batch_view

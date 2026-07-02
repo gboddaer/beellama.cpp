@@ -48,6 +48,10 @@ void cleanup_slot_dflash(dflash_slot_state & state);
 llama_tokens generate_draft(llama_context * ctx_dft, dflash_slot_state & state, int n_draft = 1);
 void rollback(llama_context * ctx_tgt, dflash_slot_state & state);
 
+// Verify draft tokens against target logits
+// Returns number of accepted draft tokens (0 to draft_tokens.size())
+int verify_draft(llama_context * ctx_tgt, dflash_slot_state & state, int batch_idx);
+
 } // namespace dflash
 
 // DFlash server utility functions
