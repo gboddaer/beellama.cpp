@@ -63,7 +63,8 @@ void cleanup_slot_dflash(dflash_slot_state & state) {
         llama_free(state.dft_ctx);
         state.dft_ctx = nullptr;
     }
-    if (state.dft_batch.n_tokens > 0) {
+    // Check if batch was allocated (token pointer non-null after init)
+    if (state.dft_batch.token != nullptr) {
         llama_batch_free(state.dft_batch);
         state.dft_batch = llama_batch{};
     }
