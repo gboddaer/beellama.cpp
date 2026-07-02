@@ -112,6 +112,10 @@ struct mtmd_context_params {
     // If it returns false, model loading is immediately aborted.
     mtmd_progress_callback progress_callback;
     void * progress_callback_user_data;
+
+    // physical ubatch of the text decoder; 0 if unknown (fork mtmd feature:
+    // lets non-causal image-decode projectors cap image tokens to the decoder ubatch)
+    int decoder_n_ubatch;
 };
 
 MTMD_API const char * mtmd_default_marker(void);
@@ -327,6 +331,16 @@ struct mtmd_caps {
 MTMD_API struct mtmd_caps mtmd_get_cap_from_file(const char * mmproj_fname);
 
 /////////////////////////////////////////
+
+// Lightweight metadata-only decode-requirements query (fork mtmd feature).
+// Lets the server size batch/ubatch for non-causal image-decode projectors
+// (Gemma3/Gemma4) before creating the text context, and lets clip cap image
+// tokens to the decoder ubatch so a non-causal image chunk fits one ubatch.
+struct mtmd_decode_requirements {
+    bool needs_non_causal_full_batch;
+    int32_t min_decoder_batch_tokens;
+};
+MTMD_API struct mtmd_decode_requirements mtmd_get_decode_requirements_from_file(const char * mmproj_fname);
 
 // test function, to be used in test-mtmd-c-api.c
 MTMD_API mtmd_input_chunks * mtmd_test_create_input_chunks(void);

@@ -253,6 +253,7 @@ mtmd_context_params mtmd_context_params_default() {
         /* batch_max_tokens  */ 1024,
         /* progress_callback */ nullptr,
         /* progress_callback_user_data */ nullptr,
+        /* decoder_n_ubatch */ 0,
     };
     return params;
 }
@@ -349,6 +350,7 @@ struct mtmd_context {
             /* no_alloc          */ no_alloc,
             /* progress_callback */ ctx_params.progress_callback,
             /* progress_callback_user_data */ ctx_params.progress_callback_user_data,
+            /* decoder_n_ubatch */ ctx_params.decoder_n_ubatch,
         };
 
         auto res = clip_init(mmproj_fname, ctx_clip_params);
@@ -2019,6 +2021,19 @@ struct mtmd_caps mtmd_get_cap_from_file(const char * fname) {
     } catch (const std::exception & e) {
         LOG_ERR("%s: failed to get capabilities from file '%s': %s\n", __func__, fname, e.what());
         return mtmd_caps{ false, false };
+    }
+}
+
+struct mtmd_decode_requirements mtmd_get_decode_requirements_from_file(const char * fname) {
+    try {
+        auto tmp = clip_get_decode_requirements(fname);
+        mtmd_decode_requirements requirements;
+        requirements.needs_non_causal_full_batch = tmp.needs_non_causal_full_batch;
+        requirements.min_decoder_batch_tokens    = tmp.min_decoder_batch_tokens;
+        return requirements;
+    } catch (const std::exception & e) {
+        LOG_ERR("%s: failed to get decode requirements from file '%s': %s\n", __func__, fname, e.what());
+        return mtmd_decode_requirements{ false, 0 };
     }
 }
 

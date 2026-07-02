@@ -56,6 +56,7 @@ struct clip_context_params {
     bool no_alloc;
     mtmd_progress_callback progress_callback;
     void * progress_callback_user_data;
+    int decoder_n_ubatch; // physical ubatch of the text decoder; 0 if unknown (fork mtmd feature)
 };
 
 struct clip_init_result {
@@ -102,3 +103,12 @@ struct clip_cap {
     bool has_audio;
 };
 struct clip_cap clip_get_cap(const char * fname);
+
+// Fork mtmd feature: metadata-only decode-requirements query for non-causal
+// image-decode projectors (Gemma3/Gemma4). Used by the server to size
+// batch/ubatch before creating the text context.
+struct clip_decode_requirements {
+    bool needs_non_causal_full_batch;
+    int32_t min_decoder_batch_tokens;
+};
+struct clip_decode_requirements clip_get_decode_requirements(const char * fname);

@@ -1030,6 +1030,59 @@ static std::unique_ptr<clip_graph> clip_get_graph_builder(clip_ctx * ctx, const 
     return builder;
 }
 
+// Fork mtmd feature: cap image tokens to the text decoder's physical ubatch so a
+// non-causal image chunk fits in one decoder ubatch. With decoder_n_ubatch <= 0
+// (unknown), falls back to set_limit_image_tokens(min, max) = current behavior.
+static void clip_set_limit_image_tokens_for_non_causal_decode(
+        clip_hparams & hparams,
+        int            n_tokens_min,
+        int            n_tokens_max,
+        int            decoder_n_ubatch) {
+    if (decoder_n_ubatch <= 0) {
+        hparams.set_limit_image_tokens(n_tokens_min, n_tokens_max);
+        return;
+    }
+
+    int effective_max = hparams.custom_image_max_tokens > 0 ? hparams.custom_image_max_tokens : n_tokens_max;
+    int effective_min = hparams.custom_image_min_tokens > 0 ? hparams.custom_image_min_tokens : n_tokens_min;
+
+    if (effective_max <= decoder_n_ubatch) {
+        hparams.set_limit_image_tokens(n_tokens_min, n_tokens_max);
+        return;
+    }
+
+    LOG_WRN("%s: non-causal image decode requires image tokens <= decoder n_ubatch; limiting image_max_tokens from %d to %d\n",
+            __func__, effective_max, decoder_n_ubatch);
+    effective_max = decoder_n_ubatch;
+
+    if (effective_min > effective_max) {
+        LOG_WRN("%s: limiting image_min_tokens from %d to %d to keep non-causal image decode within decoder n_ubatch\n",
+                __func__, effective_min, effective_max);
+        effective_min = effective_max;
+    }
+
+    hparams.set_limit_image_tokens(effective_min, effective_max);
+}
+
+// Fork mtmd feature: default fixed image-token count for a non-causal projector
+// (e.g. Gemma3), used by clip_get_decode_requirements to report the minimum
+// decoder batch size that fits one full image chunk.
+static int32_t clip_default_fixed_image_tokens(const clip_hparams & hparams) {
+    const int cur_merge = hparams.n_merge == 0 ? 1 : hparams.n_merge;
+    const int stride    = hparams.patch_size * cur_merge;
+
+    if (stride <= 0 || hparams.image_size <= 0) {
+        return 0;
+    }
+
+    const int default_side = hparams.image_size / stride;
+    if (default_side <= 0) {
+        return 0;
+    }
+
+    return default_side * default_side;
+}
+
 //
 // clip_model_loader
 //
@@ -1115,7 +1168,7 @@ struct clip_model_loader {
         }
     }
 
-    void load_hparams(clip_model & model, clip_modality modality) {
+    void load_hparams(clip_model & model, clip_modality modality, int decoder_n_ubatch = 0) {
         auto & hparams = model.hparams;
         std::string log_ffn_op; // for logging
 
@@ -1438,7 +1491,7 @@ struct clip_model_loader {
                             hparams.n_merge = 1;
                         }
                         // @ngxson : the model performs quite poor with small images, we need to bump minimum image tokens to 40 to avoid that
-                        hparams.set_limit_image_tokens(40, 280);
+                        clip_set_limit_image_tokens_for_non_causal_decode(hparams, 40, 280, decoder_n_ubatch);
                         hparams.set_warmup_n_tokens(256); // avoid OOM on warmup
                     } break;
 
@@ -3181,7 +3234,7 @@ struct clip_init_result clip_init(const char * fname, struct clip_context_params
 
         if (loader.has_vision) {
             ctx_vision = new clip_ctx(ctx_params);
-            loader.load_hparams(ctx_vision->model, CLIP_MODALITY_VISION);
+            loader.load_hparams(ctx_vision->model, CLIP_MODALITY_VISION, ctx_params.decoder_n_ubatch);
             loader.load_tensors(*ctx_vision);
             loader.init_ctx(*ctx_vision);
             if (ctx_params.warmup) {
@@ -3221,6 +3274,32 @@ struct clip_cap clip_get_cap(const char * fname) {
     res.has_vision = loader.has_vision;
     res.has_audio  = loader.has_audio;
     return res;
+}
+
+struct clip_decode_requirements clip_get_decode_requirements(const char * fname) {
+    clip_decode_requirements requirements{};
+    clip_model_loader loader(fname, /* skip_tensors= */ true);
+
+    if (!loader.has_vision) {
+        return requirements;
+    }
+
+    clip_model model;
+    loader.load_hparams(model, CLIP_MODALITY_VISION, /* decoder_n_ubatch */ 0);
+
+    switch (model.proj_type) {
+        case PROJECTOR_TYPE_GEMMA3:
+            requirements.needs_non_causal_full_batch = true;
+            requirements.min_decoder_batch_tokens    = clip_default_fixed_image_tokens(model.hparams);
+            break;
+        case PROJECTOR_TYPE_GEMMA4V:
+            requirements.needs_non_causal_full_batch = true;
+            break;
+        default:
+            break;
+    }
+
+    return requirements;
 }
 
 void clip_free(clip_ctx * ctx) {

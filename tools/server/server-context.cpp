@@ -1014,6 +1014,25 @@ private:
         return true;
     }
 
+    // Fork mtmd feature: raise the text decoder batch/ubatch so a full non-causal
+    // image chunk (Gemma3/Gemma4) fits in one batch. Called before ctx_tgt creation.
+    void adjust_mmproj_decoder_batch_for_non_causal(const mtmd_decode_requirements & mmproj_decode_req) {
+        if (!mmproj_decode_req.needs_non_causal_full_batch || mmproj_decode_req.min_decoder_batch_tokens <= 0) {
+            return;
+        }
+
+        const int32_t old_n_batch  = params_base.n_batch;
+        const int32_t old_n_ubatch = params_base.n_ubatch;
+
+        params_base.n_batch  = std::max(params_base.n_batch,  mmproj_decode_req.min_decoder_batch_tokens);
+        params_base.n_ubatch = std::max(params_base.n_ubatch, mmproj_decode_req.min_decoder_batch_tokens);
+
+        if (params_base.n_batch != old_n_batch || params_base.n_ubatch != old_n_ubatch) {
+            SRV_WRN("mmproj non-causal image decode requires full chunks; raised batch/ubatch from %d/%d to %d/%d\n",
+                    old_n_batch, old_n_ubatch, params_base.n_batch, params_base.n_ubatch);
+        }
+    }
+
     // load the model and initialize llama_context
     // this may also be called to resume from sleeping state
     bool load_model(common_params & params) {
@@ -1068,6 +1087,13 @@ private:
             // progress callback
             mparams.progress_callback           = load_progress_callback;
             mparams.progress_callback_user_data = &load_progress_mmproj;
+
+            // Fork mtmd feature: size the text decoder batch/ubatch so a full
+            // non-causal image chunk (Gemma3/Gemma4) fits in one batch, then expose
+            // the (possibly raised) decoder ubatch so clip caps image tokens to it.
+            const mtmd_decode_requirements mmproj_decode_req = mtmd_get_decode_requirements_from_file(mmproj_path.c_str());
+            adjust_mmproj_decoder_batch_for_non_causal(mmproj_decode_req);
+            mparams.decoder_n_ubatch = params_base.n_ubatch;
         }
 
         // optionally get the memory usage of mmproj
