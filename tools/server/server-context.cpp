@@ -2838,28 +2838,31 @@ private:
                 int32_t dflash_added = 0;
                 for (auto & slot : slots) {
                     if (slot.dflash_state.active && slot.dflash_state.dft_ctx) {
-                        // Generate draft token from the last accepted token
+                        // Generate draft token(s) from the last accepted token
                         auto draft = dflash::generate_draft(
                             slot.dflash_state.dft_ctx,
                             slot.dflash_state,
                             1
                         );
                         if (!draft.empty()) {
-                            // Add draft token(s) to the batch
+                            // Get base position for draft tokens
+                            llama_pos base_pos = slot.prompt.tokens.pos_next();
+
+                            // Add draft tokens - increment position for each
+                            // Position: base_pos, base_pos+1, ..., base_pos+n-1
                             for (int i = 0; i < (int)draft.size() - 1; ++i) {
                                 if (!batch.add(slot.id, draft[i],
-                                    slot.prompt.tokens.pos_next(),
-                                    false)) {
+                                    base_pos + i, false)) {
                                     break; // batch full
                                 }
                             }
                             // Last draft token gets logits=true for verification
                             if (draft.size() > 0) {
-                                batch.add(slot.id, draft.back(),
-                                    slot.prompt.tokens.pos_next(),
-                                    true);
+                                llama_pos last_pos = base_pos + (int)draft.size() - 1;
+                                if (batch.add(slot.id, draft.back(), last_pos, true)) {
+                                    dflash_added += (int)draft.size();
+                                }
                             }
-                            dflash_added += draft.size();
                         }
                     }
                 }
