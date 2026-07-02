@@ -146,7 +146,7 @@ gated_delta_net_cuda(const float * q,
             // snapshot slot mapping: slot 0 = most recent state, slot s = s tokens back.
             // When n_tokens < K only slots 0..n_tokens-1 are written; older slots are caller-owned.
             const int64_t state_size_per_token = S_v * S_v * H * n_seqs; // per-slot stride in output
-            const int target_slot = (int) n_tokens - 1 - t;
+            const int target_slot = (int) K - (int) n_tokens + (int) t;
             if (target_slot >= 0 && target_slot < K) {
                 float * curr_state = (dst + attn_score_elems) + target_slot * state_size_per_token + state_out_offset;
 #pragma unroll

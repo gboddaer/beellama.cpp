@@ -1,6 +1,7 @@
 #include "llama-context.h"
 #include "dflash-profile.h"
 #include "speculative.h"
+#include "common.h"
 
 #include "ggml.h"
 #include "ggml-backend.h"
@@ -179,7 +180,7 @@ static bool test_need_n_rs_seq() {
     auto make = [](std::vector<enum common_speculative_type> types, int32_t n_max) -> uint32_t {
         common_params_speculative s{};
         s.types      = std::move(types);
-        s.draft.n_max = n_max;
+        s.n_max = n_max;
         return s.need_n_rs_seq();
     };
     ok &= expect(make({COMMON_SPECULATIVE_TYPE_DFLASH}, 4) == 4u,  "DFlash -> need_n_rs_seq == draft.n_max");
@@ -390,6 +391,7 @@ static bool test_existing_for_test_helpers() {
 int main(int argc, char ** argv) {
     bool ok = true;
 
+    std::fprintf(stderr, "DEBUG: start of main tests\n");
     ok &= expect(llama_dflash_gpu_tape_supported_arch(LLM_ARCH_QWEN35), "Qwen3.5 must support GPU tape");
     ok &= expect(llama_dflash_gpu_tape_supported_arch(LLM_ARCH_QWEN35MOE), "Qwen3.5-MoE must support GPU tape");
     ok &= expect(!llama_dflash_gpu_tape_supported_arch(LLM_ARCH_QWEN3NEXT), "Qwen3Next must stay on fallback");
