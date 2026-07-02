@@ -1,7 +1,6 @@
 #include "llama-context.h"
 #include "dflash-profile.h"
 #include "speculative.h"
-#include "common.h"
 
 #include "ggml.h"
 #include "ggml-backend.h"
@@ -9,23 +8,6 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
-
-// Stub test helpers (these are fork-specific test utilities that need to be ported)
-bool common_dflash_prefill_capture_complete_for_test(...);
-bool common_dflash_cpu_ring_valid_after_write_for_test(...);
-bool common_dflash_should_refuse_large_prefill_fallback_for_test(...);
-bool common_dflash_cpu_ring_valid_after_source_write_for_test(...);
-bool common_dflash_tree_update_requires_cpu_hidden_for_test(...);
-bool common_dflash_invalid_reduced_logits_next_streak_for_test(...);
-bool common_dflash_invalid_reduced_logits_fail_closed_for_test(...);
-
-bool common_dflash_prefill_capture_complete_for_test(...) { return false; }
-bool common_dflash_cpu_ring_valid_after_write_for_test(...) { return false; }
-bool common_dflash_should_refuse_large_prefill_fallback_for_test(...) { return false; }
-bool common_dflash_cpu_ring_valid_after_source_write_for_test(...) { return false; }
-bool common_dflash_tree_update_requires_cpu_hidden_for_test(...) { return false; }
-bool common_dflash_invalid_reduced_logits_next_streak_for_test(...) { return false; }
-bool common_dflash_invalid_reduced_logits_fail_closed_for_test(...) { return false; }
 #include <fstream>
 #include <sstream>
 #include <string>
@@ -123,6 +105,8 @@ static bool test_vk_dflash_cross_ring_roundtrip() {
     // Drafter-side Vulkan tensor to receive the set_tensor_tensor D2D copy.
     ggml_backend_dev_t dev = ggml_backend_reg_dev_get(vk_reg, 0);
     ggml_backend_t backend = ggml_backend_dev_init(dev, nullptr);
+    ggml_backend_buffer_type_t buft = ggml_backend_dev_buffer_type(dev);
+    GGML_UNUSED(buft);
     size_t mem_size = ggml_tensor_overhead()*4;
     void * mem = malloc(mem_size);
     struct ggml_init_params ip = {};
@@ -180,7 +164,7 @@ static bool test_need_n_rs_seq() {
     auto make = [](std::vector<enum common_speculative_type> types, int32_t n_max) -> uint32_t {
         common_params_speculative s{};
         s.types      = std::move(types);
-        s.n_max = n_max;
+        s.draft.n_max = n_max;
         return s.need_n_rs_seq();
     };
     ok &= expect(make({COMMON_SPECULATIVE_TYPE_DFLASH}, 4) == 4u,  "DFlash -> need_n_rs_seq == draft.n_max");
@@ -391,7 +375,6 @@ static bool test_existing_for_test_helpers() {
 int main(int argc, char ** argv) {
     bool ok = true;
 
-    std::fprintf(stderr, "DEBUG: start of main tests\n");
     ok &= expect(llama_dflash_gpu_tape_supported_arch(LLM_ARCH_QWEN35), "Qwen3.5 must support GPU tape");
     ok &= expect(llama_dflash_gpu_tape_supported_arch(LLM_ARCH_QWEN35MOE), "Qwen3.5-MoE must support GPU tape");
     ok &= expect(!llama_dflash_gpu_tape_supported_arch(LLM_ARCH_QWEN3NEXT), "Qwen3Next must stay on fallback");

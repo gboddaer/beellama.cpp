@@ -484,7 +484,16 @@ struct common_params_speculative {
             return t == COMMON_SPECULATIVE_TYPE_DRAFT_MTP || t == COMMON_SPECULATIVE_TYPE_DRAFT_EAGLE3 || t == COMMON_SPECULATIVE_TYPE_DFLASH;
         });
 
-        return needs_rs_seq ? n_max : 0u;
+        // DFlash on a hybrid arch (e.g. Qwen3.5/Qwen3.6 with DeltaNet recurrent
+        // state) needs per-token recurrent-state snapshots to roll back after a
+        // partial draft rejection; without them (n_rs_seq=0) the recurrent state
+        // cannot roll back (RS-ROLLBACK-OVERFLOW), KV positions desynchronise, and
+        // the verify decode reads an uninitialized token id. The arch clamp in
+        // llama_context construction keeps n_rs_seq=0 for archs that do not
+        // support rs rollback (e.g. Qwen3Next/Coder-Next), so non-hybrid DFlash
+        // targets are unaffected. Uses draft.n_max (the per-drafter horizon), not
+        // the top-level n_max, so the rs_seq count tracks the active draft budget.
+        return needs_rs_seq ? draft.n_max : 0u;
     }
 };
 
