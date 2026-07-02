@@ -119,6 +119,25 @@ static ggml_tensor * ggml_mul_mat_aux(
 // llama_kv_cache
 //
 
+// Fork-compatible constructor (without mem_other and share)
+llama_kv_cache::llama_kv_cache(
+        const llama_model & model,
+        const llama_hparams & hparams,
+                ggml_type   type_k,
+                ggml_type   type_v,
+                     bool   v_trans,
+                     bool   offload,
+                     bool   unified,
+                 uint32_t   kv_size,
+                 uint32_t   n_seq_max,
+                 uint32_t   n_pad,
+                 uint32_t   n_swa,
+           llama_swa_type   swa_type,
+    const layer_filter_cb & filter,
+    const  layer_reuse_cb & reuse) :
+    llama_kv_cache(model, hparams, type_k, type_v, v_trans, offload, unified, kv_size, n_seq_max, n_pad, n_swa, swa_type, nullptr, filter, reuse, nullptr) {
+}
+
 llama_kv_cache::llama_kv_cache(
         const llama_model & model,
         const llama_hparams & hparams,
