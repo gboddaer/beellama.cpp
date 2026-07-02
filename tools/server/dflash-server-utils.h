@@ -35,6 +35,7 @@ llama_model * load_dflash_drafter(const char * path, const llama_model_params & 
 struct dflash_slot_state {
     llama_context * dft_ctx = nullptr;
     llama_batch dft_batch;
+    std::vector<llama_token> draft_tokens;
     int n_draft = 0;
     int n_accepted = 0;
     bool active = false;

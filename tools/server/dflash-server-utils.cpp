@@ -75,23 +75,40 @@ void cleanup_slot_dflash(dflash_slot_state & state) {
 
 llama_tokens generate_draft(llama_context * ctx_dft, dflash_slot_state & state, int n_draft) {
     (void)ctx_dft;
-    (void)state;
     (void)n_draft;
+    
     // TODO: Implement draft generation
-    // 1. Run llama_decode on ctx_dft with draft batch
-    // 2. Get logits and argmax to generate draft tokens
-    // 3. Return draft tokens
-    return {};
+    // For MVP (n_draft=1):
+    // 1. llama_batch b = llama_batch_get_one(&last_accepted_token, 1);
+    // 2. llama_decode(ctx_dft, b);
+    // 3. float * logits = llama_get_logits_ith(ctx_dft, b.n_tokens - 1);
+    // 4. llama_token next = llama_token_best(ctx_dft, b.n_tokens - 1);
+    // 5. state.draft_tokens.push_back(next);
+    // 6. return state.draft_tokens;
+    
+    // For multi-draft (n_draft>1):
+    // Loop n_draft times, each time feeding previous draft token
+    
+    state.draft_tokens.clear();
+    return state.draft_tokens;
 }
 
 void rollback(llama_context * ctx_tgt, dflash_slot_state & state) {
     (void)ctx_tgt;
-    (void)state;
+    
     // TODO: Implement rollback
-    // 1. Remove draft tokens from KV cache
+    // 1. Use llama_memory_seq_rm to remove rejected slots from KV cache
     // 2. Reset draft state
     // 3. Update counters
+    
+    // For MVP:
+    // - Remove slots n_accepted to n_draft-1 from both ctx_tgt and ctx_dft KV
+    // - Clear draft_tokens
+    // - Reset n_draft, n_accepted, active
+    
+    state.draft_tokens.clear();
     state.n_draft = 0;
+    state.n_accepted = 0;
     state.active = false;
 }
 
