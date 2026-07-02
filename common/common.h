@@ -301,6 +301,22 @@ struct common_params_sampling {
     std::string print() const;
 };
 
+enum common_reasoning_loop_guard_mode {
+    COMMON_REASONING_LOOP_GUARD_OFF,
+    COMMON_REASONING_LOOP_GUARD_FORCE_CLOSE,
+    COMMON_REASONING_LOOP_GUARD_STOP,
+};
+
+struct common_reasoning_loop_guard_params {
+    common_reasoning_loop_guard_mode mode = COMMON_REASONING_LOOP_GUARD_FORCE_CLOSE;
+    int32_t min_reasoning_tokens = 1024;
+    int32_t window_tokens = 2048;
+    int32_t max_period = 512;
+    int32_t min_repeated_coverage = 768;
+    int32_t check_interval = 32;
+    int32_t interventions_max = 1;
+};
+
 struct common_params_model {
     std::string path        = ""; // model local path
     std::string url         = ""; // model url to download

@@ -16,6 +16,11 @@
 #include "speculative.h"
 #include "mtmd.h"
 #include "mtmd-helper.h"
+#include "server-adaptive-dm.h"
+#include "server-loop-guard.h"
+#include "src/dflash-profile.h"
+#include "src/llama-ext.h"
+#include "src/llama-memory.h"
 
 #include <algorithm>
 #include <cstddef>
