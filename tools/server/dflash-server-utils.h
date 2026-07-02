@@ -43,6 +43,10 @@ struct dflash_slot_state {
 void init_slot_dflash(dflash_slot_state & state);
 void cleanup_slot_dflash(dflash_slot_state & state);
 
+// Decode integration
+llama_tokens generate_draft(llama_context * ctx_dft, dflash_slot_state & state, int n_draft = 1);
+void rollback(llama_context * ctx_tgt, dflash_slot_state & state);
+
 } // namespace dflash
 
 // DFlash server utility functions

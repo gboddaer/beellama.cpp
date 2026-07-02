@@ -73,6 +73,28 @@ void cleanup_slot_dflash(dflash_slot_state & state) {
     state.active = false;
 }
 
+llama_tokens generate_draft(llama_context * ctx_dft, dflash_slot_state & state, int n_draft) {
+    (void)ctx_dft;
+    (void)state;
+    (void)n_draft;
+    // TODO: Implement draft generation
+    // 1. Run llama_decode on ctx_dft with draft batch
+    // 2. Get logits and argmax to generate draft tokens
+    // 3. Return draft tokens
+    return {};
+}
+
+void rollback(llama_context * ctx_tgt, dflash_slot_state & state) {
+    (void)ctx_tgt;
+    (void)state;
+    // TODO: Implement rollback
+    // 1. Remove draft tokens from KV cache
+    // 2. Reset draft state
+    // 3. Update counters
+    state.n_draft = 0;
+    state.active = false;
+}
+
 } // namespace dflash
 
 namespace dflash_server_utils {
