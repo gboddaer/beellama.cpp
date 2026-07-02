@@ -73,6 +73,12 @@ void cleanup_slot_dflash(dflash_slot_state & state) {
     state.active = false;
 }
 
+// Maximum draft tokens per cycle. The common_speculative framework uses
+// common_speculative_n_max() for the real DFlash path; this cap only applies
+// to the standalone dflash-server-utils helpers (used by unit tests and kept
+// as a reference implementation).
+constexpr int DFLASH_DRAFT_CAP = 8;
+
 llama_tokens generate_draft(llama_context * ctx_dft, dflash_slot_state & state,
                             llama_token seed, llama_seq_id seq_id, int n_draft) {
     state.draft_tokens.clear();
@@ -85,8 +91,9 @@ llama_tokens generate_draft(llama_context * ctx_dft, dflash_slot_state & state,
         return state.draft_tokens;
     }
     
-    // Cap n_draft to avoid batch overflow (TODO: make configurable)
-    n_draft = std::min(n_draft, 8);
+    // Cap n_draft to avoid batch overflow. The caller may pass a larger value
+    // (e.g. from common_speculative_n_max); we clamp it to the safe cap.
+    n_draft = std::min(n_draft, DFLASH_DRAFT_CAP);
     
     // Seed the chain with the last accepted target token. The draft model decodes
     // from this token to predict the next ones. The seed itself is NOT a draft
@@ -97,8 +104,11 @@ llama_tokens generate_draft(llama_context * ctx_dft, dflash_slot_state & state,
         return state.draft_tokens;
     }
     
-    // Autoregressive draft generation: loop n_draft times
-    for (int i = 0; i < n_draft; ++i) {
+    // Autoregressive draft generation: loop n_draft_max times.
+    // NOTE (GLM M6): ctx_dft must not be shared concurrently across slots.
+    // If the draft context is shared, the caller must serialize access.
+    const int n_draft_max = n_draft; // renamed to avoid shadowing state.n_draft (GLM M2)
+    for (int i = 0; i < n_draft_max; ++i) {
         // Create a single-token batch for the draft context
         llama_batch b = llama_batch_get_one(&cur, 1);
         
