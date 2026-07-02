@@ -311,3 +311,17 @@ Feature fully ported and building. The previously-deleted test-mtmd-plumbing
 text-grep guards are NOT restored (they were an anti-pattern per GLM); the
 feature is validated by build + test-mtmd-c-api + the real code path. A
 behavioral test for decoder_n_ubatch could be added as follow-up.
+
+## Workflow decision: push policy (2026-07-02)
+
+- Local dev branch `merge_llama_into_beellama_2` now tracks
+  `gboddaer/merge_llama_into_beellama_2` (upstream set).
+- PUSH POLICY: push ONLY to `gboddaer/merge_llama_into_beellama_2` from now on.
+  Do NOT push to `gboddaer/main` unless the user explicitly instructs.
+  `gboddaer/main` is treated as release-only.
+- Resolved divergence: remote `gboddaer/merge_llama_into_beellama_2` previously
+  held 4 abandoned WIP commits (627fb18ab tip) + a stray `dawn/` tree from an
+  earlier incomplete DFlash attempt. Force-pushed (with-lease, expected
+  627fb18ab) local HEAD 09ab0643a to overwrite; nothing valuable lost (WIP was
+  superseded by the completed systematic merge). All three refs now at
+  09ab0643a.
