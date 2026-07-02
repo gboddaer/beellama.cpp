@@ -27,6 +27,22 @@ void init();
 // Cleanup (called once at server shutdown)
 void shutdown();
 
+// Model loading
+bool is_dflash_model(const llama_model * model);
+llama_model * load_dflash_drafter(const char * path, const llama_model_params & params);
+
+// Slot state management
+struct dflash_slot_state {
+    llama_context * dft_ctx = nullptr;
+    llama_batch dft_batch;
+    int n_draft = 0;
+    int n_accepted = 0;
+    bool active = false;
+};
+
+void init_slot_dflash(dflash_slot_state & state);
+void cleanup_slot_dflash(dflash_slot_state & state);
+
 } // namespace dflash
 
 // DFlash server utility functions

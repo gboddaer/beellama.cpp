@@ -37,6 +37,41 @@ void shutdown() {
     g_enabled.store(false, std::memory_order_release);
 }
 
+bool is_dflash_model(const llama_model * model) {
+    (void)model;
+    // TODO: Check GGUF metadata for dflash.drafter=true or dflash.target=true
+    return false;
+}
+
+llama_model * load_dflash_drafter(const char * path, const llama_model_params & params) {
+    (void)path;
+    (void)params;
+    // TODO: Load draft model with appropriate parameters
+    return nullptr;
+}
+
+void init_slot_dflash(dflash_slot_state & state) {
+    state.dft_ctx = nullptr;
+    state.dft_batch = llama_batch_init(512, 0, 1);
+    state.n_draft = 0;
+    state.n_accepted = 0;
+    state.active = false;
+}
+
+void cleanup_slot_dflash(dflash_slot_state & state) {
+    if (state.dft_ctx) {
+        llama_free(state.dft_ctx);
+        state.dft_ctx = nullptr;
+    }
+    if (state.dft_batch.n_tokens > 0) {
+        llama_batch_free(state.dft_batch);
+        state.dft_batch = llama_batch{};
+    }
+    state.n_draft = 0;
+    state.n_accepted = 0;
+    state.active = false;
+}
+
 } // namespace dflash
 
 namespace dflash_server_utils {
