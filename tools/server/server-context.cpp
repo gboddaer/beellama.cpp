@@ -182,6 +182,9 @@ struct server_slot {
     std::vector<int32_t> spec_i_batch;
     common_prompt_checkpoint spec_ckpt;
 
+    // DFlash state
+    dflash::dflash_slot_state dflash_state;
+
     // TODO: move members that belong to the task (such as `generated_text`, `has_new_line`) to task_results_state
     //       see https://github.com/ggml-org/llama.cpp/pull/18283#issuecomment-3710175837
     std::unique_ptr<const server_task> task;
@@ -341,6 +344,9 @@ struct server_slot {
 
         // clear multimodal state
         mbatch.reset();
+
+        // DFlash cleanup: free draft context and batch
+        dflash::cleanup_slot_dflash(dflash_state);
     }
 
     void init_sampler() const {
@@ -1382,6 +1388,11 @@ private:
             };
 
             slot.reset();
+
+            // DFlash initialization: create draft context if DFlash is enabled
+            if (dflash::enabled()) {
+                dflash::init_slot_dflash(slot.dflash_state);
+            }
         }
 
         {
