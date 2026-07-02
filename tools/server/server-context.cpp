@@ -2837,32 +2837,40 @@ private:
             if (dflash_snapshot) {
                 int32_t dflash_added = 0;
                 for (auto & slot : slots) {
-                    if (slot.dflash_state.active && slot.dflash_state.dft_ctx) {
-                        // Generate draft token(s) from the last accepted token
-                        auto draft = dflash::generate_draft(
-                            slot.dflash_state.dft_ctx,
-                            slot.dflash_state,
-                            1
-                        );
-                        if (!draft.empty()) {
-                            // Get base position for draft tokens
-                            llama_pos base_pos = slot.prompt.tokens.pos_next();
+                    // Only generate drafts during generation (not prompt processing)
+                    // and only if the slot has a valid last sampled token to seed from.
+                    if (slot.state != SLOT_STATE_GENERATING) continue;
+                    if (!slot.dflash_state.active || !slot.dflash_state.dft_ctx) continue;
+                    
+                    // Seed the draft from the slot's last sampled target token.
+                    llama_token seed = slot.sampled;
+                    if (seed < 0) continue;
+                    
+                    auto draft = dflash::generate_draft(
+                        slot.dflash_state.dft_ctx,
+                        slot.dflash_state,
+                        seed,
+                        slot.id,
+                        1
+                    );
+                    if (!draft.empty()) {
+                        // Get base position for draft tokens
+                        llama_pos base_pos = slot.prompt.tokens.pos_next();
+                        slot.dflash_state.base_pos = base_pos;
+                        slot.dflash_state.draft_batch_idx.clear();
 
-                            // Add draft tokens - increment position for each
-                            // Position: base_pos, base_pos+1, ..., base_pos+n-1
-                            for (int i = 0; i < (int)draft.size() - 1; ++i) {
-                                if (!batch.add(slot.id, draft[i],
-                                    base_pos + i, false)) {
-                                    break; // batch full
-                                }
-                            }
+                        // Add draft tokens - increment position for each
+                        // Position: base_pos, base_pos+1, ..., base_pos+n-1
+                        for (int i = 0; i < (int)draft.size(); ++i) {
+                            llama_pos pos = base_pos + i;
                             // Last draft token gets logits=true for verification
-                            if (draft.size() > 0) {
-                                llama_pos last_pos = base_pos + (int)draft.size() - 1;
-                                if (batch.add(slot.id, draft.back(), last_pos, true)) {
-                                    dflash_added += (int)draft.size();
-                                }
+                            bool output = (i == (int)draft.size() - 1);
+                            if (!batch.add(slot.id, draft[i], pos, output)) {
+                                break; // batch full
                             }
+                            // Record the batch index where this draft token's logits land
+                            slot.dflash_state.draft_batch_idx.push_back(batch.size() - 1);
+                            dflash_added++;
                         }
                     }
                 }
@@ -3775,15 +3783,26 @@ private:
         if (dflash_snapshot) {
             for (auto & slot : slots) {
                 if (slot.dflash_state.active && !slot.dflash_state.draft_tokens.empty()) {
-                    // Verify target output against draft
-                    int n_accepted = dflash::verify_draft(
-                        ctx_tgt,
-                        slot.dflash_state,
-                        slot.i_batch
-                    );
-                    if (n_accepted == 0) {
-                        // Rollback rejected draft tokens
-                        dflash::rollback(ctx_tgt, slot.dflash_state);
+                    // Verify target output against draft chain (accepts longest prefix)
+                    int n_accepted = dflash::verify_draft(ctx_tgt, slot.dflash_state);
+                    int n_reject = slot.dflash_state.n_draft - n_accepted;
+                    
+                    if (n_reject > 0) {
+                        // Rollback rejected draft tokens from target KV.
+                        // The target logits at the first rejected position provide
+                        // the corrected token; the normal sampling path downstream
+                        // will sample and emit it.
+                        dflash::rollback(ctx_tgt, slot.dflash_state, slot.id);
+                    }
+                    
+                    // Sync the draft context KV with the accepted tokens so the
+                    // draft model stays aligned with the target for the next cycle.
+                    // (For the MVP single-token case, the accepted token is the seed
+                    // for the next generate_draft call; sync keeps the draft KV valid.)
+                    if (slot.dflash_state.dft_ctx && n_accepted > 0) {
+                        // Feed the last accepted draft token to the draft context
+                        llama_token sync_tok = slot.dflash_state.draft_tokens[n_accepted - 1];
+                        dflash::sync_draft_ctx(slot.dflash_state.dft_ctx, sync_tok, slot.id);
                     }
                 }
             }

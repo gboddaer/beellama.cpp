@@ -264,6 +264,8 @@ llama_build_and_test(test-cpu-out-prod.cpp)
 llama_build_and_test(test-cpu-fattn-support.cpp)
 llama_build_and_test(test-dflash-plumbing.cpp ARGS ${PROJECT_SOURCE_DIR})
 target_include_directories(test-dflash-plumbing PRIVATE ${PROJECT_SOURCE_DIR}/src)
+llama_build_and_test(test-dflash-decode.cpp ${PROJECT_SOURCE_DIR}/tools/server/dflash-server-utils.cpp)
+target_include_directories(test-dflash-decode PRIVATE ${PROJECT_SOURCE_DIR}/tools/server ${PROJECT_SOURCE_DIR}/src ${PROJECT_SOURCE_DIR}/tools/mtmd ${PROJECT_SOURCE_DIR})
 llama_build_and_test(test-mtmd-plumbing.cpp ARGS ${PROJECT_SOURCE_DIR})
 llama_build_and_test(test-perplexity-plumbing.cpp ARGS ${PROJECT_SOURCE_DIR})
 

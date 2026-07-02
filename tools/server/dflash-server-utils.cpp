@@ -73,125 +73,126 @@ void cleanup_slot_dflash(dflash_slot_state & state) {
     state.active = false;
 }
 
-llama_tokens generate_draft(llama_context * ctx_dft, dflash_slot_state & state, int n_draft) {
+llama_tokens generate_draft(llama_context * ctx_dft, dflash_slot_state & state,
+                            llama_token seed, llama_seq_id seq_id, int n_draft) {
     state.draft_tokens.clear();
+    state.draft_batch_idx.clear();
+    state.n_draft = 0;
+    state.n_accepted = 0;
+    state.base_pos = -1;
     
     if (!ctx_dft || n_draft <= 0) {
         return state.draft_tokens;
     }
     
-    // Cap n_draft to avoid batch overflow
-    n_draft = std::min(n_draft, 8); // TODO: make configurable
+    // Cap n_draft to avoid batch overflow (TODO: make configurable)
+    n_draft = std::min(n_draft, 8);
+    
+    // Seed the chain with the last accepted target token. The draft model decodes
+    // from this token to predict the next ones. The seed itself is NOT a draft
+    // token (it is already in the target KV); it is only fed to the draft context.
+    llama_token cur = seed;
+    if (cur < 0) {
+        // No valid seed token available (e.g. before any target token exists)
+        return state.draft_tokens;
+    }
     
     // Autoregressive draft generation: loop n_draft times
-    // Each iteration decodes one token on the draft context, then argmax
     for (int i = 0; i < n_draft; ++i) {
-        // Get the last token to feed into the draft context
-        llama_token cur;
-        if (state.draft_tokens.empty()) {
-            // First draft token: use last_accepted from state
-            // TODO: this needs to be set by the caller before calling generate_draft
-            // For now, skip if no last_accepted is available
-            break;
-        } else {
-            cur = state.draft_tokens.back();
-        }
-        
         // Create a single-token batch for the draft context
         llama_batch b = llama_batch_get_one(&cur, 1);
         
         // Decode on the draft context
         int rc = llama_decode(ctx_dft, b);
-        if (rc < 0) {
-            // Fatal error - abort draft generation
-            fprintf(stderr, "dflash: draft decode failed at step %d, rc=%d\n", i, rc);
-            break;
-        }
-        if (rc > 0) {
-            // Batch full or context exceeded - stop drafting
-            fprintf(stderr, "dflash: draft batch full at step %d\n", i);
+        if (rc != 0) {
+            // rc < 0: fatal; rc > 0: batch full / context exceeded — stop drafting
+            if (rc < 0) {
+                fprintf(stderr, "dflash: draft decode failed at step %d, rc=%d\n", i, rc);
+            }
             break;
         }
         
-        // Get logits from the draft context
-        const float * logits = llama_get_logits_ith(ctx_dft, b.n_tokens - 1);
-        if (!logits) {
-            fprintf(stderr, "dflash: no draft logits at step %d\n", i);
-            break;
-        }
-        
-        // Argmax over the draft vocab to get the next token
-        // llama_get_logits_argmax_ith returns int32_t* (pointer to argmax array)
+        // Argmax over the draft vocab to get the next token.
+        // llama_get_logits_argmax_ith returns int32_t* (pointer to argmax array).
+        // This is a DFlash-specific API available in this fork.
         const int32_t * argmax_ptr = llama_get_logits_argmax_ith(ctx_dft, b.n_tokens - 1);
         if (!argmax_ptr) {
-            fprintf(stderr, "dflash: no argmax at step %d\n", i);
+            // Argmax not available — stop drafting
             break;
         }
-        llama_token next = (llama_token) *argmax_ptr;
-        
-        state.draft_tokens.push_back(next);
+        state.draft_tokens.push_back((llama_token) *argmax_ptr);
         state.n_draft++;
+        
+        // The next draft step feeds the just-generated draft token
+        cur = state.draft_tokens.back();
     }
     
+    (void) seq_id; // reserved for draft-context KV seq management
     return state.draft_tokens;
 }
 
-void rollback(llama_context * ctx_tgt, dflash_slot_state & state) {
-    if (!ctx_tgt) {
-        state.draft_tokens.clear();
-        state.n_draft = 0;
-        state.n_accepted = 0;
-        state.active = false;
-        return;
-    }
-    
-    // Remove rejected draft tokens from target KV cache
+void rollback(llama_context * ctx_tgt, dflash_slot_state & state, llama_seq_id seq_id) {
+    // Remove rejected draft tokens from target KV cache.
+    // Draft tokens were added at absolute positions [base_pos, base_pos + n_draft).
+    // Accepted ones [base_pos, base_pos + n_accepted) stay; rejected ones are removed.
     int n_reject = state.n_draft - state.n_accepted;
-    if (n_reject > 0) {
-        // Get the memory handle for the target context
+    if (n_reject > 0 && ctx_tgt && state.base_pos >= 0) {
         llama_memory_t mem = llama_get_memory(ctx_tgt);
         if (mem) {
-            // Remove positions [n_accepted, n_draft) from the KV cache
-            // Using seq_id 0 for single-sequence MVP
-            // TODO: use proper seq_id from slot
-            llama_pos p0 = (llama_pos) state.n_accepted;
-            llama_pos p1 = (llama_pos) state.n_draft;
-            llama_memory_seq_rm(mem, 0, p0, p1);
+            llama_pos p0 = state.base_pos + (llama_pos) state.n_accepted;
+            llama_pos p1 = state.base_pos + (llama_pos) state.n_draft;
+            llama_memory_seq_rm(mem, seq_id, p0, p1);
         }
     }
     
-    // TODO: Also rollback the draft context KV if it exists
-    // For MVP, we only rollback the target context
-    
+    // Reset per-cycle counters, but keep `active` true so drafting continues
+    // for the lifetime of the slot's generation phase (GLM review C6).
     state.draft_tokens.clear();
+    state.draft_batch_idx.clear();
     state.n_draft = 0;
     state.n_accepted = 0;
-    state.active = false;
+    state.base_pos = -1;
 }
 
-int verify_draft(llama_context * ctx_tgt, dflash_slot_state & state, int batch_idx) {
+int verify_draft(llama_context * ctx_tgt, dflash_slot_state & state) {
     if (!ctx_tgt || state.draft_tokens.empty()) {
         return 0;
     }
     
-    // Get the target logits argmax at the batch position
-    // llama_get_logits_argmax_ith returns int32_t* (pointer to argmax array)
-    const int32_t * argmax_ptr = llama_get_logits_argmax_ith(ctx_tgt, batch_idx);
-    if (!argmax_ptr) {
-        return 0;
+    // Walk the draft chain and accept the longest prefix that matches the
+    // target's argmax at the corresponding batch position.
+    int n_accepted = 0;
+    for (size_t i = 0; i < state.draft_tokens.size(); ++i) {
+        if (i >= state.draft_batch_idx.size()) break;
+        int32_t batch_idx = state.draft_batch_idx[i];
+        if (batch_idx < 0) break;
+        
+        const int32_t * argmax_ptr = llama_get_logits_argmax_ith(ctx_tgt, batch_idx);
+        if (!argmax_ptr) {
+            break; // argmax unavailable — stop accepting
+        }
+        llama_token tgt_tok = (llama_token) *argmax_ptr;
+        if (tgt_tok != state.draft_tokens[i]) {
+            break; // mismatch — stop accepting here
+        }
+        n_accepted++;
     }
-    llama_token tgt_tok = (llama_token) *argmax_ptr;
     
-    // Compare with the first draft token
-    if (tgt_tok == state.draft_tokens[0]) {
-        // Accepted!
-        state.n_accepted = 1;
-        return 1;
+    state.n_accepted = n_accepted;
+    return n_accepted;
+}
+
+bool sync_draft_ctx(llama_context * ctx_dft, llama_token token, llama_seq_id seq_id) {
+    if (!ctx_dft || token < 0) return false;
+    
+    llama_batch b = llama_batch_get_one(&token, 1);
+    int rc = llama_decode(ctx_dft, b);
+    if (rc != 0) {
+        fprintf(stderr, "dflash: draft context sync failed, rc=%d\n", rc);
+        return false;
     }
-    
-    // Rejected - need to rollback
-    state.n_accepted = 0;
-    return 0;
+    (void) seq_id;
+    return true;
 }
 
 } // namespace dflash

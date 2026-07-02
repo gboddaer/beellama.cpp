@@ -36,21 +36,41 @@ struct dflash_slot_state {
     llama_context * dft_ctx = nullptr;
     llama_batch dft_batch;
     std::vector<llama_token> draft_tokens;
-    int n_draft = 0;
-    int n_accepted = 0;
-    bool active = false;
+    // Batch index in the target batch where each draft token's logits land.
+    // Populated by the pre-decode hook when draft tokens are appended to the batch.
+    std::vector<int32_t> draft_batch_idx;
+    // Absolute target KV position of the first draft token in this cycle.
+    // Used by rollback() to remove the correct KV range.
+    llama_pos base_pos = -1;
+    int n_draft = 0;     // number of draft tokens generated this cycle
+    int n_accepted = 0;  // number of draft tokens accepted this cycle
+    bool active = false; // true for the lifetime of the slot's generation phase
 };
 
 void init_slot_dflash(dflash_slot_state & state);
 void cleanup_slot_dflash(dflash_slot_state & state);
 
 // Decode integration
-llama_tokens generate_draft(llama_context * ctx_dft, dflash_slot_state & state, int n_draft = 1);
-void rollback(llama_context * ctx_tgt, dflash_slot_state & state);
+// seed: the last accepted/sampled target token (the draft context's input).
+//          The draft model decodes from this token to predict the next ones.
+// seq_id: the sequence id used in the draft context's KV cache (typically slot.id).
+llama_tokens generate_draft(llama_context * ctx_dft, dflash_slot_state & state,
+                            llama_token seed, llama_seq_id seq_id, int n_draft = 1);
 
-// Verify draft tokens against target logits
-// Returns number of accepted draft tokens (0 to draft_tokens.size())
-int verify_draft(llama_context * ctx_tgt, dflash_slot_state & state, int batch_idx);
+// Rollback rejected draft tokens from the target KV cache.
+// seq_id: the target context sequence id (typically slot.id).
+void rollback(llama_context * ctx_tgt, dflash_slot_state & state, llama_seq_id seq_id);
+
+// Verify draft tokens against target logits.
+// Returns the number of accepted draft tokens (0 to draft_tokens.size()).
+// On full/partial acceptance the caller must advance the draft context KV with
+// the accepted tokens. On rejection, rollback() must be called and the target
+// logits at the rejection position provide the corrected token.
+int verify_draft(llama_context * ctx_tgt, dflash_slot_state & state);
+
+// Advance the draft context KV cache by feeding it a token (accepted or resampled).
+// This keeps the draft model in sync with the target after each decode step.
+bool sync_draft_ctx(llama_context * ctx_dft, llama_token token, llama_seq_id seq_id);
 
 } // namespace dflash
 
