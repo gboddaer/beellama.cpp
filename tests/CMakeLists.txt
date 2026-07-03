@@ -262,8 +262,13 @@ target_include_directories(test-server-prompt-checkpoint PRIVATE ${PROJECT_SOURC
 llama_build_and_test(test-dflash-ring.cpp)
 llama_build_and_test(test-cpu-out-prod.cpp)
 llama_build_and_test(test-cpu-fattn-support.cpp)
-llama_build_and_test(test-dflash-plumbing.cpp ARGS ${PROJECT_SOURCE_DIR})
-target_include_directories(test-dflash-plumbing PRIVATE ${PROJECT_SOURCE_DIR}/src)
+# test-dflash-plumbing calls the internal (non-LLAMA_API) symbol llm_arch_supports_rs_rollback
+# (src/llama-arch.h), which is not exported from llama.dll under WIN32+BUILD_SHARED_LIBS.
+# Upstream gates test-llama-archs the same way for the sibling llm_arch_supports_sm_tensor.
+if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
+    llama_build_and_test(test-dflash-plumbing.cpp ARGS ${PROJECT_SOURCE_DIR})
+    target_include_directories(test-dflash-plumbing PRIVATE ${PROJECT_SOURCE_DIR}/src)
+endif()
 llama_build_and_test(test-dflash-decode.cpp ${PROJECT_SOURCE_DIR}/tools/server/dflash-server-utils.cpp)
 target_include_directories(test-dflash-decode PRIVATE ${PROJECT_SOURCE_DIR}/tools/server ${PROJECT_SOURCE_DIR}/src ${PROJECT_SOURCE_DIR}/tools/mtmd ${PROJECT_SOURCE_DIR})
 # test-mtmd-plumbing.cpp removed: it was entirely 17 fork source-text grep guards
