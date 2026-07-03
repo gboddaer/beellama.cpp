@@ -4120,7 +4120,11 @@ int llama_context::tape_replay_cpu(llama_memory_recurrent * mem_recurrent, int32
     return results.empty() ? n_accepted : 0;
 }
 
+#if defined(_MSC_VER)
+__declspec(noinline)
+#else
 __attribute__((noinline))
+#endif
 int llama_context::dflash_rollback(llama_seq_id seq_id, llama_seq_id seq_backup, int n_past_before, int n_accepted) {
     auto * mem_hybrid = dynamic_cast<llama_memory_hybrid *>(memory.get());
     if (!mem_hybrid) {
@@ -9291,7 +9295,7 @@ int64_t llama_context::dflash_dump_hidden_states(const char * path) {
             for (int64_t t = 0; t < buf.n_tokens; t++) {
                 const float * row = buf.data.data() + (size_t) t * buf.n_embd;
                 int32_t token_id = (t < (int64_t) buf.token_ids.size()) ? buf.token_ids[t] : -1;
-                fprintf(f, "%d %zu %ld %d ", slot, h, t, token_id);
+                fprintf(f, "%d %zu %lld %d ", slot, h, (long long) t, token_id);
                 for (int64_t e = 0; e < buf.n_embd; e++) {
                     if (e) fprintf(f, " ");
                     fprintf(f, "%.8g", row[e]);
