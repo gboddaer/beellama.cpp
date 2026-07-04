@@ -158,7 +158,8 @@ llama_context * common_speculative_create_ctx_dft(const common_params_speculativ
 common_speculative * common_speculative_init(
         common_params_speculative & params,
         llama_context             * ctx_tgt,
-        llama_context             * ctx_dft_shared = nullptr);
+        llama_context             * ctx_dft_shared = nullptr,
+        uint32_t                    n_seq         = 1);
 
 // fork: single-seq overloads
 void common_speculative_begin(common_speculative * spec, const llama_tokens & prompt);

@@ -4489,7 +4489,8 @@ llama_context * common_speculative_create_ctx_dft(const common_params_speculativ
 common_speculative * common_speculative_init(
         common_params_speculative & params,
         llama_context             * ctx_tgt,
-        llama_context             * ctx_dft_shared) {
+        llama_context             * ctx_dft_shared,
+        uint32_t                    n_seq_in) {
     const bool owns_ctx_dft = (ctx_dft_shared == nullptr);
     llama_context * ctx_dft = ctx_dft_shared;
     if (ctx_dft == nullptr && params.model_dft) {
@@ -4517,7 +4518,7 @@ common_speculative * common_speculative_init(
         }
     }
 
-    const uint32_t n_seq = 1;
+    const uint32_t n_seq = n_seq_in > 0 ? n_seq_in : 1;
     std::vector<std::unique_ptr<common_speculative_impl>> impls = {};
 
     for (const common_speculative_config & config : configs) {

@@ -1398,7 +1398,9 @@ private:
                 if (needs_ctx_overload) {
                     // DFlash impl constructor calls llama_model_n_embd(params.model_dft).
                     params_base.speculative.model_dft = model_dft.get();
-                    spec.reset(common_speculative_init(params_base.speculative, ctx_tgt, ctx_dft.get()));
+                    // Size dparams to n_parallel so dparams[slot.id] is in bounds for
+                    // multi-slot servers (fork used per-slot specs; merge uses one spec).
+                    spec.reset(common_speculative_init(params_base.speculative, ctx_tgt, ctx_dft.get(), params_base.n_parallel));
                 } else {
                     spec.reset(common_speculative_init(params_base.speculative, params_base.n_parallel));
                 }
