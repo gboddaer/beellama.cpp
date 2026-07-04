@@ -1379,7 +1379,10 @@ private:
         // try speculative decoding
         if (ctx_tgt_seq_rm_type != COMMON_CONTEXT_SEQ_RM_TYPE_NO) {
             try {
-                spec.reset(common_speculative_init(params_base.speculative, params_base.n_parallel));
+                // DFlash impl constructor calls llama_model_n_embd(params.model_dft), so the
+                // drafter model pointer must be published on the speculative params (fork adb92b36a:2522).
+                params_base.speculative.model_dft = model_dft.get();
+                spec.reset(common_speculative_init(params_base.speculative, ctx_tgt, ctx_dft.get()));
             } catch (const std::exception & e) {
                 SRV_ERR("failed to initialize speculative decoding context: %s\n", e.what());
             }

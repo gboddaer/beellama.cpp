@@ -1,6 +1,7 @@
 #include "models.h"
 
 #include "llama-impl.h"
+#include "llama-context.h"   // llama_dflash_rs_writeback_slot_for_test (RS snapshot write-back decision)
 #include "llama-memory-recurrent.h"
 
 // utility to get one slice from the third dimension
@@ -563,8 +564,17 @@ ggml_tensor * llm_build_delta_net_base::build_recurrent_attn(
     const int64_t D = S_v * S_v * H_v;
     const int64_t K = cparams.n_rs_seq + 1;
 
+    // Pad the 4D recurrent state [S_v, S_v, H_v, n_seqs] into a 3D (D, K, n_seqs)
+    // layout so ggml_gated_delta_net produces K rollback snapshots (ported from
+    // fork adb92b36a).  Without this, the op sees a 4D state (K_actual=1) and
+    // emits only a single snapshot, causing the downstream view_4d/view_2d
+    // per-slot writebacks to overflow (ggml.c:1807 bounds check).
+    // TODO: remove pad + simplify (fork TODO)
+    ggml_tensor * s_3d     = ggml_reshape_3d(ctx0, s, D, 1, n_seqs);
+    ggml_tensor * s_3d_pad = ggml_pad       (ctx0, s_3d, 0, K - 1, 0, 0);
+
     // state s is 4D [S_v, S_v, H_v, n_seqs]; K snapshot slots are written into the output.
-    ggml_tensor * gdn_out = ggml_gated_delta_net(ctx0, q, k, v, g, b, s, K);
+    ggml_tensor * gdn_out = ggml_gated_delta_net(ctx0, q, k, v, g, b, s_3d_pad, K);
     if (n_seq_tokens > 1) {
         cb(gdn_out, LLAMA_TENSOR_NAME_FGDN_CH, il);
     } else {
@@ -584,23 +594,46 @@ ggml_tensor * llm_build_delta_net_base::build_recurrent_attn(
 
     const size_t row_size = hparams.n_embd_s() * ggml_element_size(ssm_states_all);
 
-    // op writes the last min(n_seq_tokens, K) snapshots; trailing slots are left unwritten
-    const int64_t n_written = std::min<int64_t>(n_seq_tokens, K);
+    // Per-slot recurrent-state writeback (ported from fork adb92b36a).
+    //
+    // The upstream bulk ggml_view_3d(dst=ssm_states_all, ne=[D,n_seqs,n_written],
+    // nb=[nb[1], mem_size*row_size, kv_head*row_size]) overflows when n_written>1
+    // because nb[2]=kv_head*row_size is not the per-snapshot stride.  DFlash keeps K
+    // rollback snapshots in the recurrent cache, each mem_size*row_size apart, and the
+    // fork wrote them one slot at a time with a bounded ggml_view_2d per slot.  Restore
+    // that per-slot loop (it is independent of the tree op, which remains gated).
+    //
+    // llama_dflash_rs_writeback_slot_for_test() decides per k_i whether to write a
+    // freshly-produced gdn_out snapshot or rotate an older state slot, and returns false
+    // for out-of-range / empty cases (so no view is created during degenerate probes).
+    for (int64_t k_i = 0; k_i < K; ++k_i) {
+        uint32_t cache_slot = 0;
+        llama_dflash_rs_slot_src slot_src{};
+        if (!llama_dflash_rs_writeback_slot_for_test(K, n_seq_tokens, k_i, cache_slot, slot_src)) {
+            continue; // unreachable for k_i in [0,K) with valid K / n_seq_tokens
+        }
+        ggml_tensor * dst = ggml_view_2d(ctx0, ssm_states_all,
+            hparams.n_embd_s(), n_seqs, ssm_states_all->nb[1],
+            ((size_t) cache_slot * mem_size + kv_head) * row_size);
 
-    // write the produced snapshots into the recurrent cache (snapshot slot i -> rollback group i)
-    ggml_tensor * src = ggml_view_3d(ctx0, gdn_out,
-        D, n_seqs, n_written,
-        ggml_row_size(gdn_out->type, D),
-        ggml_row_size(gdn_out->type, state_size_per_snap),
-        ggml_row_size(gdn_out->type, attn_score_elems));
-
-    ggml_tensor * dst = ggml_view_3d(ctx0, ssm_states_all,
-        D, n_seqs, n_written,
-        ssm_states_all->nb[1],
-        (size_t) mem_size * row_size,
-        (size_t) kv_head * row_size);
-
-    ggml_build_forward_expand(gf, ggml_cpy(ctx0, src, dst));
+        ggml_tensor * src = nullptr;
+        if (slot_src.from_gdn) {
+            // gdn_out slot slot_src.gdn_slot holds the state after one of this batch's tokens.
+            src = ggml_view_4d(ctx0, gdn_out,
+                S_v, S_v, H_v, n_seqs,
+                ggml_row_size(gdn_out->type, S_v),
+                ggml_row_size(gdn_out->type, S_v * S_v),
+                ggml_row_size(gdn_out->type, S_v * S_v * H_v),
+                ggml_row_size(gdn_out->type, attn_score_elems + slot_src.gdn_slot * state_size_per_snap));
+        } else {
+            // gdn_out slot k_i is uninitialised (n_seq_tokens < K): rotate the older
+            // snapshot (slot_src.old_slot) down so slot history is preserved for rollback.
+            src = ggml_view_2d(ctx0, ssm_states_all,
+                hparams.n_embd_s(), n_seqs, ssm_states_all->nb[1],
+                ((size_t) slot_src.old_slot * mem_size + kv_head) * row_size);
+        }
+        ggml_build_forward_expand(gf, ggml_cpy(ctx0, src, dst));
+    }
 
     return output;
 }

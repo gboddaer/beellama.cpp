@@ -50,6 +50,14 @@ void llama_model_dflash_draft::load_arch_hparams(llama_model_loader & ml) {
     if (hparams.n_swa > 0) {
         hparams.swa_type = LLAMA_SWA_TYPE_STANDARD;
         ml.get_key_or_arr(LLM_KV_ATTENTION_SLIDING_WINDOW_PATTERN, hparams.swa_layers, hparams.n_layer(), false);
+        // Populate is_swa_impl from the explicit per-layer pattern so that
+        // is_swa_any() returns true and create_memory() does not trip
+        // GGML_ASSERT(hparams.is_swa_any()) at llama-model.cpp.  Other SWA
+        // models do this via set_swa_pattern(n_period); DFlash uses an explicit
+        // per-layer boolean array instead, so mirror it directly.
+        for (uint32_t il = 0; il < hparams.n_layer(); ++il) {
+            hparams.is_swa_impl[il] = hparams.swa_layers[il] != 0;
+        }
     }
 }
 
