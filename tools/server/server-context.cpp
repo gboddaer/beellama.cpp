@@ -1379,10 +1379,29 @@ private:
         // try speculative decoding
         if (ctx_tgt_seq_rm_type != COMMON_CONTEXT_SEQ_RM_TYPE_NO) {
             try {
-                // DFlash impl constructor calls llama_model_n_embd(params.model_dft), so the
-                // drafter model pointer must be published on the speculative params (fork adb92b36a:2522).
-                params_base.speculative.model_dft = model_dft.get();
-                spec.reset(common_speculative_init(params_base.speculative, ctx_tgt, ctx_dft.get()));
+                // Dispatch by speculative type (matches fork adb92b36a separation):
+                //   - DFLASH/SUFFIX/COPYSPEC/RECYCLE  → 3-arg init (needs ctx_tgt + ctx_dft;
+                //     only this overload handles these types)
+                //   - DRAFT_SIMPLE/EAGLE3/MTP/NGRAM_*  → 2-arg init (only that overload
+                //     handles these types)
+                // Calling the 3-arg init for DRAFT_SIMPLE/etc. would silently disable
+                // speculative decoding (no impls pushed); calling the 2-arg init for
+                // DFLASH would log "no implementations specified".  The fork kept these
+                // on separate spec objects (main spec vs per-slot slot.spec); the merge
+                // has a single spec so dispatch here.
+                const auto & sp = params_base.speculative;
+                const bool needs_ctx_overload =
+                    sp.has_type(COMMON_SPECULATIVE_TYPE_DFLASH) ||
+                    sp.has_type(COMMON_SPECULATIVE_TYPE_SUFFIX) ||
+                    sp.has_type(COMMON_SPECULATIVE_TYPE_COPYSPEC) ||
+                    sp.has_type(COMMON_SPECULATIVE_TYPE_RECYCLE);
+                if (needs_ctx_overload) {
+                    // DFlash impl constructor calls llama_model_n_embd(params.model_dft).
+                    params_base.speculative.model_dft = model_dft.get();
+                    spec.reset(common_speculative_init(params_base.speculative, ctx_tgt, ctx_dft.get()));
+                } else {
+                    spec.reset(common_speculative_init(params_base.speculative, params_base.n_parallel));
+                }
             } catch (const std::exception & e) {
                 SRV_ERR("failed to initialize speculative decoding context: %s\n", e.what());
             }
