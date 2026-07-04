@@ -126,6 +126,23 @@
     schedule span capture → cross-attention data is wrong → garbled drafts (6.7% vs 34% acceptance).
   - Full fix = port fork's server DFlash decode integration (~300 lines of decode-view logic +
     per-slot spec). Well-defined since impl is identical.
+- HF-026: **GLM port-strategy review (2026-07-04)** — recommended incremental approach:
+  - Step 0 (probe): add `common_speculative_set_prefill_capture_enabled(spec, true)` unconditionally
+    before decode; cheap go/no-go. (Note: capture already ON by default — probe likely no-op; real
+    fix is #3 span scheduling.)
+  - Step 1 (B, single-slot quality, ~60-100 lines): port fork's `should_flush_dflash_prefill` span
+    computation (fork:5868) + `llama_dflash_prefill_capture_begin/end` (fork:6040,6179,6303) +
+    view-gated `set_prefill_capture_enabled` toggling. Copy fork span logic VERBATIM (span boundaries
+    are highest risk — wrong suffix vs whole prompt → worse than 6.7%). Target ~34% acceptance.
+  - Step 2 (C, multi-slot): per-slot `slot.spec` (fork:2777, each n_seq=1, seq_id=0).
+  - Step 3: SKIP `common_speculative_draft_batch` (same impl->draft path as common_speculative_draft).
+  - GLM: quality culprit = #1 capture-enable + #3 span scheduling (NOT #2 draft_batch, NOT #4 per-slot
+    for single-slot quality). #4 is multi-slot only.
+- HF-027: **Fork prefill suffix flush = the quality key** — `should_flush_dflash_prefill` lambda
+  (fork:5868) computes `common_dflash_prefill_span{capture_begin, capture_end, src_offset, n_tokens}`
+  (the prompt SUFFIX, not whole prompt). `llama_dflash_prefill_capture_begin(ctx_tgt, slot.id,
+  span.capture_begin, span.capture_end)` (fork:6040) schedules span-specific capture. Merge captures
+  without span scheduling → wrong cross-attention context → 6.7% acceptance vs fork 34%.
 - HF-022: **GLM review (glm-5.2:cloud) of commit 9a67f5636 returned 3 concerns — ALL RESOLVED (2026-07-04)**:
   1. **Fix 3 UB risk → MOOT**: `swa_layers` is `std::array<uint32_t, LLAMA_MAX_LAYERS>` (fixed-size,
      llama-hparams.h:150), zeroed at llama-model.cpp:1104. Never empty → no out-of-bounds. No fix needed.
@@ -261,7 +278,20 @@ Next: verify swa_layers type; if vector add guard; verify 3-arg overload dispatc
 
 ## Next actions
 
-### Priority 1: Address GLM review concerns on commit `9a67f5636` (HF-022)
+### Priority 1: GLM review concerns (HF-022) — DONE (HF-023: all 3 resolved; commit b878e6435)
+
+### Priority 2: DFlash decode QUALITY + MULTI-SLOT port (NEXT — plan in HF-026/027)
+  Impl is IDENTICAL fork-vs-merge; fix is purely server-side wiring.
+  Step 1 (B, single-slot quality, ~60-100 lines): port fork's prefill suffix-flush span scheduling
+  into decode() BEFORE llama_decode (~line 3691) + capture_end AFTER common_speculative_process (~line 3757).
+  Copy fork should_flush_dflash_prefill (fork:5868) VERBATIM — capture_from = max(0, prompt_total - cross_ctx),
+  span_begin/end = the suffix window. APIs all exist (common_dflash_prefill_span, llama_dflash_prefill_capture_begin/end,
+  common_speculative_set_prefill_capture_enabled). Target ~34% acceptance, correct output. Test: --parallel 1.
+  Step 2 (C, multi-slot): per-slot slot.spec (fork:2777, each n_seq=1, seq_id=0); reverts n_seq=n_parallel workaround.
+  Step 3: SKIP common_speculative_draft_batch (same impl->draft path). Risk: span boundaries highest — copy verbatim.
+
+### Priority 1-OLD (superseded by Priority 1 above)
+1. **Verify `swa_layers` type
 1. **Verify `swa_layers` type** (H-005): check `llama-hparams.h:150`. If `std::array<uint32_t, LLAMA_MAX_LAYERS>`
    (fixed size), Fix 3 has NO UB risk → GLM concern #1 moot, document it. If `std::vector`, add a size
    guard `if (hparams.swa_layers.size() >= hparams.n_layer())` before the loop.
