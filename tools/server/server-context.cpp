@@ -3093,6 +3093,7 @@ private:
                         auto & draft_params = common_speculative_get_draft_params(spec.get(), slot.id);
                         draft_params.drafting = true;
                         draft_params.n_max = n_draft_max;
+                        draft_params.n_min = 0;
                         draft_params.n_past = slot.prompt.n_tokens();
                         draft_params.id_last = slot.sampled;
                         draft_params.prompt = &slot.spec_prompt;
