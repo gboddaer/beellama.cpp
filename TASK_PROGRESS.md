@@ -290,6 +290,27 @@ Next: verify swa_layers type; if vector add guard; verify 3-arg overload dispatc
   Step 2 (C, multi-slot): per-slot slot.spec (fork:2777, each n_seq=1, seq_id=0); reverts n_seq=n_parallel workaround.
   Step 3: SKIP common_speculative_draft_batch (same impl->draft path). Risk: span boundaries highest — copy verbatim.
 
+### Step 1 PROGRESS (commits ee9b2210b, cec71db2d) — ring now grows, quality still low
+  DONE (ported, committed, pushed):
+    - Prefill suffix-span capture scheduling (should_flush_dflash_prefill + llama_dflash_prefill_capture_begin/end
+      + set_prefill_capture_enabled). Helps long prompts (suffix-only capture).
+    - common_speculative_update_logits_deferred_dflash_kv call after accept (DFlash accept() is a no-op;
+      ring append happens via update_logits -> append_target_hiddens). Ring NOW GROWS during generation
+      (DFLASH_RX append: ring_filled 17->19->21->23...; was frozen at 17).
+  RESULT: ring grows (real improvement) BUT output still garbled, acceptance 6.7% (5/75) vs fork 34%.
+  RULED OUT as the cause:
+    - Span scheduling: for 17-token test prompt capture_from=max(0,17-512)=0 so span=whole prompt (no change).
+    - n_layer()=64 (merge) vs n_layer=65 (fork): llama_model_n_layer returns n_layer()=n_layer_all-n_layer_nextn=64
+      vs fork n_layer member=65. DFlash contract uses it ONLY for validation (target_layer_ids all <64). NOT the cause.
+    - K/V projection cache unavailable: both fork+merge on Vulkan (CUDA-only). NOT the cause.
+  REMAINING quality candidates (need larger fork decode-flow port):
+    - Adaptive 'profit' draft-max controller: fork n_draft=4 (adaptive), merge n_draft=15 (block_size-1, no
+      controller). Fork get_n_draft_max uses common_speculative_n_min + profit (fork:1017-1050); merge simple (merge:438).
+    - 3-token non-speculative WARMUP: fork does 3 append(1) before first draft (ring 17->20); merge drafts
+      immediately at ring=17. Likely needs n_min/capture_min warmup (lost HF-017).
+    - Possibly capture-content issue (hidden values at [1,16,31,46,61]) — not yet verified.
+  NEXT: port adaptive profit controller + n_min warmup (Step 2 of quality fix). Larger port.
+
 ### Priority 1-OLD (superseded by Priority 1 above)
 1. **Verify `swa_layers` type
 1. **Verify `swa_layers` type** (H-005): check `llama-hparams.h:150`. If `std::array<uint32_t, LLAMA_MAX_LAYERS>`
