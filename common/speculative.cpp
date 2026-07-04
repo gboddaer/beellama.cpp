@@ -3071,6 +3071,32 @@ struct common_speculative_impl_dflash : public common_speculative_impl {
                     seq_id, cross_len, committed_len, ring_filled,
                     cpu_ring_valid ? 1 : 0, gpu_ring_handle ? 1 : 0);
             }
+            // DFlash ring data dump for merge-vs-fork comparison
+            static const bool enable_ring_dump = [] {
+                const char * env = std::getenv("GGML_DFLASH_RING_DUMP");
+                return env && std::atoi(env) != 0;
+            }();
+            if (enable_ring_dump && cross_len > 0) {
+                const int dump_n = std::min(8, cross_len);
+                LOG_INF("[DFLASH_RING_DUMP] seq=%d cross_len=%d committed_len=%d ring_filled=%d n_layers=%zu ring_write_pos=%d\n",
+                    seq_id, cross_len, committed_len, ring_filled, capture_layers.size(), ring_write_pos);
+                for (size_t li = 0; li < capture_layers.size(); li++) {
+                    const int32_t layer_id = capture_layers[li];
+                    if (layer_id >= (int) ring_buf.size()) continue;
+                    LOG_INF("[DFLASH_RING_DUMP] layer[%zu]=%d first_8=[", li, layer_id);
+                    for (int i = 0; i < dump_n; i++) {
+                        if (i) LOG_INF(",");
+                        LOG_INF("%+.4f", ring_buf[layer_id][i]);
+                    }
+                    LOG_INF("] ring_write_pos_8=[");
+                    const int wp = ring_write_pos % RING_SIZE;
+                    for (int i = 0; i < 8; i++) {
+                        if (i) LOG_INF(",");
+                        LOG_INF("%+.4f", ring_buf[layer_id][(wp + i) % RING_SIZE]);
+                    }
+                    LOG_INF("]\n");
+                }
+            }
             if (cross_len <= 0) {
                 if (common_dflash_rx_diag_enabled()) {
                     LOG_INF("DFLASH_RX draft: seq=%d SKIP reason=cross_len_nonpositive cross_len=%d committed_len=%d ring_filled=%d\n",
