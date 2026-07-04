@@ -96,11 +96,36 @@
   - `llama-server --parallel 1 --spec-type dflash ...` → no crash, 11 tokens generated, finish=stop.
   - DFlash speculative decoding IS ACTIVE: `draft acceptance = 0.06667 (5 accepted / 75 generated)`,
     `dflash: #gen tokens = 75, #acc tokens = 5`. Cross-attention ring populated, drafts generated+accepted.
-  - Warning: `drafter K/V projection cache unavailable; using full-window K/V projection` (non-fatal).
-  - Output garbled ("Thinking Process:escap with of") — low acceptance (6.7%) due to cold capture +
-    K/V projection fallback. Quality issue, not a crash.
-  - Proof: /tmp/dflash-1slot.log shows full decode + dflash statistics.
-  - **Multi-slot (--parallel 4) needs per-slot specs (fork's slot.spec approach) — larger port.**
+  - Warning: `drafter K/V projection cache unavailable; using full-window K/V projection` (CUDA-only;
+    Vulkan limitation, fork has it too — NOT the quality issue).
+  - **Multi-slot (--parallel 4): dparams crash fixed (commit 805e1560e) but 0 drafts** — hidden-state
+    capture not wired for multi-slot (`begin hidden[0] shape mismatch: embd=0`). `--no-kv-unified` did
+    NOT fix it; the difference is n_parallel itself (1 vs 4), not kv_unified. Needs fork's per-slot spec
+    architecture (each slot its own DFlash impl/capture/seq_id) — larger port.
+- HF-025: **MERGE DFlash QUALITY REGRESSION vs fork (2026-07-04)** ❌
+  - Same model pair (Qwen3.6-27B-Q4_K_M + Qwen3.6-27B-DFlash-Q4_K_M), --parallel 1, Vulkan:
+    - FORK binary: output CORRECT ("Here's a thinking process: 1. Analyze... 2+2=4. 4. Form..."),
+      acceptance **34%** (154/452), 190 tokens, 8.8 tok/s.
+    - MERGE binary: output GARBLED ("Thinking Process:escap with of"), acceptance **6.7%** (5/75),
+      11 tokens, 4.4 tok/s.
+  - Both have same Vulkan K/V-cache limitation → NOT the cause.
+  - Merge generates 6x fewer drafts (75 vs 452) and accepts 30x fewer → cross-attention / draft path
+    is incomplete. This is part of the ~652 lost server DFlash decode integration lines (HF-017).
+  - The merge's pre_decode uses the standard dparams/draft flow; the fork used
+    common_speculative_draft_batch + common_speculative_process + per-slot spec + capture-enable
+    wiring (fork server lines 4636, 6047, 6275, 2777) that the merge lost.
+  - **The DFlash impl (common/speculative.cpp) is IDENTICAL fork-vs-merge** (only diff: my n_seq_in
+    change + 2 TODO state stubs). The ENTIRE quality + multi-slot difference is SERVER-side
+    (server-context.cpp invocation). No impl changes needed for the port.
+  - Missing server calls (APIs all exist in merge): `common_speculative_set_prefill_capture_enabled`
+    (fork:6047,6298,6367,6373 — per-view capture control), `common_speculative_draft_batch`
+    (fork:4636 — batched draft prep), `llama_dflash_prefill_capture_begin/end` (fork:6040 — suffix
+    span capture scheduling), per-slot `slot.spec` (fork:2777). Merge DOES call common_speculative_process.
+  - Root quality cause (likely): fork captures only the prompt SUFFIX via
+    llama_dflash_prefill_capture_begin(ctx_tgt, slot.id, capture_begin, capture_end); merge doesn't
+    schedule span capture → cross-attention data is wrong → garbled drafts (6.7% vs 34% acceptance).
+  - Full fix = port fork's server DFlash decode integration (~300 lines of decode-view logic +
+    per-slot spec). Well-defined since impl is identical.
 - HF-022: **GLM review (glm-5.2:cloud) of commit 9a67f5636 returned 3 concerns — ALL RESOLVED (2026-07-04)**:
   1. **Fix 3 UB risk → MOOT**: `swa_layers` is `std::array<uint32_t, LLAMA_MAX_LAYERS>` (fixed-size,
      llama-hparams.h:150), zeroed at llama-model.cpp:1104. Never empty → no out-of-bounds. No fix needed.
