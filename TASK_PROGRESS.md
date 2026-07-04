@@ -309,7 +309,41 @@ Next: verify swa_layers type; if vector add guard; verify 3-arg overload dispatc
     - 3-token non-speculative WARMUP: fork does 3 append(1) before first draft (ring 17->20); merge drafts
       immediately at ring=17. Likely needs n_min/capture_min warmup (lost HF-017).
     - Possibly capture-content issue (hidden values at [1,16,31,46,61]) — not yet verified.
-  NEXT: port adaptive profit controller + n_min warmup (Step 2 of quality fix). Larger port.
+  NEXT: Switch merge's draft path to 6-arg common_speculative_draft() (same as fork). Key differences:
+    - Fork: common_speculative_draft(slot.get_spec(), params_spec, ..., draft_n_past) where draft_n_past=-1 for DFlash
+    - Merge: 1-arg common_speculative_draft(spec.get()) with manual draft_params (n_past=slot.prompt.n_tokens())
+    - 1-arg version doesn't enforce n_min (only truncates to n_max), 6-arg checks result.size() < n_min after
+    - 6-arg function exists in merge's speculative.cpp (line 4627-4700), just not called from server
+    - Also: draft_batch is fork's multi-slot path only (n_drafting<2 returns false), NOT the quality cause
+  TODO: Test switching to 6-arg version with draft_n_past=-1 for DFlash.
+  Also TODO: Prepare cross-attention data dump for merge-vs-fork comparison.
+
+### Step 2: Switch to 6-arg common_speculative_draft() (IN PROGRESS)
+  Fork's single-slot DFlash path (server-context.cpp:4856-4859):
+    slot.spec_draft = common_speculative_draft(slot.get_spec(), params_spec, cached_text_tokens, slot.sampled, nullptr, draft_n_past);
+    where: draft_n_past = (use_mtp_spec ? slot.prompt.n_tokens() : -1) = -1 for DFlash
+  Merge's single-slot DFlash path (server-context.cpp:3093-3109):
+    Sets draft_params manually, then calls 1-arg common_speculative_draft(spec.get())
+  Key differences:
+    1. 6-arg passes n_min=params_spec.n_min, 1-arg doesn't set n_min (defaults to 0)
+    2. 6-arg post-checks: if result.size() < n_min -> clear. 1-arg doesn't.
+    3. 6-arg uses slot.get_spec() (per-slot), merge uses spec.get() (shared)
+    4. 6-arg passes draft_n_past=-1, merge sets n_past=slot.prompt.n_tokens()
+    BUT: draft() ignores dp.n_past for DFlash (uses committed_len instead)
+    AND: n_min=0 makes the post-check a no-op
+    SO: 6-arg vs 1-arg should be equivalent for DFlash with n_min=0
+    HYPOTHESIS: The 6-arg function's internal dp setup might differ subtly from manual setup
+  Plan: Replace merge's manual draft_params + 1-arg call with 6-arg call matching fork exactly.
+  This is a small change (3 lines) but could fix quality if there's a subtle difference in dp setup.
+
+### Step 3: Cross-attention data dump for merge-vs-fork comparison
+  TODO: Add dump of cross-attention ring data (first N values per layer) to merge's draft()
+  Compare with fork's values to verify ring content is identical
+  This requires modifying speculative.cpp (DFlash draft()) to log ring data at build_cross_data time
+
+  STATUS: init ✅, decode ✅, ring grows ✅, quality ❌ (6.7% vs 34%).
+  Remaining suspects: 6-arg vs 1-arg draft path (subtle dp setup diff), cross-attention data.
+  draft_batch port is for MULTI-SLOT only (not quality fix) - already available in speculative.cpp.
 
 ### Step 1 EXHAUSTIVE INVESTIGATION (commits ee9b2210b, cec71db2d, 87be163ec) — quality still 6.7%
   ALL of these ported/verified, NONE fixed quality (6.7% acceptance, garbled output vs fork 34%):
