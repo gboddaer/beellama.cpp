@@ -4106,7 +4106,7 @@ private:
                 // lines 6418/6420/6984). Without it the ring stays stale (committed_len
                 // never grows) -> cross-attention uses stale context -> garbled drafts
                 // (6.7% acceptance vs fork 34%).
-                common_speculative_update_logits(spec.get(), ctx_tgt, accepted, accepted.size());
+                common_speculative_update_logits_deferred_dflash_kv(spec.get(), ctx_tgt, accepted, accepted.size());
 
                 slot.spec_draft = std::move(accepted);
             }
