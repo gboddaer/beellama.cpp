@@ -311,6 +311,39 @@ Next: verify swa_layers type; if vector add guard; verify 3-arg overload dispatc
     - Possibly capture-content issue (hidden values at [1,16,31,46,61]) — not yet verified.
   NEXT: port adaptive profit controller + n_min warmup (Step 2 of quality fix). Larger port.
 
+### Step 1 EXHAUSTIVE INVESTIGATION (commits ee9b2210b, cec71db2d, 87be163ec) — quality still 6.7%
+  ALL of these ported/verified, NONE fixed quality (6.7% acceptance, garbled output vs fork 34%):
+    - Prefill suffix-span capture scheduling (ee9b2210b) — no change for 17-token test prompt
+      (capture_from=max(0,17-512)=0, span=whole prompt).
+    - common_speculative_update_logits_deferred_dflash_kv ring append (ee9b2210b) — ring NOW
+      GROWS (was frozen at 17; now 17->19->21->23...). Real improvement, but quality unchanged.
+    - Deferred variant (cec71db2d) — matches fork defer_kv=1. No quality change.
+    - 3-token non-speculative warmup (tested, reverted) — fork does 3 append(1) before first
+      draft (ring 17->20); merge warmup hack (skip speculation for n_decoded<3) did NOT help.
+    - Drafter ctx=256 (87be163ec) — fork sets -cd 256; merge used 4096. Ported. No quality change.
+    - n_draft count: fork n_draft=4 (adaptive profit), merge n_draft=15 (block_size-1, no
+      adaptive controller). NOT the correctness cause (acceptance RATE differs, not just count).
+    - get_n_draft_max doesn't clamp to configured n_max (real bug, but fixing won't fix quality
+      since n_draft count isn't the correctness cause).
+  RULED OUT as the quality cause:
+    - DFlash impl (speculative.cpp): IDENTICAL fork-vs-merge (only n_seq param + 2 TODO stubs diff).
+    - Capture mechanism (llama-context.cpp): essentially identical (47-line diff, whitespace).
+    - n_layer()=64 (merge) vs n_layer=65 (fork): validation-only (target_layer_ids all <64).
+    - K/V projection cache: both Vulkan-limited (CUDA-only feature).
+    - Capture layer mapping: correct (tensors l_out-<id> found, no shape mismatch).
+  REMAINING SUSPECT (next step): the DRAFT PATH itself.
+    - Fork uses common_speculative_draft_batch (line 4636) -> DFlash impl prepare_batch_draft()
+      (line 2664, the BATCH path: build_cross_data then a separate drafter batch decode).
+    - Merge uses common_speculative_draft (line 3078) -> DFlash impl draft() (line 3029, the FLAT
+      path: build_cross_data + inline drafter decode + extract).
+    - These are DIFFERENT DFlash impl methods. GLM's "same impl->draft path" was INCORRECT.
+    - Switching to common_speculative_draft_batch is the next step — complex API change
+      (multi-slot batch: specs vector, id_last_per_spec, results, log_probs; fork:4636-4650).
+  ALSO UNVERIFIED: actual hidden VALUES (ring content). DFLASH_DBG append logs layer0_first
+    values but needs -lv 4 / env to enable. Could dump via dflash_dump_hidden_states (line 9295).
+    If hidden values differ merge-vs-fork, the capture content is wrong despite right layers/dim.
+  STATUS: init ✅, decode ✅ (no crash), ring grows ✅, quality ❌ (6.7% vs 34%).
+
 ### Priority 1-OLD (superseded by Priority 1 above)
 1. **Verify `swa_layers` type
 1. **Verify `swa_layers` type** (H-005): check `llama-hparams.h:150`. If `std::array<uint32_t, LLAMA_MAX_LAYERS>`
