@@ -1251,6 +1251,35 @@ private:
                 return false;
             }
 
+            // DFlash drafter context sizing (ported from fork adb92b36a:2504-2520).
+            // The drafter does NOT need the full main ctx; a small per-slot ctx (256)
+            // scaled by the DFlash slot count is enough and keeps the drafter graph
+            // small. Without this the drafter uses the main n_ctx (4096) which changes
+            // the drafter's graph/ubatch/parallel layout and mismatches the fork.
+            if (params_base.speculative.has_type(COMMON_SPECULATIVE_TYPE_DFLASH)) {
+                // DFlash drafter does not need the full main ctx; a small per-slot ctx
+                // (256) scaled by the DFlash slot count is enough and keeps the drafter
+                // graph small. Without this the drafter uses the main n_ctx (e.g. 4096)
+                // which changes the drafter graph/ubatch/parallel layout (fork adb92b36a:2504).
+                if (params_dft.n_ctx == params_base.n_ctx) {
+                    params_dft.n_ctx   = 256;
+                    params_dft.n_batch = params_dft.n_ctx;
+                    SRV_INF("dflash: setting drafter ctx to %d (drafter doesn't need the full main ctx)\n",
+                            params_dft.n_ctx);
+                }
+                const int block_size = llama_model_dflash_block_size(model_dft.get());
+                const int dflash_draft_slots = params_base.speculative.dflash_max_slots > 0
+                    ? params_base.speculative.dflash_max_slots
+                    : params_base.n_parallel;
+                const int dflash_draft_slots_clamped = std::max(1,
+                    std::min({ dflash_draft_slots, params_base.n_parallel, (int) LLAMA_DFLASH_MAX_SLOTS }));
+                const int dflash_draft_ctx_per_slot = params_dft.n_ctx;
+                params_dft.n_ctx      = dflash_draft_ctx_per_slot * dflash_draft_slots_clamped;
+                params_dft.n_ubatch   = LLAMA_DFLASH_MAX_SLOTS * block_size;
+                params_dft.n_parallel = dflash_draft_slots_clamped;
+                params_dft.kv_unified = false;
+            }
+
             auto cparams = common_context_params_to_llama(params_dft);
 
             if (spec_mtp) {
