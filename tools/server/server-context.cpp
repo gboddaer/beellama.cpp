@@ -3697,6 +3697,115 @@ private:
             n_empty_consecutive = 0;
         }
 
+        // DFlash: prefill suffix-span capture scheduling (ported from fork adb92b36a).
+        // The fork captures only the prompt SUFFIX (last cross_ctx tokens), not the whole
+        // prompt, via llama_dflash_prefill_capture_begin(ctx_tgt, slot.id, span_begin, span_end).
+        // Without this the cross-attention ring gets wrong context -> garbled drafts (6.7% vs 34%).
+        struct pending_dflash_prefill_flush {
+            int slot_id;
+            common_dflash_prefill_span span;
+        };
+        std::vector<pending_dflash_prefill_flush> pending_prefill_flushes;
+        bool dflash_capture_needed_for_view = false;
+
+        if (spec && params_base.speculative.has_type(COMMON_SPECULATIVE_TYPE_DFLASH)) {
+            // First pass: is any GENERATING DFlash slot in this view? (capture must stay on for them)
+            for (const auto & slot : slots) {
+                if (!slot.can_speculate()) {
+                    continue;
+                }
+                bool in_view = false;
+                for (int32_t j = 0; j < batch_view.n_tokens && !in_view; ++j) {
+                    for (int32_t k = 0; k < batch_view.n_seq_id[j]; ++k) {
+                        if (batch_view.seq_id[j][k] == slot.id) { in_view = true; break; }
+                    }
+                }
+                if (!in_view) {
+                    continue;
+                }
+                if (slot.state == SLOT_STATE_GENERATING) {
+                    dflash_capture_needed_for_view = true;
+                    break;
+                }
+            }
+
+            // Second pass: for PROCESSING_PROMPT/DONE_PROMPT slots in view, schedule suffix-span capture.
+            for (const auto & slot : slots) {
+                if (!slot.can_speculate() || !slot.task) {
+                    continue;
+                }
+                if (slot.state != SLOT_STATE_PROCESSING_PROMPT && slot.state != SLOT_STATE_DONE_PROMPT) {
+                    continue;
+                }
+
+                // Compute the slot's token range within this batch_view
+                bool found_slot_token = false;
+                llama_pos batch_pos_min = 0;
+                llama_pos batch_pos_max = 0;
+                for (int32_t j = 0; j < batch_view.n_tokens; ++j) {
+                    bool belongs = false;
+                    for (int32_t k = 0; k < batch_view.n_seq_id[j]; ++k) {
+                        if (batch_view.seq_id[j][k] == slot.id) { belongs = true; break; }
+                    }
+                    if (!belongs) {
+                        continue;
+                    }
+                    const llama_pos pos = batch_view.pos[j];
+                    if (!found_slot_token) {
+                        batch_pos_min = pos;
+                        batch_pos_max = pos;
+                        found_slot_token = true;
+                    } else {
+                        batch_pos_min = std::min(batch_pos_min, pos);
+                        batch_pos_max = std::max(batch_pos_max, pos);
+                    }
+                }
+                if (!found_slot_token) {
+                    continue;
+                }
+
+                // Suffix window: only the last cross_ctx tokens of the prompt are useful for cross-attention.
+                const int32_t prompt_total = slot.task->n_tokens();
+                const int32_t cross_ctx    = std::max<int32_t>(1, params_base.speculative.dflash_cross_ctx);
+                const int32_t capture_from = std::max<int32_t>(0, prompt_total - cross_ctx);
+                const int32_t batch_end    = (int32_t) batch_pos_max + 1;
+
+                if (batch_end <= capture_from) {
+                    continue; // this batch chunk is outside the suffix window
+                }
+
+                const int32_t span_begin    = std::max<int32_t>(batch_pos_min, capture_from);
+                const int32_t span_end      = std::min<int32_t>(batch_end, prompt_total);
+                const int     src_offset    = span_begin - batch_pos_min;
+                const int     n_tokens_span = span_end - span_begin;
+                if (n_tokens_span <= 0) {
+                    continue;
+                }
+
+                // Mixed prompt/generation view: the fork discards to avoid corrupting generation capture.
+                if (dflash_capture_needed_for_view) {
+                    common_speculative_discard_dflash_state(spec.get(), "mixed prompt/generation prefill view");
+                    continue;
+                }
+
+                common_dflash_prefill_span span;
+                span.should_flush  = true;
+                span.capture_begin = span_begin;
+                span.capture_end   = span_end;
+                span.src_offset    = src_offset;
+                span.n_tokens      = n_tokens_span;
+
+                pending_prefill_flushes.push_back({ slot.id, span });
+                common_speculative_note_prefill_suffix_scheduled(spec.get());
+                llama_dflash_prefill_capture_begin(ctx_tgt, slot.id, span.capture_begin, span.capture_end);
+            }
+
+            // Enable the eval-callback capture for this view. For prefill-flush slots capture
+            // was already begun per-span above; for generating slots we need it on for the decode.
+            const bool capture_on = dflash_capture_needed_for_view || !pending_prefill_flushes.empty();
+            common_speculative_set_prefill_capture_enabled(spec.get(), capture_on);
+        }
+
         const int ret = llama_decode(ctx_tgt, batch_view);
 
         metrics.on_decoded(slots);
@@ -3759,6 +3868,21 @@ private:
 
             // TODO: handle error
             throw std::runtime_error("failed to process speculative batch");
+        }
+
+        // DFlash: flush captured prefill hiddens into the ring buffer before the next
+        // llama_decode resets the capture buffer (ported from fork adb92b36a).
+        if (!pending_prefill_flushes.empty()) {
+            for (const auto & pf : pending_prefill_flushes) {
+                const int written = common_speculative_flush_prefill(spec.get(), pf.span.src_offset, pf.span.n_tokens);
+                if (written != pf.span.n_tokens) {
+                    SRV_ERR("dflash prefill flush mismatch: slot=%d requested=%d written=%d src_offset=%d; disabling DFlash drafting until fresh hiddens are available\n",
+                            pf.slot_id, pf.span.n_tokens, written, pf.span.src_offset);
+                    common_speculative_discard_dflash_state(spec.get(), "prefill flush mismatch");
+                    common_speculative_set_prefill_capture_enabled(spec.get(), false);
+                }
+            }
+            llama_dflash_prefill_capture_end(ctx_tgt);
         }
 
         // handle `n_cmpl > 1` tasks - when the main prompt is processed, activate all child tasks too
@@ -3975,6 +4099,14 @@ private:
                 }
 
                 common_speculative_accept(spec.get(), slot.id, accepted.size() - 1);
+
+                // DFlash: append the accepted tokens' hidden states to the cross-attention
+                // ring. The DFlash impl's accept() is a no-op; the append happens via
+                // update_logits -> append_target_hiddens (fork adb92b36a calls this at
+                // lines 6418/6420/6984). Without it the ring stays stale (committed_len
+                // never grows) -> cross-attention uses stale context -> garbled drafts
+                // (6.7% acceptance vs fork 34%).
+                common_speculative_update_logits(spec.get(), ctx_tgt, accepted, accepted.size());
 
                 slot.spec_draft = std::move(accepted);
             }
