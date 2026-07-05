@@ -3170,6 +3170,24 @@ struct common_speculative_impl_dflash : public common_speculative_impl {
                 float * argmax_probs = llama_get_logits_argmax_probs(ctx_dft);
                 const int K_flat = llama_get_logits_argmax_k(ctx_dft);
                 const int argmax_rows = llama_get_logits_argmax_n(ctx_dft);
+
+                // DFlash draft token trace for merge-vs-fork comparison
+                static const bool enable_token_trace = [] {
+                    const char * env = std::getenv("GGML_DFLASH_TOKEN_TRACE");
+                    return env && std::atoi(env) != 0;
+                }();
+                if (enable_token_trace && argmax && K_flat > 0) {
+                    std::string ids = "[";
+                    int trace_n = std::min(8, output_len - 1);
+                    for (int i = 1; i <= trace_n; ++i) {
+                        if (i > 1) ids += ",";
+                        ids += std::to_string(argmax[i * K_flat]);
+                    }
+                    ids += "]";
+                    LOG_INF("[DFLASH_TOKEN_TRACE] seq=%d committed=%d id_last=%d output_len=%d K=%d first_draft_ids=%s\n",
+                        (int) seq_id, committed_len, (int) id_last, output_len, K_flat, ids.c_str());
+                }
+
                 if (argmax) {
                     const int n_vocab = llama_vocab_n_tokens(llama_model_get_vocab(model_dft));
                     if (!common_dflash_argmax_shape_valid(__func__, argmax_rows, output_len, K_flat)) {
