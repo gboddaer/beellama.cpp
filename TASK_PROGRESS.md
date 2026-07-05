@@ -694,3 +694,56 @@ Testing whether per-slot spec creation (vs shared spec) causes the regression:
 - Temporary change: single-slot DFlash uses shared spec (like original merge)
 - If output corrects → per-slot spec creation is the cause
 - If still garbled → regression was pre-existing (introduced earlier in merge)
+
+## HF-037: DFlash quality regression root cause — n_outputs_max (2026-07-05)
+
+### BREAKTHROUGH FINDING
+
+`--spec-draft-n-max 1` produces **PERFECT output** (correct answer, coherent
+reasoning, 62.7% acceptance). Default `--spec-draft-n-max 16` produces garbled
+output (43.8% acceptance, garbled after ~20 tokens).
+
+### Key observations
+
+1. `--spec-draft-n-max` does NOT change the number of draft tokens per call
+   (both generate 15 tokens/call). It changes `server_n_outputs_max`:
+   - n_max=1: `n_outputs_per_seq = 2`, target output buffer = 2
+   - n_max=16: `n_outputs_per_seq = 17`, target output buffer = 17
+
+2. The target's output buffer size affects quality, NOT the draft count.
+   With a small buffer (2), output is correct. With a large buffer (17),
+   output is garbled.
+
+3. The fork uses an ADAPTIVE controller that starts with small drafts (5)
+   and grows them. The merge uses fixed n_draft_max = n_ctx - prompt - 2.
+
+### Comparison (same prompt: "Capital of France?")
+
+| Setting | Acceptance | Output | n_outputs_max |
+|---------|-----------|--------|---------------|
+| merge n_max=1 | 62.7% | ✅ "The capital of France is Paris." | 2 |
+| merge n_max=5 | 3.6% | ❌ Completely garbled | 6 |
+| merge n_max=16 (default) | 43.8% | ❌ Garbled after ~20 tokens | 17 |
+| fork (adaptive 5→16) | 26.7% | ✅ "The capital of France is Paris." | varies |
+| merge non-DFlash | N/A | ✅ "The capital of France is Paris." | 1 |
+
+### Root cause hypothesis
+
+The merge's `server_n_outputs_max` computes `n_outputs_per_seq = 1 + n_max`.
+For DFlash, this creates a large target output buffer (17 positions) that
+somehow corrupts the verification or graph building. With n_max=1, the buffer
+is small (2) and the output is correct.
+
+The fork's adaptive controller keeps n_max small initially, which keeps the
+output buffer small, which produces correct output. As confidence grows, n_max
+increases, but by then the ring buffer has enough context for accurate
+verification.
+
+### Next steps
+
+1. **Port the fork's adaptive profit controller** — starts with small n_max,
+   grows based on acceptance rate. This is the proper fix.
+2. **Investigate why large n_outputs_max corrupts output** — is it the graph
+   building, the verification, or the sampling?
+3. **Test `--spec-draft-n-max 1` with longer prompts** — verify it's a stable
+   workaround.
