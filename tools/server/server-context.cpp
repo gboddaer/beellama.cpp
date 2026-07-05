@@ -1573,6 +1573,18 @@ private:
             }
         }
 
+        // DFlash: allocate per-slot tape + hidden buffers on the target context.
+        // common_speculative_init (run per-slot above) creates dflash_capture on the
+        // target context; this call resizes layer_hiddens to dflash_slots_cap so the
+        // eval callback can route hidden states to the correct slot's buffer.
+        // Without this, layer_hiddens.size()=1 and slots > 0 get "out of range" warnings
+        // and no hidden state capture -> empty ring buffer -> 0 drafts.
+        // (fork adb92b36a:2814 calls this; merge was missing it.)
+        // Only call for multi-slot; single-slot already has layer_hiddens.size()=1.
+        if (dflash_slots_cap > 1) {
+            llama_dflash_allocate_slots(ctx_tgt, dflash_slots_cap);
+        }
+
         {
             const char * LLAMA_TRACE = getenv("LLAMA_TRACE");
             trace = LLAMA_TRACE ? atoi(LLAMA_TRACE) : 0;
@@ -3845,7 +3857,7 @@ private:
         std::vector<pending_dflash_prefill_flush> pending_prefill_flushes;
         bool dflash_capture_needed_for_view = false;
 
-        if (spec && params_base.speculative.has_type(COMMON_SPECULATIVE_TYPE_DFLASH)) {
+        if (params_base.speculative.has_type(COMMON_SPECULATIVE_TYPE_DFLASH)) {
             // First pass: is any GENERATING DFlash slot in this view? (capture must stay on for them)
             for (const auto & slot : slots) {
                 if (!slot.can_speculate()) {
@@ -3944,6 +3956,10 @@ private:
 
                 pending_prefill_flushes.push_back({ slot.id, span });
                 common_speculative_note_prefill_suffix_scheduled(slot.get_spec());
+                // Set active slot for DFlash cross-attention ring access
+                if (params_base.speculative.has_type(COMMON_SPECULATIVE_TYPE_DFLASH)) {
+                    llama_dflash_set_active_slot(ctx_tgt, slot.id);
+                }
                 llama_dflash_prefill_capture_begin(ctx_tgt, slot.id, span.capture_begin, span.capture_end);
             }
 
@@ -4046,6 +4062,10 @@ private:
                 }
                 if (!pf_spec) {
                     pf_spec = spec.get();
+                }
+                // Set active slot so flush_prefill reads from the correct slot's hidden buffer
+                if (params_base.speculative.has_type(COMMON_SPECULATIVE_TYPE_DFLASH)) {
+                    llama_dflash_set_active_slot(ctx_tgt, pf.slot_id);
                 }
                 const int written = common_speculative_flush_prefill(pf_spec, pf.span.src_offset, pf.span.n_tokens);
                 if (written != pf.span.n_tokens) {
