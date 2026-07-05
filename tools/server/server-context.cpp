@@ -1495,7 +1495,7 @@ private:
                     // Non-DFlash fork types (SUFFIX, COPYSPEC, RECYCLE) use a single shared spec.
                     // DFlash creates per-slot specs below in the slot init loop.
                     // TEMPORARY TEST: single-slot DFlash uses shared spec to check quality regression.
-                    if (!is_dflash || params_base.n_parallel == 1) {
+                    if (!is_dflash) {
                         spec.reset(common_speculative_init(params_base.speculative, ctx_tgt, ctx_dft.get(), params_base.n_parallel));
                     }
                 } else {
@@ -1542,7 +1542,7 @@ private:
             // Non-DFlash: use the shared context-level spec.
             // TEMPORARY TEST: use shared spec for single-slot DFlash to check if
             // per-slot spec creation causes the quality regression.
-            const bool slot_dflash = is_dflash && i < dflash_slots_cap && params_base.n_parallel > 1;
+            const bool slot_dflash = is_dflash && i < dflash_slots_cap;
             if (slot_dflash) {
                 try {
                     slot.spec.reset(common_speculative_init(
@@ -2579,8 +2579,19 @@ private:
 
         cur.update_tgt(ctx_tgt,       slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
         cur.update_dft(ctx_dft.get(), slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
-        // stash the draft's speculative state with the checkpoint
-        common_speculative_get_state(slot.get_spec(), slot.get_seq_id(), cur.data_spec);
+        // Save DFlash ring buffer state with the checkpoint (fork uses ring_state_save/load,
+        // not the get_state/set_state TODO stubs which lose ring state on restore).
+        if (slot.can_speculate() && params_base.speculative.has_type(COMMON_SPECULATIVE_TYPE_DFLASH)) {
+            size_t ring_size = common_speculative_ring_state_size(slot.get_spec());
+            if (ring_size > 0) {
+                cur.data_spec.resize(ring_size);
+                bool ring_saved = common_speculative_ring_state_save(
+                        slot.get_spec(), cur.data_spec.data(), ring_size);
+                if (!ring_saved) {
+                    cur.data_spec.clear();
+                }
+            }
+        }
 
         SLT_TRC(slot,
                 "created context checkpoint %d of %d (pos_min = %d, pos_max = %d, n_tokens = %" PRId64 ", size = %.3f MiB)\n",
@@ -3557,8 +3568,11 @@ private:
                                         // restore the context checkpoint
                                         it->load_tgt(ctx_tgt,       slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
                                         it->load_dft(ctx_dft.get(), slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
-                                        // restore the draft's speculative state
-                                        common_speculative_set_state(slot.get_spec(), slot.get_seq_id(), it->data_spec);
+                                        // restore the DFlash ring buffer state (fork uses ring_state_load,
+                                        // not the set_state TODO stub which does nothing)
+                                        if (slot.can_speculate() && !it->data_spec.empty()) {
+                                            common_speculative_ring_state_load(slot.get_spec(), it->data_spec.data(), it->data_spec.size());
+                                        }
 
                                         pos_next = std::min(pos_next, std::max(it->pos_min + 1, it->pos_max));
                                         n_past   = std::min(slot.prompt.tokens.size_up_to_pos(pos_next), (size_t) it->n_tokens);
