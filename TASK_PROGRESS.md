@@ -565,3 +565,74 @@ Next: verify swa_layers type; if vector add guard; verify 3-arg overload dispatc
 - Investigate fork's `hidden_gpu`/`prefill_gpu` allocation for multi-slot
 - Check if fork calls `allocate_tape_gpu(n_parallel, ...)` on target context somewhere
 - May need to call `allocate_tape_gpu(ctx_tgt, n_parallel, ...)` during DFlash init
+
+## HF-035: Multi-Slot DFlash — Proven Facts vs Hypotheses (2026-07-05)
+
+### PROVEN FACTS (empirically tested)
+
+1. **Single-slot DFlash WORKS** (`--parallel 1`): 59.3% acceptance (16/27), correct output, 3 draft cycles. No regression from multi-slot changes (with `allocate_slots > 1` guard).
+
+2. **Multi-slot WITHOUT DFlash works** (`--parallel 2`, no `--spec-type dflash`): Output correct ("Here's a thinking process:"). No garbled output. The garbled output is caused by DFlash, NOT by multi-slot itself.
+
+3. **Multi-slot WITH DFlash produces GARBLED OUTPUT** (`--parallel 2`): "Thinking Process: to\n在 to 响应 ,话 to >" — mixed Chinese/English garbage. Also 0 drafts generated.
+
+4. **Garbled output is NOT caused by** (each was disabled and output remained garbled):
+   - `llama_dflash_allocate_slots` (disabled completely, still garbled)
+   - `common_speculative_draft` (disabled, still garbled)
+   - `set_active_dflash_slot` calls (disabled, still garbled)
+   - Prefill capture scheduling (disabled, still garbled)
+   - GPU capture (`GGML_DFLASH_GPU_RING=0`, still garbled)
+
+5. **`llama_dflash_allocate_slots(ctx_tgt, 1)` BREAKS single-slot**: acceptance drops from 59.3% to 5.3%. Guard `> 1` fixes this. (fork:2814 calls it unconditionally, but fork's `allocate_tape_gpu(1,...)` might be idempotent — merge's is not).
+
+6. **The `llama_dflash_allocate_slots` API EXISTS in the merge** (llama.h:1636, llama-context.cpp:8899) but was NOT being CALLED from server code. Added the call (fork:2814 equivalent).
+
+7. **Prefill capture scheduling was SKIPPED for DFlash** because the guard was `if (spec && ...)` but `spec` is null for DFlash (per-slot specs). Fixed by removing `spec &&` guard. Prefill spans now scheduled (confirmed with `GGML_DFLASH_PREFILL_TRACE=1`).
+
+8. **`flush_prefill` returns 0 for slot > 0**: `dflash prefill flush mismatch: slot=1 requested=13 written=0`. Hidden states not captured for slots > 0.
+
+9. **`set_active_dflash_slot: slot N out of range [0, 1)` warning** appears without `allocate_slots`. With `allocate_slots(2)`, the warning disappears but `flush_prefill` still returns 0.
+
+### HYPOTHESES (not yet proven)
+
+1. **HYPOTHESIS: GPU capture disables eval callback → layer_hiddens empty for slots > 0**. In `decode()` line 6646, `cparams.cb_eval = nullptr` when `dflash_gpu_capture_ready`. But `GGML_DFLASH_GPU_RING=0` (force CPU capture) didn't fix it, so this may be wrong or only partially correct.
+
+2. **HYPOTHESIS: The garbled output is caused by the DFlash impl constructor's `set_dflash_capture(ctx_tgt, ...)` call**. When 2 slots create DFlash impls, `set_dflash_capture` is called twice on the same target context, possibly corrupting graph state. NOT YET TESTED — would need to disable `set_dflash_capture` in the DFlash impl constructor.
+
+3. **HYPOTHESIS: `memory->set_force_split_seq(true)` in `set_dflash_capture` corrupts multi-slot decode**. This forces ubatch splitting by sequence, which might interact badly with the graph cache. NOT YET TESTED.
+
+4. **HYPOTHESIS: The fork's `flush_prefill` reads from `hidden_gpu` (GPU), not `layer_hiddens` (CPU)**. NOT YET VERIFIED — need to read the fork's `flush_prefill` implementation.
+
+5. **HYPOTHESIS: There's a GPU→CPU sync step before `flush_prefill`** (e.g., in `prefill_capture_end`). NOT YET FOUND.
+
+### REMAINING QUESTIONS
+
+1. **Why does the fork's multi-slot DFlash work with the same `set_dflash_capture` code?** Both fork and merge call `set_dflash_capture` per-slot on the same target context. The fork works, the merge produces garbled output. What's different?
+
+2. **What specifically corrupts the output?** The garbled output (mixed Chinese/English) suggests KV cache corruption or position/sequence ID mismatch. Need to identify the exact mechanism.
+
+3. **Is the garbled output caused by the graph being rebuilt with incorrect DFlash capture parameters?** The `set_dflash_capture` call changes `cparams.cb_eval` and `cparams.dflash_capture_layers`. If the graph is cached and not rebuilt correctly, the output could be garbled.
+
+### GLM REVIEW SUMMARY (glm-5.2:cloud)
+
+**GLM Review 1** (HF-034):
+- Key insight: fork likely sizes `hidden_gpu`/`prefill_gpu` to `n_parallel`, not `layer_hiddens`
+- `set_active_dflash_slot` IS needed — routes captured data to correct per-slot ring
+- 0 drafts chain: n_slots=1 → set_active_dflash_slot rejected → no capture → empty ring → embd=0
+- **VERIFIED**: `llama_dflash_allocate_slots` was the missing call (fork:2814)
+
+**GLM Review 2** (HF-035):
+- **Garbled output is the real problem**, not 0 drafts — 0 drafts should produce correct but slow output (pure target fallback)
+- Garbled output means memory corruption or graph corruption
+- `allocate_slots` resizing `layer_hiddens` after graph was cached would corrupt tensor pointers
+- **PARTIALLY VERIFIED**: `allocate_slots` disabled completely → still garbled, so NOT the sole cause
+- Recommendation: isolate garbled output first, force CPU capture as diagnostic
+- **DONE**: `GGML_DFLASH_GPU_RING=0` didn't fix garbled output
+
+### NEXT STEPS
+
+1. **Investigate the DFlash impl constructor's effect on the target context** — disable `set_dflash_capture` in the constructor and check if output is correct
+2. **Check if `set_force_split_seq(true)` is the cause** — disable it and test
+3. **Compare fork vs merge `set_dflash_capture` more carefully** — there might be a subtle difference
+4. **Check if the graph cache is being invalidated correctly** when DFlash capture is enabled
+5. **Read the fork's `flush_prefill` implementation** to understand GPU vs CPU hidden state reading
