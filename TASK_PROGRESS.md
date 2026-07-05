@@ -200,6 +200,34 @@
   - BUILD_CROSS_DATA breakpoint didn't resolve in merge (different symbol mangling) —
     GLM flagged as red flag: if symbol mangling differs, the function might actually
     be DIFFERENT even if source looks identical
+- HF-031: **ROOT CAUSE FOUND AND FIXED — missing llama_model_share_tensors** (2026-07-05) ✅
+  - **Root cause**: merge was missing `llama_model_share_tensors(model_dft.get(),
+    llama_get_model(ctx_tgt))` which fork calls at adb92b36a:2526.
+  - Without this call, the drafter's lm_head (model.output) is NULL. The DFlash graph
+    code (dflash_draft.cpp:1206) falls back to a Q4_0 placeholder tensor, producing
+    garbage logits. The argmax of garbage logits is all zeros, so every draft token is 0.
+  - **GGML_DFLASH_TOKEN_TRACE=1 revealed the smoking gun**:
+    - MERGE: first_draft_ids=[0,0,0,0,0,0,0,0] — ALL ZEROS (garbage)
+    - FORK:  first_draft_ids=[1817,25,271,16] — MEANINGFUL TOKENS (correct)
+  - **Results AFTER fix (was before)**:
+    - Token trace: [8340,25,271,16,13,220,2972,2014] (was [0,0,0,0,0,0,0,0])
+    - Draft acceptance: 55.6% (25/45) (was 6.7%)
+    - Speed: 19.4 tok/s (was 4.2 tok/s)
+    - Output: 'Thinking Process: 1. Identify the user input: The user is asking
+      What is 2+2?. 2.' (was garbled 'Thinking Process:en design: The')
+  - **Also fixed in same commit**:
+    - Added `params_base.speculative.cparams_dft = common_context_params_to_llama(params_dft)`
+      (fork adb92b36a:2523, was missing in merge)
+    - Added `cparams.dflash_n_slots` and `cparams.dflash_cross_ctx` for ctx_dft creation
+      (fork sets these in common_speculative_create_ctx_dft, was missing in merge)
+  - **Debug tools added** (kept for future use):
+    - GGML_DFLASH_RING_DUMP=1: dump ring buffer data (HF-028)
+    - GGML_DFLASH_KV_TRACE=1: dump drafter KV cache state (HF-029)
+    - GGML_DFLASH_TOKEN_TRACE=1: dump drafter output token IDs (HF-031)
+  - **Investigation path**: ring dump (HF-028, similar) → GDB flow comparison (HF-029,
+    2.6x more draft calls) → GLM review (HF-030, KV cache suspect) → KV trace (pos_max
+    differences, symptom) → token trace (all zeros, smoking gun) → graph comparison
+    (identical) → share_tensors missing (root cause).
 - HF-022: **GLM review (glm-5.2:cloud) of commit 9a67f5636 returned 3 concerns — ALL RESOLVED (2026-07-04)**:
   1. **Fix 3 UB risk → MOOT**: `swa_layers` is `std::array<uint32_t, LLAMA_MAX_LAYERS>` (fixed-size,
      llama-hparams.h:150), zeroed at llama-model.cpp:1104. Never empty → no out-of-bounds. No fix needed.
