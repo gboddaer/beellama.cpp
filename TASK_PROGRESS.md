@@ -186,6 +186,20 @@
     The gap is in the DRAFT CONTENT — the drafter produces wrong tokens given the same
     cross-attention data. Next: investigate drafter graph/forward pass differences
     (dflash_draft.cpp, cross-attention consumption in the drafter graph).**
+- HF-030: **GLM review of GDB findings (2026-07-05) — 5 suspects, KV cache highest**
+  - GLM (glm-5.2:cloud) analyzed the GDB flow comparison and identified 5 suspects:
+    1. **HIGHEST: Drafter KV cache state (MEM_SEQ_RM 113 vs 23)** — 4.9x ratio is NOT
+       proportional to 2.6x other call counts → KV cache management fundamentally different.
+       If sequences removed at wrong times, drafter has stale/missing context.
+    2. Drafter graph building — different attention mask, layer connectivity, tensor shapes
+    3. Drafter model loading — wrong weight order/precision, missing/duplicated layers
+    4. Cross-attention consumption — drafter reads cross data differently (head mapping,
+       scaling, positional handling)
+    5. Drafter sampling — different temperature/top-k/top-p or argmax bug
+  - GLM recommendation: investigate drafter KV cache state FIRST (strongest signal)
+  - BUILD_CROSS_DATA breakpoint didn't resolve in merge (different symbol mangling) —
+    GLM flagged as red flag: if symbol mangling differs, the function might actually
+    be DIFFERENT even if source looks identical
 - HF-022: **GLM review (glm-5.2:cloud) of commit 9a67f5636 returned 3 concerns — ALL RESOLVED (2026-07-04)**:
   1. **Fix 3 UB risk → MOOT**: `swa_layers` is `std::array<uint32_t, LLAMA_MAX_LAYERS>` (fixed-size,
      llama-hparams.h:150), zeroed at llama-model.cpp:1104. Never empty → no out-of-bounds. No fix needed.
