@@ -3834,6 +3834,16 @@ private:
                 const int32_t capture_from = std::max<int32_t>(0, prompt_total - cross_ctx);
                 const int32_t batch_end    = (int32_t) batch_pos_max + 1;
 
+                // DFlash prefill capture trace for merge-vs-fork comparison
+                static const bool enable_prefill_trace = [] {
+                    const char * env = std::getenv("GGML_DFLASH_PREFILL_TRACE");
+                    return env && std::atoi(env) != 0;
+                }();
+                if (enable_prefill_trace) {
+                    LOG_INF("[DFLASH_PREFILL_TRACE] slot=%d prompt_total=%d cross_ctx=%d capture_from=%d batch_pos=[%d,%d] batch_end=%d\n",
+                        slot.id, prompt_total, cross_ctx, capture_from, (int)batch_pos_min, (int)batch_pos_max, batch_end);
+                }
+
                 if (batch_end <= capture_from) {
                     continue; // this batch chunk is outside the suffix window
                 }
