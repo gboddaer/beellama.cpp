@@ -530,3 +530,38 @@ Next: verify swa_layers type; if vector add guard; verify 3-arg overload dispatc
 - Fork binary (working DFlash reference): `/crypt/beellama.cpp/build-vulkan/bin/llama-server` (on adb92b36a).
 - Do NOT `pkill -f llama-server` — kills the user's running server. Use distinct ports (8090+) per test.
 - No time limit, no token limit (user instruction).
+## HF-034: Multi-Slot DFlash Implementation (2026-07-05)
+
+### Architecture Ported (commit ad46a8703)
+- **server_slot struct refactored**: `spec` is now `common_speculative_ptr` (owned unique_ptr), added `spec_shared` (non-owning fallback), `get_spec()`, `get_seq_id()`
+- **Per-slot spec creation**: Each DFlash slot gets its own `common_speculative_init(params, ctx_tgt, ctx_dft)` with `n_seq=1`
+- **Shared drafter context**: `ctx_dft` is kept (not reset) for DFlash; all slots share one drafter context
+- **seq_id fix**: `get_seq_id()` returns 0 for per-slot specs, `slot.id` for shared specs (fixes dparams out-of-bounds crash)
+- **set_active_slot**: Added `llama_dflash_set_active_slot(ctx_tgt, slot.id)` before draft/accept/update_logits
+- **n_outputs_max**: Increased drafter's `n_outputs_max` to account for draft tokens (fixes output_reserve crash)
+- **dflash_n_slots**: Set `llama_set_dflash_n_slots(ctx_tgt, n_parallel)` for target context
+- **All per-slot operations**: Replaced `spec.get()` with `slot.get_spec()` in 15+ locations
+
+### Results
+| Mode | Acceptance | Speed | Drafts | Output | Status |
+|------|-----------|-------|--------|--------|--------|
+| --parallel 1 | 43.6% | 20.9 tok/s | 5 cycles, 24/55 accepted | correct | ✅ WORKING |
+| --parallel 4 | 0% | 11.4 tok/s | 18 calls, 0 generated | correct (non-spec) | ⚠️ 0 drafts |
+
+### Multi-Slot Issue
+- 4 per-slot DFlash specs created ✅
+- Shared drafter context works ✅ (1 warmup, not 4)
+- But 0 drafts generated (18 draft calls, 0 output)
+- Error: `begin hidden[0] shape mismatch: embd=0 expected=5120 tokens=0`
+- Warning: `set_active_dflash_slot: slot 2 out of range [0, 1); ignoring` (same in fork)
+
+### GLM Review (glm-5.2:cloud)
+- Key insight: fork likely sizes `hidden_gpu`/`prefill_gpu` to `n_parallel`, not `layer_hiddens`
+- `set_active_dflash_slot` IS needed — routes captured data to correct per-slot ring
+- 0 drafts chain: n_slots=1 → set_active_dflash_slot rejected → no capture → empty ring → embd=0
+- Recommendation: inspect fork's `hidden_gpu`/`prefill_gpu` sizing, replicate in merge
+
+### Next Steps
+- Investigate fork's `hidden_gpu`/`prefill_gpu` allocation for multi-slot
+- Check if fork calls `allocate_tape_gpu(n_parallel, ...)` on target context somewhere
+- May need to call `allocate_tape_gpu(ctx_tgt, n_parallel, ...)` during DFlash init
