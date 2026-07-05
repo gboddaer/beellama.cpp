@@ -175,7 +175,8 @@ struct server_slot {
     mtmd::batch_ptr mbatch = nullptr;
 
     // speculative decoding
-    common_speculative * spec;
+    common_speculative_ptr spec;                  // owned (DFlash per-slot)
+    common_speculative * spec_shared = nullptr;   // non-owning fallback (non-DFlash)
 
     llama_tokens spec_draft;
     llama_tokens spec_prompt;
@@ -375,12 +376,12 @@ struct server_slot {
 
     bool need_embd() const {
         GGML_ASSERT(task);
-        return task->need_embd() || (spec && common_speculative_need_embd(spec));
+        return task->need_embd() || (get_spec() && common_speculative_need_embd(get_spec()));
     }
 
     bool need_embd_nextn() const {
         GGML_ASSERT(task);
-        return spec && common_speculative_need_embd_nextn(spec);
+        return get_spec() && common_speculative_need_embd_nextn(get_spec());
     }
 
     // if the context does not have a memory module then all embeddings have to be computed within a single ubatch
@@ -423,7 +424,17 @@ struct server_slot {
     }
 
     bool can_speculate() const {
-        return !!spec;
+        return spec || spec_shared;
+    }
+
+    common_speculative * get_spec() const {
+        return spec ? spec.get() : spec_shared;
+    }
+
+    // Per-slot spec (DFlash): use seq_id=0 (each slot has its own spec with n_seq=1).
+    // Shared spec (non-DFlash): use slot.id as the seq_id.
+    llama_seq_id get_seq_id() const {
+        return spec ? 0 : id;
     }
 
     void add_token(const completion_token_output & token) {
@@ -649,7 +660,7 @@ struct server_slot {
                     "     acc per pos = (%s)\n", acceptance_rates_per_pos.c_str());
         }
 
-        common_speculative_print_stats(spec);
+        common_speculative_print_stats(get_spec());
     }
 
     json to_json(bool only_metrics = false) const {
@@ -724,7 +735,7 @@ struct server_slot {
             if (mbatch) {
                 float * embd = mtmd_batch_get_output_embd(mbatch.get(), chunk.get());
                 if (embd) {
-                    void * cb_data = spec;
+                    void * cb_data = get_spec();
                     static auto cb = [](llama_batch batch, void * user_data) {
                         common_speculative * spec = static_cast<common_speculative *>(user_data);
                         if (!common_speculative_process(spec, batch)) {
@@ -1216,6 +1227,12 @@ private:
 
         n_ctx = llama_n_ctx(ctx_tgt);
 
+        // DFlash: set target context's dflash_n_slots so set_active_dflash_slot()
+        // accepts all parallel slots. Without this, slots > 0 get "out of range" warnings.
+        if (params_base.speculative.has_type(COMMON_SPECULATIVE_TYPE_DFLASH)) {
+            llama_set_dflash_n_slots(ctx_tgt, std::max(1, params_base.n_parallel));
+        }
+
         add_bos_token = llama_vocab_get_add_bos(vocab);
 
         if (has_draft) {
@@ -1422,14 +1439,23 @@ private:
                 //     only this overload handles these types)
                 //   - DRAFT_SIMPLE/EAGLE3/MTP/NGRAM_*  → 2-arg init (only that overload
                 //     handles these types)
+                // Dispatch by speculative type (matches fork adb92b36a separation):
+                //   - DFLASH/SUFFIX/COPYSPEC/RECYCLE  → 3-arg init (needs ctx_tgt + ctx_dft;
+                //     only this overload handles these types)
+                //   - DRAFT_SIMPLE/EAGLE3/MTP/NGRAM_*  → 2-arg init (only that overload
+                //     handles these types)
                 // Calling the 3-arg init for DRAFT_SIMPLE/etc. would silently disable
                 // speculative decoding (no impls pushed); calling the 2-arg init for
-                // DFLASH would log "no implementations specified".  The fork kept these
-                // on separate spec objects (main spec vs per-slot slot.spec); the merge
-                // has a single spec so dispatch here.
+                // DFLASH would log "no implementations specified".
+                //
+                // DFlash: per-slot spec objects (each slot owns its own ring/capture/seq_id).
+                // Context-level spec is NOT created for DFlash; each slot creates its own
+                // spec.reset(...) in the slot init loop below.
+                // Non-DFlash fork types (SUFFIX, COPYSPEC, RECYCLE): single shared spec.
                 const auto & sp = params_base.speculative;
+                const bool is_dflash = sp.has_type(COMMON_SPECULATIVE_TYPE_DFLASH);
                 const bool needs_ctx_overload =
-                    sp.has_type(COMMON_SPECULATIVE_TYPE_DFLASH) ||
+                    is_dflash ||
                     sp.has_type(COMMON_SPECULATIVE_TYPE_SUFFIX) ||
                     sp.has_type(COMMON_SPECULATIVE_TYPE_COPYSPEC) ||
                     sp.has_type(COMMON_SPECULATIVE_TYPE_RECYCLE);
@@ -1458,12 +1484,19 @@ private:
                             params_dft.cache_type_v          = params_spec.cache_type_v;
                             params_dft.tensor_buft_overrides = params_spec.tensor_buft_overrides;
                         }
-                        params_dft.n_outputs_max = params_base.n_parallel;
+                        // Drafter needs output positions for all draft tokens.
+                        // (n_outputs_max = n_parallel is too small; crash in output_reserve).
+                        const uint32_t n_outputs_dft = std::max<uint32_t>(
+                            (uint32_t)params_base.n_parallel,
+                            (uint32_t)(1 + common_speculative_n_max(&params_base.speculative)));
+                        params_dft.n_outputs_max = n_outputs_dft;
                         params_base.speculative.cparams_dft = common_context_params_to_llama(params_dft);
                     }
-                    // Size dparams to n_parallel so dparams[slot.id] is in bounds for
-                    // multi-slot servers (fork used per-slot specs; merge uses one spec).
-                    spec.reset(common_speculative_init(params_base.speculative, ctx_tgt, ctx_dft.get(), params_base.n_parallel));
+                    // Non-DFlash fork types (SUFFIX, COPYSPEC, RECYCLE) use a single shared spec.
+                    // DFlash creates per-slot specs below in the slot init loop.
+                    if (!is_dflash) {
+                        spec.reset(common_speculative_init(params_base.speculative, ctx_tgt, ctx_dft.get(), params_base.n_parallel));
+                    }
                 } else {
                     spec.reset(common_speculative_init(params_base.speculative, params_base.n_parallel));
                 }
@@ -1476,11 +1509,25 @@ private:
             ctx_dft_seq_rm_type = common_context_can_seq_rm(ctx_dft.get());
         }
 
+        // DFlash multi-slot: determine how many slots get DFlash (fork:2686-2693)
+        const bool is_dflash = params_base.speculative.has_type(COMMON_SPECULATIVE_TYPE_DFLASH);
+
         if (spec) {
             SRV_TRC("%s", "speculative decoding context initialized\n");
-        } else {
+        } else if (!is_dflash) {
+            // Only reset ctx_dft for non-DFlash. For DFlash, the context-level spec is
+            // not created (per-slot specs are used instead), but the shared ctx_dft
+            // must be kept for the per-slot specs to use.
             ctx_dft.reset();
         }
+
+        const int dflash_slots_cap = is_dflash
+            ? std::max(1, std::min({ params_base.n_parallel,
+                                     (int)(params_base.speculative.dflash_max_slots > 0
+                                             ? params_base.speculative.dflash_max_slots
+                                             : params_base.n_parallel),
+                                     (int)LLAMA_DFLASH_MAX_SLOTS }))
+            : 0;
 
         for (int i = 0; i < params_base.n_parallel; i++) {
             server_slot & slot = slots[i];
@@ -1488,8 +1535,26 @@ private:
             slot.id      = i;
             slot.ctx_tgt = ctx_tgt;
             slot.ctx_dft = ctx_dft.get();
-            slot.spec    = spec.get();
             slot.n_ctx   = n_ctx_slot;
+
+            // DFlash: each slot gets its own spec (per-slot ring/capture/seq_id).
+            // Non-DFlash: use the shared context-level spec.
+            const bool slot_dflash = is_dflash && i < dflash_slots_cap;
+            if (slot_dflash) {
+                try {
+                    slot.spec.reset(common_speculative_init(
+                        params_base.speculative, slot.ctx_tgt, ctx_dft.get()));
+                } catch (const std::exception & e) {
+                    SRV_ERR("failed to initialize slot %d speculative context: %s\n", i, e.what());
+                    return false;
+                }
+            } else if (spec) {
+                slot.spec_shared = spec.get();
+            }
+
+            if (slot.can_speculate()) {
+                common_speculative_set_seq_id(slot.get_spec(), slot.get_seq_id());
+            }
 
             slot.mctx                   = mctx;
             slot.prompt.tokens.has_mtmd = mctx != nullptr;
@@ -2500,7 +2565,7 @@ private:
         cur.update_tgt(ctx_tgt,       slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
         cur.update_dft(ctx_dft.get(), slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
         // stash the draft's speculative state with the checkpoint
-        common_speculative_get_state(spec.get(), slot.id, cur.data_spec);
+        common_speculative_get_state(slot.get_spec(), slot.get_seq_id(), cur.data_spec);
 
         SLT_TRC(slot,
                 "created context checkpoint %d of %d (pos_min = %d, pos_max = %d, n_tokens = %" PRId64 ", size = %.3f MiB)\n",
@@ -3094,8 +3159,8 @@ private:
 
             generating.push_back(&slot);
 
-            if (spec) {
-                common_speculative_get_draft_params(spec.get(), slot.id).drafting = false;
+            if (slot.can_speculate()) {
+                common_speculative_get_draft_params(slot.get_spec(), slot.get_seq_id()).drafting = false;
 
                 const bool use_ckpt_tgt = ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_FULL;
                 const bool use_ckpt_dft = ctx_dft_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_FULL;
@@ -3124,7 +3189,7 @@ private:
 
                         slot.spec_prompt = slot.prompt.tokens.get_text_tokens();
 
-                        auto & draft_params = common_speculative_get_draft_params(spec.get(), slot.id);
+                        auto & draft_params = common_speculative_get_draft_params(slot.get_spec(), slot.get_seq_id());
                         draft_params.drafting = true;
                         draft_params.n_max = n_draft_max;
                         draft_params.n_min = 0;
@@ -3141,7 +3206,15 @@ private:
 
         // generate the actual drafts (if any)
         {
-            common_speculative_draft(spec.get());
+            // set active slot for DFlash cross-attention ring access
+            if (params_base.speculative.has_type(COMMON_SPECULATIVE_TYPE_DFLASH)) {
+                for (server_slot * s : drafting) {
+                    llama_dflash_set_active_slot(ctx_tgt, s->id);
+                }
+            }
+            for (server_slot * s : drafting) {
+                common_speculative_draft(s->get_spec());
+            }
         }
 
         // make checkpoints if needed
@@ -3470,7 +3543,7 @@ private:
                                         it->load_tgt(ctx_tgt,       slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
                                         it->load_dft(ctx_dft.get(), slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
                                         // restore the draft's speculative state
-                                        common_speculative_set_state(spec.get(), slot.id, it->data_spec);
+                                        common_speculative_set_state(slot.get_spec(), slot.get_seq_id(), it->data_spec);
 
                                         pos_next = std::min(pos_next, std::max(it->pos_min + 1, it->pos_max));
                                         n_past   = std::min(slot.prompt.tokens.size_up_to_pos(pos_next), (size_t) it->n_tokens);
@@ -3858,7 +3931,7 @@ private:
 
                 // Mixed prompt/generation view: the fork discards to avoid corrupting generation capture.
                 if (dflash_capture_needed_for_view) {
-                    common_speculative_discard_dflash_state(spec.get(), "mixed prompt/generation prefill view");
+                    common_speculative_discard_dflash_state(slot.get_spec(), "mixed prompt/generation prefill view");
                     continue;
                 }
 
@@ -3870,14 +3943,22 @@ private:
                 span.n_tokens      = n_tokens_span;
 
                 pending_prefill_flushes.push_back({ slot.id, span });
-                common_speculative_note_prefill_suffix_scheduled(spec.get());
+                common_speculative_note_prefill_suffix_scheduled(slot.get_spec());
                 llama_dflash_prefill_capture_begin(ctx_tgt, slot.id, span.capture_begin, span.capture_end);
             }
 
             // Enable the eval-callback capture for this view. For prefill-flush slots capture
             // was already begun per-span above; for generating slots we need it on for the decode.
             const bool capture_on = dflash_capture_needed_for_view || !pending_prefill_flushes.empty();
-            common_speculative_set_prefill_capture_enabled(spec.get(), capture_on);
+            // Multi-slot: set capture enabled on each slot's spec
+            if (spec) {
+                common_speculative_set_prefill_capture_enabled(spec.get(), capture_on);
+            }
+            for (auto & s : slots) {
+                if (s.spec) {
+                    common_speculative_set_prefill_capture_enabled(s.get_spec(), capture_on);
+                }
+            }
         }
 
         const int ret = llama_decode(ctx_tgt, batch_view);
@@ -3937,7 +4018,14 @@ private:
         // TODO: avoid restoring the draft context and re-evaluating the drafted tokens when not needed [TAG_SPEC_AVOID_DRAFT_REEVAL]
         //       for now, always re-evaluate for simplicity
         //       ref: https://github.com/ggml-org/llama.cpp/pull/22728#issuecomment-4400925384
-        if (!common_speculative_process(spec.get(), batch_view)) {
+        // Multi-slot: process speculative batch for each slot's spec
+        for (auto & s : slots) {
+            if (s.get_spec() && !common_speculative_process(s.get_spec(), batch_view)) {
+                SRV_ERR("%s", "failed to process speculative batch\n");
+                throw std::runtime_error("failed to process speculative batch");
+            }
+        }
+        if (spec && !common_speculative_process(spec.get(), batch_view)) {
             SRV_ERR("%s", "failed to process speculative batch\n");
 
             // TODO: handle error
@@ -3948,12 +4036,23 @@ private:
         // llama_decode resets the capture buffer (ported from fork adb92b36a).
         if (!pending_prefill_flushes.empty()) {
             for (const auto & pf : pending_prefill_flushes) {
-                const int written = common_speculative_flush_prefill(spec.get(), pf.span.src_offset, pf.span.n_tokens);
+                // Find the slot for this flush
+                common_speculative * pf_spec = nullptr;
+                for (auto & s : slots) {
+                    if (s.id == pf.slot_id && s.get_spec()) {
+                        pf_spec = s.get_spec();
+                        break;
+                    }
+                }
+                if (!pf_spec) {
+                    pf_spec = spec.get();
+                }
+                const int written = common_speculative_flush_prefill(pf_spec, pf.span.src_offset, pf.span.n_tokens);
                 if (written != pf.span.n_tokens) {
                     SRV_ERR("dflash prefill flush mismatch: slot=%d requested=%d written=%d src_offset=%d; disabling DFlash drafting until fresh hiddens are available\n",
                             pf.slot_id, pf.span.n_tokens, written, pf.span.src_offset);
-                    common_speculative_discard_dflash_state(spec.get(), "prefill flush mismatch");
-                    common_speculative_set_prefill_capture_enabled(spec.get(), false);
+                    common_speculative_discard_dflash_state(pf_spec, "prefill flush mismatch");
+                    common_speculative_set_prefill_capture_enabled(pf_spec, false);
                 }
             }
             llama_dflash_prefill_capture_end(ctx_tgt);
@@ -4047,7 +4146,7 @@ private:
                 slot.state = SLOT_STATE_GENERATING;
 
                 if (slot.can_speculate()) {
-                    common_speculative_begin(spec.get(), slot.id, slot.prompt.tokens.get_text_tokens());
+                    common_speculative_begin(slot.get_spec(), slot.get_seq_id(), slot.prompt.tokens.get_text_tokens());
                 }
             } else if (slot.state != SLOT_STATE_GENERATING) {
                 return;
@@ -4172,7 +4271,11 @@ private:
                     SLT_INF(slot, "accepted %2zu/%2zu draft tokens\n", accepted.size() - 1, n_draft);
                 }
 
-                common_speculative_accept(spec.get(), slot.id, accepted.size() - 1);
+                // set active slot for DFlash cross-attention ring write
+                if (params_base.speculative.has_type(COMMON_SPECULATIVE_TYPE_DFLASH)) {
+                    llama_dflash_set_active_slot(ctx_tgt, slot.id);
+                }
+                common_speculative_accept(slot.get_spec(), slot.get_seq_id(), accepted.size() - 1);
 
                 // DFlash: append the accepted tokens' hidden states to the cross-attention
                 // ring. The DFlash impl's accept() is a no-op; the append happens via
@@ -4180,7 +4283,7 @@ private:
                 // lines 6418/6420/6984). Without it the ring stays stale (committed_len
                 // never grows) -> cross-attention uses stale context -> garbled drafts
                 // (6.7% acceptance vs fork 34%).
-                common_speculative_update_logits_deferred_dflash_kv(spec.get(), ctx_tgt, accepted, accepted.size());
+                common_speculative_update_logits_deferred_dflash_kv(slot.get_spec(), ctx_tgt, accepted, accepted.size());
 
                 slot.spec_draft = std::move(accepted);
             }
