@@ -1291,6 +1291,15 @@ private:
             cparams.n_rs_seq  = 0;
             cparams.ctx_other = ctx_tgt;
 
+            // DFlash: set dflash_n_slots and dflash_cross_ctx so the drafter graph
+            // builds with the correct cross-attention width. Without these, the graph
+            // may not build the argmax tensor correctly and drafts are all token 0.
+            // (fork sets these in common_speculative_create_ctx_dft; merge was missing them.)
+            if (params_base.speculative.has_type(COMMON_SPECULATIVE_TYPE_DFLASH)) {
+                cparams.dflash_n_slots    = std::max(1, params_base.n_parallel);
+                cparams.dflash_cross_ctx  = params_base.speculative.dflash_cross_ctx;
+            }
+
             ctx_dft.reset(llama_init_from_model(model_dft.get(), cparams));
             if (ctx_dft == nullptr) {
                 SRV_ERR("%s", "failed to create draft context\n");
@@ -1427,6 +1436,31 @@ private:
                 if (needs_ctx_overload) {
                     // DFlash impl constructor calls llama_model_n_embd(params.model_dft).
                     params_base.speculative.model_dft = model_dft.get();
+                    // Share tensors between drafter and target model so the drafter's
+                    // lm_head (output weights) is the target's lm_head. Without this,
+                    // model.output is null and the graph uses a Q4_0 placeholder,
+                    // producing garbage logits -> all-zero argmax -> 6.7% acceptance.
+                    // (fork adb92b36a:2526 calls this; merge was missing it.)
+                    llama_model_share_tensors(model_dft.get(), llama_get_model(ctx_tgt));
+                    // Set cparams_dft so common_speculative_create_ctx_dft() creates the
+                    // drafter context with the correct params (argmax, logits, etc.).
+                    // Without this, cparams_dft is default-constructed and the drafter's
+                    // argmax buffer is all zeros -> drafts are all token 0 -> 6.7% acceptance.
+                    // (fork adb92b36a:2523 sets this; merge was missing it.)
+                    {
+                        common_params params_dft = params_base;
+                        if (has_draft) {
+                            const auto & params_spec = params_base.speculative.draft;
+                            params_dft.devices               = params_spec.devices;
+                            params_dft.model                 = params_spec.mparams;
+                            params_dft.n_gpu_layers          = params_spec.n_gpu_layers;
+                            params_dft.cache_type_k          = params_spec.cache_type_k;
+                            params_dft.cache_type_v          = params_spec.cache_type_v;
+                            params_dft.tensor_buft_overrides = params_spec.tensor_buft_overrides;
+                        }
+                        params_dft.n_outputs_max = params_base.n_parallel;
+                        params_base.speculative.cparams_dft = common_context_params_to_llama(params_dft);
+                    }
                     // Size dparams to n_parallel so dparams[slot.id] is in bounds for
                     // multi-slot servers (fork used per-slot specs; merge uses one spec).
                     spec.reset(common_speculative_init(params_base.speculative, ctx_tgt, ctx_dft.get(), params_base.n_parallel));
