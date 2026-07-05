@@ -747,3 +747,58 @@ verification.
    building, the verification, or the sampling?
 3. **Test `--spec-draft-n-max 1` with longer prompts** — verify it's a stable
    workaround.
+
+## HF-038: Quality regression root cause — n_outputs_max corrupts graph (2026-07-05)
+
+### PROVEN by extensive bisection
+
+1. `--spec-draft-n-max 1` (n_outputs_max=2) → **correct output** (all prompts, long generations)
+2. `--spec-draft-n-max 5` (n_outputs_max=6) → **garbled output** (regardless of n_draft_max cap)
+3. `--spec-draft-n-max 16` (n_outputs_max=17, default) → **garbled output** after ~20 tokens
+4. Capping `n_draft_max` to 5 does NOT help — the issue is `n_outputs_max` itself, not draft count
+5. The fork has `n_outputs_max=17` (same `server_n_outputs_max`) and **works correctly**
+6. DFlash impl, eval callback, output_reserve, server_n_outputs_max are all **identical** fork-vs-merge
+7. The crash when capping target n_outputs_max to 2: the target batch includes draft tokens with
+   `output=true` (lines 500-503), requiring `n_outputs_max >= n_draft + 1`
+
+### ROOT CAUSE
+
+The merge includes 342 upstream llama.cpp commits that the fork doesn't have. Something in these
+commits changed how the target context handles multiple output positions (n_outputs_max > 2).
+With n_outputs_max=2, the graph is simple and hidden states are correct. With n_outputs_max >= 6,
+the graph changes in a way that corrupts the hidden state capture, leading to garbled DFlash output.
+
+The exact upstream commit that introduced the regression has NOT been identified. Bisecting 342
+commits would be needed to find it.
+
+### WORKAROUND
+
+Use `--spec-draft-n-max 1` for correct DFlash output. This sets `n_outputs_max=2` which avoids
+the graph corruption. The downside is reduced speed (only 1 draft token per cycle, 60% acceptance).
+
+### What does NOT work
+
+- Capping `n_outputs_max` in `server_n_outputs_max` → crashes (target batch needs n_draft+1 outputs)
+- Capping `n_draft_max` to 5 → still garbled (n_outputs_max is still 17 from server_n_outputs_max)
+- `GGML_DFLASH_GPU_RING=0` (force CPU capture) → still garbled
+- Ring state save/load fix (HF-036) → correct but not the root cause
+- Per-slot spec vs shared spec → both garbled (regression is pre-existing)
+
+### Fork vs merge comparison (all identical)
+
+- `common_speculative_impl_dflash` class: identical (22 diff lines: n_seq + TODO stubs)
+- `dflash_eval_callback`: identical
+- `llama_context::output_reserve`: identical
+- `llama_context::set_dflash_capture`: identical
+- `llama_context::set_active_dflash_slot`: identical
+- `server_n_outputs_max`: identical (both return 17 for DFlash n_max=16)
+- `llama_context::decode` DFlash sections: identical (only line number offsets)
+
+### Next steps
+
+1. **Bisect 342 upstream commits** to find which one introduced the n_outputs_max graph corruption
+2. **Port the fork's adaptive profit controller** — starts with small drafts, grows based on
+   acceptance. This would keep n_outputs_max small initially, avoiding the corruption.
+3. **Use `--spec-draft-n-max 1` workaround** for now — correct output, reduced speed
+4. **Investigate the graph building** — compare the target's compute graph for n_outputs_max=2
+   vs n_outputs_max=17 to find the divergence

@@ -462,7 +462,6 @@ struct server_slot {
             n_draft_max = std::min(n_draft_max, n_remaining - 1);
         }
 
-        SLT_DBG(*this, "max possible draft: %d\n", n_draft_max);
 
         return n_draft_max;
     }
