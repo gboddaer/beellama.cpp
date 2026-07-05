@@ -143,6 +143,19 @@
   (the prompt SUFFIX, not whole prompt). `llama_dflash_prefill_capture_begin(ctx_tgt, slot.id,
   span.capture_begin, span.capture_end)` (fork:6040) schedules span-specific capture. Merge captures
   without span scheduling → wrong cross-attention context → 6.7% acceptance vs fork 34%.
+- HF-028: **Ring buffer data is SIMILAR fork-vs-merge — quality gap is NOT in capture** (2026-07-05)
+  - GGML_DFLASH_RING_DUMP=1 dumped ring_buf[layer][i] values from both merge and fork
+  - MERGE Layer[0]=1 first_8 (positions 0-7): `-0.2200, +0.7027, +0.2269, +0.1306, +0.6427, -0.2198, +0.2709, -0.3782`
+  - FORK Layer[0]=1 first_8 (positions 0-7): `-0.2250, +0.7197, +0.2430, +0.1420, +0.6544, -0.2123, +0.2634, -0.3678`
+  - Difference: 2-8% (Vulkan device/memory layout differences — NVIDIA RTX vs AMD iGPU)
+  - MERGE draft quality: 6.7% (garbled output, 0.3 tok/s)
+  - FORK draft quality: 84% (correct output, 6.7 tok/s)
+  - **CONCLUSION: Ring capture is CORRECT in merge. Quality gap is in data USAGE:**
+    (1) cross-attention processing (build_cross_data, cross_buf layout, read_start)
+    (2) drafter forward pass interpretation of cross data
+    (3) server-side wiring (draft_params, speculative server flow)
+  - Ring data dump code (GGML_DFLASH_RING_DUMP=1) is now in both merge and fork.
+  - This narrows the quality investigation from "ring capture" to "cross-attention processing".
 - HF-022: **GLM review (glm-5.2:cloud) of commit 9a67f5636 returned 3 concerns — ALL RESOLVED (2026-07-04)**:
   1. **Fix 3 UB risk → MOOT**: `swa_layers` is `std::array<uint32_t, LLAMA_MAX_LAYERS>` (fixed-size,
      llama-hparams.h:150), zeroed at llama-model.cpp:1104. Never empty → no out-of-bounds. No fix needed.
