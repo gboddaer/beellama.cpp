@@ -156,6 +156,36 @@
     (3) server-side wiring (draft_params, speculative server flow)
   - Ring data dump code (GGML_DFLASH_RING_DUMP=1) is now in both merge and fork.
   - This narrows the quality investigation from "ring capture" to "cross-attention processing".
+- HF-029: **GDB flow comparison merge vs fork — merge does 2.6x more draft cycles** (2026-07-05)
+  - GDB breakpoints traced function call counts for a single "What is 2+2?" request:
+    | Function           | Merge | Fork | Ratio |
+    |--------------------|-------|------|-------|
+    | DRAFT_CALL         | 16    | 6    | 2.6x  |
+    | MEM_SEQ_RM         | 113   | 23   | 4.9x  |
+    | ALIGN_DRAFTER      | 16    | 6    | 2.6x  |
+    | PREFILL_CAPTURE    | 32    | 12   | 2.6x  |
+    | BUILD_CROSS_DATA   | 0*    | 6    | —     |
+    | PREPARE_BATCH_DRAFT| 0     | 0    | —     |
+    | DRAFT_BATCH        | 0     | 0    | —     |
+    * Merge BUILD_CROSS_DATA=0: breakpoint didn't resolve (different symbol mangling)
+  - MEM_SEQ_RM per draft cycle: merge ~7 vs fork ~3.8 (merge does 2x more per cycle)
+  - Merge mem_seq_rm call sites (56 total): 39 from common_context_seq_rm→update_slots,
+    8 from update_drafter_kv_cache, 7 from common_speculative_draft, 7 from post_decode,
+    7 from pre_decode
+  - Fork mem_seq_rm call sites (23 total): 7 from update_drafter_kv_cache, 6 from
+    common_speculative_draft(6-arg)→draft(), 6 from common_context_seq_rm→update_slots
+  - **KEY: Merge uses 1-arg common_speculative_draft(spec.get()); fork uses 6-arg
+    common_speculative_draft(spec, params, prompt, id_last, log_probs, n_past)**
+  - Both use the SAME DFlash impl::draft() function (verified identical source)
+  - The extra merge calls are a SYMPTOM of low acceptance (more draft cycles needed),
+    NOT the root cause
+  - Tested switching to 6-arg common_speculative_draft: quality UNCHANGED (5.6% vs 6.7%),
+    REVERTED. The 1-arg vs 6-arg difference is NOT the quality cause.
+  - Fork speed: 32.1 tok/s, correct output; Merge speed: 4.2 tok/s, garbled output
+  - **CONCLUSION: Quality gap is NOT in server-side draft invocation (1-arg vs 6-arg).
+    The gap is in the DRAFT CONTENT — the drafter produces wrong tokens given the same
+    cross-attention data. Next: investigate drafter graph/forward pass differences
+    (dflash_draft.cpp, cross-attention consumption in the drafter graph).**
 - HF-022: **GLM review (glm-5.2:cloud) of commit 9a67f5636 returned 3 concerns — ALL RESOLVED (2026-07-04)**:
   1. **Fix 3 UB risk → MOOT**: `swa_layers` is `std::array<uint32_t, LLAMA_MAX_LAYERS>` (fixed-size,
      llama-hparams.h:150), zeroed at llama-model.cpp:1104. Never empty → no out-of-bounds. No fix needed.
