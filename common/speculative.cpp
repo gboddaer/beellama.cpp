@@ -3154,6 +3154,14 @@ struct common_speculative_impl_dflash : public common_speculative_impl {
                 continue;
             }
 
+            if (enable_kv_trace) {
+                auto * mem_dft_post_decode = llama_get_memory(ctx_dft);
+                llama_pos pos_max_decode = llama_memory_seq_pos_max(mem_dft_post_decode, seq_id);
+                llama_pos pos_min_decode = llama_memory_seq_pos_min(mem_dft_post_decode, seq_id);
+                LOG_INF("[DFLASH_KV_TRACE] seq=%d AFTER  decode: committed_len=%d batch_len=%d dft pos_min=%d pos_max=%d\n",
+                    seq_id, committed_len, batch_len, (int)pos_min_decode, (int)pos_max_decode);
+            }
+
             const int64_t t3 = ggml_time_us();
 
             // read argmax tokens for positions 1..batch_len-1 (skip position 0 = staged_first)
