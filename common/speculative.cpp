@@ -3061,9 +3061,30 @@ struct common_speculative_impl_dflash : public common_speculative_impl {
 
             const int64_t t0 = ggml_time_us();
 
+            // KV cache state logging for merge-vs-fork comparison
+            static const bool enable_kv_trace = [] {
+                const char * env = std::getenv("GGML_DFLASH_KV_TRACE");
+                return env && std::atoi(env) != 0;
+            }();
+            if (enable_kv_trace) {
+                auto * mem_dft_pre = llama_get_memory(ctx_dft);
+                llama_pos pos_max_pre = llama_memory_seq_pos_max(mem_dft_pre, seq_id);
+                llama_pos pos_min_pre = llama_memory_seq_pos_min(mem_dft_pre, seq_id);
+                LOG_INF("[DFLASH_KV_TRACE] seq=%d BEFORE draft: committed_len=%d ring_filled=%d dft pos_min=%d pos_max=%d\n",
+                    seq_id, committed_len, ring_filled, (int)pos_min_pre, (int)pos_max_pre);
+            }
+
             flush_deferred_drafter_kv_cache("flat draft");
             llama_memory_seq_rm(llama_get_memory(ctx_dft), seq_id, committed_len, -1);
             common_dflash_align_drafter_seq_or_clear(ctx_dft, seq_id, committed_len, "flat draft");
+
+            if (enable_kv_trace) {
+                auto * mem_dft_post = llama_get_memory(ctx_dft);
+                llama_pos pos_max_post = llama_memory_seq_pos_max(mem_dft_post, seq_id);
+                llama_pos pos_min_post = llama_memory_seq_pos_min(mem_dft_post, seq_id);
+                LOG_INF("[DFLASH_KV_TRACE] seq=%d AFTER  rm+align: committed_len=%d dft pos_min=%d pos_max=%d\n",
+                    seq_id, committed_len, (int)pos_min_post, (int)pos_max_post);
+            }
 
             int cross_len = build_cross_data(ctx_dft);
             if (common_dflash_rx_diag_enabled()) {
