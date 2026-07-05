@@ -1154,7 +1154,14 @@ private:
                     measure_model_bytes = false;
                 }
 
-                params_dft.n_outputs_max = params_base.n_parallel;
+                // Drafter needs output positions for all draft tokens.
+                // (n_outputs_max = n_parallel is too small; crash in output_reserve
+                // when DFlash draft generates block_size=16 tokens).
+                // Also cap at 1+n_max for DFlash to avoid the n_outputs_max corruption
+                // issue (HF-037: large target n_outputs_max corrupts output).
+                params_dft.n_outputs_max = std::max<uint32_t>(
+                    (uint32_t)params_base.n_parallel,
+                    (uint32_t)(1 + common_speculative_n_max(&params_base.speculative)));
 
                 auto mparams_dft = common_model_params_to_llama(params_dft);
                 auto cparams_dft = common_context_params_to_llama(params_dft);
@@ -1315,6 +1322,10 @@ private:
             if (params_base.speculative.has_type(COMMON_SPECULATIVE_TYPE_DFLASH)) {
                 cparams.dflash_n_slots    = std::max(1, params_base.n_parallel);
                 cparams.dflash_cross_ctx  = params_base.speculative.dflash_cross_ctx;
+                // Ensure drafter has enough output positions for DFlash block_size drafts.
+                // (params_dft.n_outputs_max may have been copied from params_base which
+                // could be capped by server_n_outputs_max for DFlash.)
+                cparams.n_outputs_max = std::max<uint32_t>(cparams.n_outputs_max, 17);
             }
 
             ctx_dft.reset(llama_init_from_model(model_dft.get(), cparams));
