@@ -228,6 +228,23 @@
     2.6x more draft calls) → GLM review (HF-030, KV cache suspect) → KV trace (pos_max
     differences, symptom) → token trace (all zeros, smoking gun) → graph comparison
     (identical) → share_tensors missing (root cause).
+- HF-032: **Profit controller is NOT the remaining quality gap** (2026-07-05)
+  - Tested capping n_draft_max=4 (matching fork's adaptive profit controller output_len=5):
+    - Acceptance DROPPED to 50% (was 55.6% with n_draft=15)
+    - Speed DROPPED to 13.0 tok/s (was 19.4 tok/s)
+    - **n_draft=4 is WORSE than n_draft=15 for the merge** — disproves hypothesis
+  - Token trace comparison (n_draft=4, same id_last=90700):
+    - MERGE: first_draft_ids=[8340,25,271,16]
+    - FORK:  first_draft_ids=[1817,25,271,16]
+    - Position 1 DIFFERS (8340 vs 1817); positions 2-4 match (25, 271, 16)
+  - committed_len DIFFERS: merge=17, fork=20 (3-token prefill capture difference)
+  - **CONCLUSION: The remaining 55.6%→84% gap is NOT the profit controller.**
+    The gap is the drafter producing DIFFERENT predictions (position 1: 8340 vs 1817)
+    due to different cross-attention context (committed_len 17 vs 20).
+  - n_draft=15 (merge default, capped by block_size-1) gives 55.6% — this IS the
+    merge's optimal n_draft. The profit controller would settle on 15 too.
+  - Full profit controller port would NOT close the gap. Next: investigate the
+    committed_len 17 vs 20 prefill capture difference.
 - HF-022: **GLM review (glm-5.2:cloud) of commit 9a67f5636 returned 3 concerns — ALL RESOLVED (2026-07-04)**:
   1. **Fix 3 UB risk → MOOT**: `swa_layers` is `std::array<uint32_t, LLAMA_MAX_LAYERS>` (fixed-size,
      llama-hparams.h:150), zeroed at llama-model.cpp:1104. Never empty → no out-of-bounds. No fix needed.
