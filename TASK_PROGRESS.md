@@ -636,3 +636,61 @@ Next: verify swa_layers type; if vector add guard; verify 3-arg overload dispatc
 3. **Compare fork vs merge `set_dflash_capture` more carefully** — there might be a subtle difference
 4. **Check if the graph cache is being invalidated correctly** when DFlash capture is enabled
 5. **Read the fork's `flush_prefill` implementation** to understand GPU vs CPU hidden state reading
+
+## HF-036: LESSON — Longer tests needed for certainty (2026-07-05)
+
+### Methodological failure
+
+Throughout HF-034..HF-035, single-slot DFlash was declared "WORKING" based on
+short tests (max_tokens=20-40). This gave **false confidence**. The first 10-20
+tokens of DFlash output are often correct (matching the target model's logits
+before drafts diverge), but longer generations reveal quality degradation.
+
+### Evidence
+
+When tested with longer prompts (max_tokens=200-400) that allow the model to
+complete reasoning AND produce a final answer:
+
+| Prompt | max_tokens | Non-DFlash | Fork DFlash | Merge DFlash |
+|--------|-----------|-----------|------------|-------------|
+| "Capital of France?" | 200 | ✅ "The capital of France is Paris." | ✅ "The capital of France is Paris." | ❌ Garbled: "onally ies7., - for :.div" |
+| "15 * 23 step by step" | 300 | ✅ Coherent step-by-step | ✅ Coherent | ❌ Garbled after first line |
+| "Reverse a string" | 400 | ✅ Coherent reasoning | (not tested) | ❌ Garbled: "githubusercontent the the with" |
+
+- **Non-DFlash merge**: perfect, coherent, complete answers
+- **Fork DFlash**: perfect, coherent, complete answers (26.7% acceptance, stable)
+- **Merge DFlash**: garbled after first few tokens, 13.5% acceptance (degrading)
+
+### Root implication
+
+The merge's single-slot DFlash has a **quality regression** that was hidden by
+short tests. The fork's DFlash produces correct long output. The merge's does
+not. This is NOT a fundamental DFlash limitation — it's a merge-specific bug.
+
+The acceptance rate degrades over time (29.3% → 13.5% across requests),
+suggesting ring buffer corruption or draft quality degradation.
+
+### Rule going forward
+
+**ALWAYS test with prompts long enough for the model to complete its answer
+(max_tokens >= 200, ideally 400+).** Short tests (max_tokens < 50) only verify
+the first few tokens and can mask quality regressions. A DFlash implementation
+is only "working" if it produces correct, coherent output for full-length
+generations, not just the first 20 tokens.
+
+### Current state
+
+- **Non-DFlash merge**: ✅ stable, correct output (base reference)
+- **Fork DFlash**: ✅ stable, correct output (working reference)
+- **Merge DFlash single-slot**: ❌ quality regression (garbled after first few tokens)
+- **Merge DFlash multi-slot**: ❌ garbled output (same issue, more severe)
+
+The single-slot quality regression is the **primary blocker**. Multi-slot cannot
+be fixed until single-slot produces correct long output.
+
+### Next diagnostic
+
+Testing whether per-slot spec creation (vs shared spec) causes the regression:
+- Temporary change: single-slot DFlash uses shared spec (like original merge)
+- If output corrects → per-slot spec creation is the cause
+- If still garbled → regression was pre-existing (introduced earlier in merge)

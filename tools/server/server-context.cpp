@@ -1494,7 +1494,8 @@ private:
                     }
                     // Non-DFlash fork types (SUFFIX, COPYSPEC, RECYCLE) use a single shared spec.
                     // DFlash creates per-slot specs below in the slot init loop.
-                    if (!is_dflash) {
+                    // TEMPORARY TEST: single-slot DFlash uses shared spec to check quality regression.
+                    if (!is_dflash || params_base.n_parallel == 1) {
                         spec.reset(common_speculative_init(params_base.speculative, ctx_tgt, ctx_dft.get(), params_base.n_parallel));
                     }
                 } else {
@@ -1539,7 +1540,9 @@ private:
 
             // DFlash: each slot gets its own spec (per-slot ring/capture/seq_id).
             // Non-DFlash: use the shared context-level spec.
-            const bool slot_dflash = is_dflash && i < dflash_slots_cap;
+            // TEMPORARY TEST: use shared spec for single-slot DFlash to check if
+            // per-slot spec creation causes the quality regression.
+            const bool slot_dflash = is_dflash && i < dflash_slots_cap && params_base.n_parallel > 1;
             if (slot_dflash) {
                 try {
                     slot.spec.reset(common_speculative_init(
