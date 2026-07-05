@@ -3857,6 +3857,9 @@ private:
         std::vector<pending_dflash_prefill_flush> pending_prefill_flushes;
         bool dflash_capture_needed_for_view = false;
 
+        // TEMPORARILY DISABLED: prefill capture scheduling for multi-slot DFlash
+        // to isolate garbled output. If output is correct with this disabled,
+        // the prefill capture scheduling is the cause of the garbled output.
         if (params_base.speculative.has_type(COMMON_SPECULATIVE_TYPE_DFLASH)) {
             // First pass: is any GENERATING DFlash slot in this view? (capture must stay on for them)
             for (const auto & slot : slots) {
