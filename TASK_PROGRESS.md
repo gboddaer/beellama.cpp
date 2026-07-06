@@ -802,3 +802,63 @@ the graph corruption. The downside is reduced speed (only 1 draft token per cycl
 3. **Use `--spec-draft-n-max 1` workaround** for now — correct output, reduced speed
 4. **Investigate the graph building** — compare the target's compute graph for n_outputs_max=2
    vs n_outputs_max=17 to find the divergence
+
+## HF-039: ROOT CAUSE — GPU-embedded hidden capture broken in merge (2026-07-05)
+
+### BREAKTHROUGH: Two hidden state capture paths identified
+
+The merge has TWO paths for capturing hidden states from the target context:
+
+1. **Eval callback path** (CPU): `dflash_eval_callback` writes to `layer_hiddens` (CPU).
+   - Active when `dflash_graph_hidden_ready = false` (i.e., `hidden_gpu` is empty)
+   - Works correctly with `--spec-draft-n-max 1` (n_outputs_max=2, 2 hidden states)
+   - Garbled with n_outputs_max > 2 (too many hidden states from draft positions)
+
+2. **GPU-embedded path** (GPU): graph-embedded copies to `hidden_gpu` (GPU buffers).
+   - Active when `dflash_graph_hidden_ready = true` (i.e., `hidden_gpu` is allocated)
+   - `dflash_graph_hidden_ready = !hidden_gpu.empty() && gpu_capture_ready && ...`
+   - When active: eval callback is DISABLED (`cparams.cb_eval = nullptr`, line 7049)
+   - **BROKEN in the merge** — produces 6.1% acceptance, garbled output at ALL n_max values
+
+### Key evidence
+
+| `hidden_gpu` allocated? | Capture path | n_max=1 | n_max=16 |
+|--------------------------|-------------|---------|---------|
+| No (merge, `>1` guard)   | Eval callback | ✅ 60% accept, correct | ❌ 43% accept, garbled |
+| Yes (merge, unconditional)| GPU-embedded | ❌ 6% accept, garbled | ❌ 6% accept, garbled |
+| Yes (fork, unconditional) | GPU-embedded | ✅ 26% accept, correct | ✅ 26% accept, correct |
+
+### Why the fork works
+
+The fork calls `llama_dflash_allocate_slots(ctx_tgt, dflash_slots_cap)` unconditionally
+(even for single-slot, dflash_slots_cap=1). This allocates `hidden_gpu`, enabling
+`dflash_graph_hidden_ready = true`, which disables the eval callback and uses the
+GPU-embedded path. The fork's GPU-embedded path works correctly.
+
+The merge's GPU-embedded path is **broken** — the 342 upstream commits changed the
+graph building in a way that corrupts the GPU-embedded hidden state capture.
+
+### Root cause chain
+
+1. `allocate_tape_gpu(1, ...)` allocates `hidden_gpu` with 1 entry
+2. `dflash_graph_hidden_ready = !hidden_gpu.empty() && ...` = true
+3. `dflash_skip_eval_callback = dflash_graph_hidden_ready || ...` = true
+4. `cparams.cb_eval = nullptr` (eval callback disabled, line 7049)
+5. Graph uses GPU-embedded hidden capture (copies to `hidden_gpu`)
+6. **The GPU-embedded capture produces wrong hidden states in the merge** (342 upstream commits)
+7. Wrong hidden states → wrong cross-attention → wrong drafts → garbled output
+
+### Current workaround
+
+`--spec-draft-n-max 1` + `dflash_slots_cap > 1` guard:
+- Uses eval callback path (hidden_gpu not allocated for single-slot)
+- n_outputs_max=2 → only 2 hidden states captured → minimal corruption
+- Correct output, 60% acceptance, reduced speed
+
+### Next steps
+
+1. **Diff `allocate_hidden_gpu` and graph building** between fork and merge to find
+   what the 342 upstream commits changed in the GPU-embedded capture path
+2. **GDB comparison** of `hidden_gpu` contents between fork and merge after decode
+3. **Check if the graph builder** (`src/models/`) handles `hidden_gpu_seqs` differently
+   in the merge vs fork
