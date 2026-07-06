@@ -6948,8 +6948,16 @@ int llama_context::decode(const llama_batch & batch_inp) {
                         dflash_capture_n_tokens <= LLAMA_DFLASH_MAX_VERIFY_TOKENS;
                     const int tape_ns = dflash_graph_tape_ready ? ns : 0;
                     const int prev_tape_ns = cparams.tape_gpu_n_seqs;
+                    const int prev_hidden_ns = cparams.hidden_gpu_n_seqs;
 
                     bool seqs_changed = (tape_ns != prev_tape_ns);
+                    // Invalidate graph when hidden_gpu_n_seqs changes (0→1 transition
+                    // from prefill to generation). Without this, the graph is cached
+                    // from prefill (no hidden_gpu copy in qwen35.cpp graph builder)
+                    // and reused for generation, so hidden_gpu stays empty (HF-039/040).
+                    if (prev_hidden_ns != cparams.hidden_gpu_n_seqs) {
+                        seqs_changed = true;
+                    }
 
                     for (int s = 0; s < ns; ++s) {
                         const llama_seq_id seq = ubatch.seq_id_unq[s];

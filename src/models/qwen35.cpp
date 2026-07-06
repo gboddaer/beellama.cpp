@@ -1,4 +1,5 @@
 #include "models.h"
+#include "llama-context.h"
 #include "llama-memory-recurrent.h"
 
 void llama_model_qwen35::load_arch_hparams(llama_model_loader & ml) {
@@ -200,6 +201,44 @@ llama_model_qwen35::graph::graph(const llama_model & model, const llm_graph_para
 
         cur = build_cvec(cur, il);
         cb(cur, "l_out", il);
+
+        // DFlash GPU-embedded hidden state capture (ported from fork adb92b36a:222-253).
+        // When hidden_gpu is allocated (via llama_dflash_allocate_slots), the graph
+        // embeds copies of layer outputs to hidden_gpu buffers. Without this, hidden_gpu
+        // stays empty and the GPU-embedded capture path produces garbage (HF-039).
+        const int64_t dflash_capture_n_seqs_dfl =
+            ubatch.n_seqs_unq > 1 ? (int64_t) ubatch.n_seqs_unq : 1;
+        const int64_t dflash_capture_n_tokens_dfl =
+            ubatch.n_seqs_unq > 1 ? (int64_t) ubatch.n_seq_tokens : (int64_t) ubatch.n_tokens;
+        if (cparams.hidden_gpu_n_seqs > 0 &&
+            cur->ne[1] == dflash_capture_n_tokens_dfl * dflash_capture_n_seqs_dfl) {
+            for (int s = 0; s < (int) dflash_capture_n_seqs_dfl && s < cparams.hidden_gpu_n_seqs; ++s) {
+                auto * hgpu = cparams.hidden_gpu_seqs[s];
+                if (!hgpu) {
+                    continue;
+                }
+
+                int hi = -1;
+                for (int i = 0; i < (int) hgpu->layer_ids.size(); ++i) {
+                    if (hgpu->layer_ids[i] == il) {
+                        hi = i;
+                        break;
+                    }
+                }
+                if (hi < 0 || dflash_capture_n_tokens_dfl > hgpu->max_tokens) {
+                    continue;
+                }
+
+                ggml_tensor * h_slice = ggml_view_2d(ctx0, cur,
+                    cur->ne[0], dflash_capture_n_tokens_dfl,
+                    cur->nb[1],
+                    (size_t) s * (size_t) dflash_capture_n_tokens_dfl * cur->nb[1]);
+                ggml_tensor * h_dst = ggml_view_2d(ctx0, hgpu->layers[hi],
+                    hgpu->layers[hi]->ne[0], (int64_t) dflash_capture_n_tokens_dfl,
+                    hgpu->layers[hi]->nb[1], 0);
+                ggml_build_forward_expand(gf, ggml_cpy(ctx0, h_slice, h_dst));
+            }
+        }
 
         // Input for next layer
         inpL = cur;

@@ -862,3 +862,56 @@ graph building in a way that corrupts the GPU-embedded hidden state capture.
 2. **GDB comparison** of `hidden_gpu` contents between fork and merge after decode
 3. **Check if the graph builder** (`src/models/`) handles `hidden_gpu_seqs` differently
    in the merge vs fork
+
+## HF-040: DFlash GPU-embedded hidden capture port + graph invalidation (2026-07-05)
+
+### Ported from fork to merge
+
+1. **qwen35.cpp DFlash hidden_gpu capture code** — Ported the fork's graph builder
+   code that copies layer outputs to `hidden_gpu` buffers during the forward pass.
+   Without this, `hidden_gpu` stays empty even when allocated, and the GPU-embedded
+   capture path produces garbage (HF-039). Added `#include "llama-context.h"` for
+   `dflash_hidden_gpu` struct access.
+
+2. **Graph invalidation for hidden_gpu_n_seqs** — Added check in
+   `process_ubatch()` to invalidate `gf_res_prev` when `hidden_gpu_n_seqs` changes
+   (0→1 transition from prefill to generation). Without this, the graph is cached
+   from prefill (no hidden_gpu copy) and reused for generation.
+
+3. **`llama_dflash_allocate_slots` unconditional** — Changed from `dflash_slots_cap > 1`
+   to `dflash_slots_cap > 0` so `hidden_gpu` is allocated even for single-slot,
+   enabling the GPU-embedded path.
+
+### Results
+
+- The graph builder DOES execute the hidden_gpu copy code (confirmed with
+  DFLASH_LAYER_OUT diagnostic: 448 lines with `hidden_n_seqs=1` out of 1344 total)
+- With `LLAMA_GRAPH_REUSE_DISABLE=1`: acceptance improved to 62.5% (from 43.8%)
+- Without graph reuse disabled: output STILL garbled (43.8% acceptance, same as before)
+- The graph is cached from prefill (`hidden_n_seqs=0`) and `can_reuse` does NOT
+  detect the change on subsequent decodes
+
+### Remaining issue
+
+The `can_reuse` check at line 6072 compares `gparams.cparams.hidden_gpu_n_seqs` with
+the previous `gparams.cparams.hidden_gpu_n_seqs`. On the second decode, `graph_params`
+copies `cparams.hidden_gpu_n_seqs` which should be 1 (set during the first decode's
+DFlash setup). But the DFLASH_UBATCH_ENTRY diagnostic showed the value alternates
+between 0 and 1, suggesting `hidden_gpu_n_seqs` is reset to 0 between calls.
+
+The root cause is likely that `process_ubatch()` resets `cparams.hidden_gpu_n_seqs = 0`
+at line 6660 (start of the DFlash setup), but `graph_params` at line 6067 runs BEFORE
+this reset, copying the value from the PREVIOUS call's end state. The alternation
+suggests some calls don't set `hidden_gpu_n_seqs = 1` (e.g., prefill calls with
+`dflash_graph_hidden_ready = false`).
+
+### Graphify comparison (HF-038 supplement)
+
+Built knowledge graphs for both fork and merge using graphify:
+- Fork: 40495 nodes, 107782 edges, 972 communities
+- Merge: 42404 nodes, 111103 edges, 1069 communities
+- DFlash nodes: 698 (fork) vs 750 (merge), 643 common
+- Fork-only: 55 nodes (renamed classes, missing helpers like apply_dflash_effective_defaults)
+- Merge-only: 107 nodes (new conversion, profile functions, renamed DFlash classes)
+- The missing functions (apply_dflash_effective_defaults, reset_dflash_only_args) have
+  equivalent defaults in the merge's struct definition, so they're not the root cause.

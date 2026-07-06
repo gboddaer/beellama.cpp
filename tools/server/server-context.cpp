@@ -1593,13 +1593,13 @@ private:
         // Without this, layer_hiddens.size()=1 and slots > 0 get "out of range" warnings
         // and no hidden state capture -> empty ring buffer -> 0 drafts.
         // (fork adb92b36a:2814 calls this; merge was missing it.)
-        // Only call for multi-slot; single-slot already has layer_hiddens.size()=1.
-        // Only call for multi-slot; calling with 1 breaks single-slot quality
+        //
+        //
         // because the GPU-embedded hidden capture path is broken in the merge
         // (342 upstream commits changed the graph building for hidden_gpu).
-        // With hidden_gpu empty, the eval callback path is used, which works
-        // correctly with --spec-draft-n-max 1 (n_outputs_max=2).
-        if (dflash_slots_cap > 1) {
+        //dflash_slots_cap > 0) {
+        //
+        if (dflash_slots_cap > 0) {
             llama_dflash_allocate_slots(ctx_tgt, dflash_slots_cap);
         }
 
