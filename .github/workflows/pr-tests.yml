@@ -1,0 +1,48 @@
+name: PR Tests
+
+on:
+  pull_request:
+    branches:
+      - main
+  push:
+    branches:
+      - fix/vulkan-dflash-ring-bounds
+
+permissions:
+  contents: read
+
+jobs:
+  dflash-vulkan:
+    name: DFlash unit tests + Vulkan compile
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Install Vulkan build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            build-essential \
+            cmake \
+            ninja-build \
+            glslc \
+            libvulkan-dev \
+            vulkan-tools
+
+      - name: Configure Vulkan build
+        run: |
+          cmake -S . -B build-ci \
+            -G Ninja \
+            -DGGML_VULKAN=ON \
+            -DGGML_NATIVE=OFF \
+            -DLLAMA_BUILD_TESTS=ON \
+            -DCMAKE_BUILD_TYPE=Release
+
+      - name: Build Vulkan backend and DFlash tests
+        run: |
+          cmake --build build-ci --target ggml-vulkan test-dflash-ring test-dflash-plumbing
+
+      - name: Run DFlash unit tests
+        run: |
+          ctest --test-dir build-ci --output-on-failure -R 'test-dflash-(ring|plumbing)'
