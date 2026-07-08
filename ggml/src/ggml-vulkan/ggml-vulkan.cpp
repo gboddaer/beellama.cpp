@@ -17141,26 +17141,43 @@ static bool dflash_vk_ring_debug_enabled() {
 }
 #define DFLASH_VK_RING_DBG(fmt, ...) do { if (dflash_vk_ring_debug_enabled()) fprintf(stderr, "[dflash-vk-ring] " fmt "\n", ##__VA_ARGS__); } while (0)
 
-// Tiny registry of our own staging buffers (keyed on bda_addr) so set_tensor_tensor can
-// resolve a raw src ptr (a real device address) back to the staging vk_buffer.
+// Tiny registry of our own staging buffers (keyed on BDA ranges) so set_tensor_tensor can
+// resolve a raw src ptr (possibly an interior device address) back to the staging vk_buffer.
+struct dflash_vk_staging_entry {
+    vk::DeviceAddress base = 0;
+    size_t size = 0;
+    vk_buffer buffer;
+};
+struct dflash_vk_staging_ref {
+    vk_buffer buffer;
+    size_t offset = 0;
+};
 static std::mutex g_dflash_vk_staging_mtx;
-static std::vector<std::pair<vk::DeviceAddress, vk_buffer>> g_dflash_vk_staging;
+static std::vector<dflash_vk_staging_entry> g_dflash_vk_staging;
 static void dflash_vk_staging_register(vk_buffer & b) {
-    if (!b || b->bda_addr == 0) return;
+    if (!b || b->bda_addr == 0 || b->size == 0) return;
     std::lock_guard<std::mutex> lk(g_dflash_vk_staging_mtx);
-    g_dflash_vk_staging.emplace_back(b->bda_addr, b);
+    g_dflash_vk_staging.push_back({ b->bda_addr, b->size, b });
 }
 static void dflash_vk_staging_unregister(vk::DeviceAddress addr) {
     if (addr == 0) return;
     std::lock_guard<std::mutex> lk(g_dflash_vk_staging_mtx);
     for (auto it = g_dflash_vk_staging.begin(); it != g_dflash_vk_staging.end(); ++it) {
-        if (it->first == addr) { g_dflash_vk_staging.erase(it); return; }
+        if (it->base == addr) { g_dflash_vk_staging.erase(it); return; }
     }
 }
-static vk_buffer dflash_vk_staging_resolve(vk::DeviceAddress addr) {
+static dflash_vk_staging_ref dflash_vk_staging_resolve(vk::DeviceAddress addr) {
     std::lock_guard<std::mutex> lk(g_dflash_vk_staging_mtx);
-    for (auto & e : g_dflash_vk_staging) if (e.first == addr) return e.second;
-    return nullptr;
+    for (auto & e : g_dflash_vk_staging) {
+        if (addr >= e.base && addr - e.base < e.size) {
+            return { e.buffer, (size_t)(addr - e.base) };
+        }
+    }
+    return {};
+}
+
+static bool dflash_vk_span_in_bounds(const vk_buffer & b, size_t offset, size_t size) {
+    return b && offset <= b->size && size <= b->size - offset;
 }
 
 extern "C" void * dflash_cross_ring_gpu_alloc_device(int dev_idx, int n_layers, int n_embd, int ring_size) {
@@ -17205,15 +17222,36 @@ extern "C" void dflash_cross_ring_gpu_free(void * handle) {
 extern "C" void dflash_cross_ring_gpu_write(void * handle, int layer, int ring_pos, const float * data, int n_tokens, int n_embd) {
     if (!handle || !data || n_tokens <= 0 || n_embd <= 0) return;
     auto * ring = (dflash_cross_ring_vk *)handle;
-    if (layer < 0 || layer >= ring->n_layers || n_embd != ring->n_embd) { DFLASH_VK_RING_DBG("write: reject layer=%d n_embd=%d (ring n_layers=%d n_embd=%d)", layer, n_embd, ring->n_layers, ring->n_embd); return; }
+    if (layer < 0 || layer >= ring->n_layers || n_embd != ring->n_embd || ring->ring_size <= 0) { DFLASH_VK_RING_DBG("write: reject layer=%d n_embd=%d (ring n_layers=%d n_embd=%d ring_size=%d)", layer, n_embd, ring->n_layers, ring->n_embd, ring->ring_size); return; }
     DFLASH_VK_RING_DBG("write layer=%d ring_pos=%d n_tokens=%d n_embd=%d uma=%d", layer, ring_pos, n_tokens, n_embd, (int)ring->uma_host_visible);
-    size_t off  = ((size_t)layer * ring->ring_size + ring_pos) * ring->n_embd * sizeof(float);
-    size_t bytes = (size_t)n_tokens * n_embd * sizeof(float);
-    if (ring->uma_host_visible && ring->rings->ptr) {
-        memcpy((uint8_t*)ring->rings->ptr + off, data, bytes);
-    } else {
-        ggml_vk_buffer_write(ring->rings, off, data, bytes);
+
+    int pos = ring_pos % ring->ring_size;
+    if (pos < 0) pos += ring->ring_size;
+    if (n_tokens > ring->ring_size) {
+        const int skip = n_tokens - ring->ring_size;
+        data += (size_t)skip * n_embd;
+        pos = (pos + skip) % ring->ring_size;
+        n_tokens = ring->ring_size;
     }
+
+    const size_t stride = (size_t)n_embd * sizeof(float);
+    const int first = std::min(n_tokens, ring->ring_size - pos);
+    auto write_span = [&](int dst_pos, const float * src, int ntok) {
+        if (ntok <= 0) return;
+        const size_t off = ((size_t)layer * ring->ring_size + (size_t)dst_pos) * ring->n_embd * sizeof(float);
+        const size_t bytes = (size_t)ntok * stride;
+        if (!dflash_vk_span_in_bounds(ring->rings, off, bytes)) {
+            DFLASH_VK_RING_DBG("write: reject OOB layer=%d dst_pos=%d ntok=%d off=%zu bytes=%zu ring_bytes=%zu", layer, dst_pos, ntok, off, bytes, ring->rings ? ring->rings->size : 0);
+            return;
+        }
+        if (ring->uma_host_visible && ring->rings->ptr) {
+            memcpy((uint8_t*)ring->rings->ptr + off, src, bytes);
+        } else {
+            ggml_vk_buffer_write(ring->rings, off, src, bytes);
+        }
+    };
+    write_span(pos, data, first);
+    write_span(0, data + (size_t)first * n_embd, n_tokens - first);
 }
 extern "C" void dflash_cross_ring_gpu_synchronize(void * handle) {
     if (!handle) return;
@@ -17229,6 +17267,7 @@ extern "C" bool dflash_cross_ring_gpu_snapshot(void * handle, int write_pos, int
     if (cross_len > ring->ring_size) cross_len = ring->ring_size;
     if (n_tokens != cross_len) return false;
     if (cross_len == 0) return true;
+    if (!dflash_vk_span_in_bounds(ring->rings, 0, (size_t)ring->ring_size * ring->n_layers * ring->n_embd * sizeof(float))) return false;
     int read_start = ((write_pos - cross_len) % ring->ring_size + ring->ring_size) % ring->ring_size;
     DFLASH_VK_RING_DBG("snapshot write_pos=%d filled=%d ctx_window=%d cross_len=%d read_start=%d", write_pos, filled, ctx_window, cross_len, read_start);
     // D2H the whole rings buffer once, then layer-major copy with wrap on the host.
@@ -17253,7 +17292,10 @@ extern "C" const float * dflash_cross_ring_gpu_interleave(void * handle, int wri
     if (!handle) return nullptr;
     auto * ring = (dflash_cross_ring_vk *)handle;
     int cross_len = filled < ctx_window ? filled : ctx_window;
+    if (cross_len > ring->ring_size) cross_len = ring->ring_size;
     if (cross_len <= 0) return nullptr;
+    if (!dflash_vk_span_in_bounds(ring->staging, 0, (size_t)cross_len * ring->n_layers * ring->n_embd * sizeof(float))) return nullptr;
+    if (!dflash_vk_span_in_bounds(ring->rings, 0, (size_t)ring->ring_size * ring->n_layers * ring->n_embd * sizeof(float))) return nullptr;
     int read_start = ((write_pos - cross_len) % ring->ring_size + ring->ring_size) % ring->ring_size;
     DFLASH_VK_RING_DBG("interleave write_pos=%d filled=%d ctx_window=%d cross_len=%d read_start=%d n_layers=%d", write_pos, filled, ctx_window, cross_len, read_start, ring->n_layers);
     // GPU-side interleave: record one vkCmdCopyBuffer per (token, layer) slice into the
@@ -17269,6 +17311,10 @@ extern "C" const float * dflash_cross_ring_gpu_interleave(void * handle, int wri
         for (int l = 0; l < ring->n_layers; ++l) {
             size_t src_off = ((size_t)l * ring->ring_size + slot) * ring->n_embd * sizeof(float);
             size_t dst_off = ((size_t)t * ring->n_layers + l) * ring->n_embd * sizeof(float);
+            if (!dflash_vk_span_in_bounds(ring->rings, src_off, bytes) || !dflash_vk_span_in_bounds(ring->staging, dst_off, bytes)) {
+                DFLASH_VK_RING_DBG("interleave: reject OOB t=%d layer=%d src_off=%zu dst_off=%zu bytes=%zu", t, l, src_off, dst_off, bytes);
+                continue;
+            }
             ggml_vk_buffer_copy_async(subctx, ring->staging, dst_off, ring->rings, src_off, bytes);
         }
     }
@@ -17305,8 +17351,9 @@ extern "C" bool dflash_vk_backend_wait_for_stream(ggml_backend_t backend) {
 extern "C" void dflash_cross_ring_gpu_set_tensor_tensor(ggml_tensor * dst, const void * src, size_t offset, size_t size) {
     if (!dst || !src || size == 0 || !dst->buffer) return;
     vk::DeviceAddress src_addr = (vk::DeviceAddress)(uintptr_t)src;
-    vk_buffer src_buf = dflash_vk_staging_resolve(src_addr);
-    if (!src_buf) return;
+    dflash_vk_staging_ref src_ref = dflash_vk_staging_resolve(src_addr);
+    vk_buffer src_buf = src_ref.buffer;
+    if (!src_buf || !dflash_vk_span_in_bounds(src_buf, src_ref.offset, size)) return;
     // If dst is NOT a Vulkan tensor (e.g. the drafter placed a target_hidden graph
     // input on the CPU), the D2D vkCmdCopyBuffer path would compute a garbage
     // vk_tensor_offset(dst) (dst->data is a real CPU pointer, not the 0x1000
@@ -17315,9 +17362,9 @@ extern "C" void dflash_cross_ring_gpu_set_tensor_tensor(ggml_tensor * dst, const
     // the CPU dst). This keeps the cross-ring correct for mixed CPU/GPU drafter
     // input placements at the cost of one readback for the CPU-resident tensor.
     if (!ggml_backend_buffer_is_vk(dst->buffer)) {
-        DFLASH_VK_RING_DBG("set_tensor_tensor CPU-dst fallback dst_off=%zu src_bda=0x%llx size=%zu", offset, (unsigned long long)src_addr, size);
+        DFLASH_VK_RING_DBG("set_tensor_tensor CPU-dst fallback dst_off=%zu src_bda=0x%llx src_off=%zu size=%zu", offset, (unsigned long long)src_addr, src_ref.offset, size);
         std::vector<uint8_t> cpu_tmp(size);
-        ggml_vk_buffer_read(src_buf, 0, cpu_tmp.data(), size);
+        ggml_vk_buffer_read(src_buf, src_ref.offset, cpu_tmp.data(), size);
         ggml_backend_tensor_set(dst, cpu_tmp.data(), offset, size);
         return;
     }
@@ -17325,8 +17372,8 @@ extern "C" void dflash_cross_ring_gpu_set_tensor_tensor(ggml_tensor * dst, const
     ggml_backend_vk_buffer_context * buf_ctx = (ggml_backend_vk_buffer_context *)dst->buffer->context;
     vk_buffer dst_buf = buf_ctx->dev_buffer;
     size_t dst_off = vk_tensor_offset(dst) + dst->view_offs + offset;
-    DFLASH_VK_RING_DBG("set_tensor_tensor dst_off=%zu src_bda=0x%llx size=%zu resolved=%d", dst_off, (unsigned long long)src_addr, size, (int)(src_buf != nullptr));
-    if (!dst_buf) return;
+    DFLASH_VK_RING_DBG("set_tensor_tensor dst_off=%zu src_bda=0x%llx src_off=%zu size=%zu resolved=%d", dst_off, (unsigned long long)src_addr, src_ref.offset, size, (int)(src_buf != nullptr));
+    if (!dst_buf || !dflash_vk_span_in_bounds(dst_buf, dst_off, size)) return;
     // NOTE: cross-queue memory-visibility bug -- the drafter's graph reads
     // target_hidden on the COMPUTE queue but this D2D copy writes it on the
     // TRANSFER queue. Per the Vulkan memory model, cross-queue visibility needs a
@@ -17336,24 +17383,47 @@ extern "C" void dflash_cross_ring_gpu_set_tensor_tensor(ggml_tensor * dst, const
     // arch: the GPU hidden capture also disrupts the target's DeltaNet compute).
     // Until the semaphore is wired in, the cross-ring D2D produces wrong drafts;
     // use GGML_DFLASH_GPU_RING=0 (CPU hidden capture) for correct DFlash.
-    ggml_vk_buffer_copy(dst_buf, dst_off, src_buf, 0, size);
+    ggml_vk_buffer_copy(dst_buf, dst_off, src_buf, src_ref.offset, size);
 }
 extern "C" bool dflash_cross_ring_gpu_write_d2d_tensor(void * handle, int layer, int ring_pos, ggml_tensor * src, int src_offset, int n_tokens, int n_embd) {
     // Phase 3: D2D copy target hidden tensor -> ring (no CPU readback). src is the
     // target's device-resident hidden tensor (qwen3next GPU hidden capture); resolve its
     // vk_buffer via tensor->buffer->context + vk_tensor_offset(). dst is our ring (handle).
-    if (!handle || !src || n_tokens <= 0 || n_embd <= 0 || !src->buffer || !src->buffer->context) return false;
+    if (!handle || !src || src_offset < 0 || n_tokens <= 0 || n_embd <= 0 || !src->buffer || !src->buffer->context) return false;
     auto * ring = (dflash_cross_ring_vk *)handle;
-    if (layer < 0 || layer >= ring->n_layers || n_embd != ring->n_embd) return false;
+    if (layer < 0 || layer >= ring->n_layers || n_embd != ring->n_embd || ring->ring_size <= 0) return false;
     ggml_backend_vk_buffer_context * buf_ctx = (ggml_backend_vk_buffer_context *)src->buffer->context;
     vk_buffer src_buf = buf_ctx->dev_buffer;
-    size_t src_off = vk_tensor_offset(src) + src->view_offs + (size_t)src_offset * (size_t)n_embd * sizeof(float);
-    size_t dst_off  = ((size_t)layer * ring->ring_size + ring_pos) * ring->n_embd * sizeof(float);
-    size_t bytes    = (size_t)n_tokens * n_embd * sizeof(float);
-    DFLASH_VK_RING_DBG("write_d2d_tensor layer=%d ring_pos=%d src_offset=%d n_tokens=%d n_embd=%d src_off=%zu dst_off=%zu bytes=%zu resolved=%d", layer, ring_pos, src_offset, n_tokens, n_embd, src_off, dst_off, bytes, (int)(src_buf != nullptr));
-    if (!src_buf) return false;
-    ggml_vk_buffer_copy(ring->rings, dst_off, src_buf, src_off, bytes);
-    return true;
+    if (!src_buf || !ring->rings) return false;
+
+    int pos = ring_pos % ring->ring_size;
+    if (pos < 0) pos += ring->ring_size;
+    if (n_tokens > ring->ring_size) {
+        const int skip = n_tokens - ring->ring_size;
+        src_offset += skip;
+        pos = (pos + skip) % ring->ring_size;
+        n_tokens = ring->ring_size;
+    }
+
+    const size_t stride = (size_t)n_embd * sizeof(float);
+    size_t src_off = vk_tensor_offset(src) + src->view_offs + (size_t)src_offset * stride;
+    const int first = std::min(n_tokens, ring->ring_size - pos);
+    DFLASH_VK_RING_DBG("write_d2d_tensor layer=%d ring_pos=%d pos=%d src_offset=%d n_tokens=%d n_embd=%d src_off=%zu first=%d resolved=%d", layer, ring_pos, pos, src_offset, n_tokens, n_embd, src_off, first, (int)(src_buf != nullptr));
+
+    auto copy_span = [&](int dst_pos, size_t src_span_off, int ntok) -> bool {
+        if (ntok <= 0) return true;
+        const size_t dst_off = ((size_t)layer * ring->ring_size + (size_t)dst_pos) * ring->n_embd * sizeof(float);
+        const size_t bytes = (size_t)ntok * stride;
+        if (!dflash_vk_span_in_bounds(src_buf, src_span_off, bytes) || !dflash_vk_span_in_bounds(ring->rings, dst_off, bytes)) {
+            DFLASH_VK_RING_DBG("write_d2d_tensor: reject OOB layer=%d dst_pos=%d src_off=%zu dst_off=%zu bytes=%zu src_size=%zu dst_size=%zu", layer, dst_pos, src_span_off, dst_off, bytes, src_buf ? src_buf->size : 0, ring->rings ? ring->rings->size : 0);
+            return false;
+        }
+        ggml_vk_buffer_copy(ring->rings, dst_off, src_buf, src_span_off, bytes);
+        return true;
+    };
+
+    return copy_span(pos, src_off, first) &&
+           copy_span(0, src_off + (size_t)first * stride, n_tokens - first);
 }
 
 static void * ggml_backend_vk_reg_get_proc_address(ggml_backend_reg_t /*reg*/, const char * name) {
