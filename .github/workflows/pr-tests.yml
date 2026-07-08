@@ -25,7 +25,6 @@ jobs:
           sudo apt-get install -y \
             build-essential \
             cmake \
-            ninja-build \
             glslc \
             libvulkan-dev \
             vulkan-tools
@@ -33,7 +32,6 @@ jobs:
       - name: Configure Vulkan build
         run: |
           cmake -S . -B build-ci \
-            -G Ninja \
             -DGGML_VULKAN=ON \
             -DGGML_NATIVE=OFF \
             -DLLAMA_BUILD_TESTS=ON \
