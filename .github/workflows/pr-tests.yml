@@ -26,6 +26,7 @@ jobs:
             build-essential \
             cmake \
             glslc \
+            spirv-headers \
             libvulkan-dev \
             vulkan-tools
 
