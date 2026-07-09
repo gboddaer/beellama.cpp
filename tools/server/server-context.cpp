@@ -45,6 +45,26 @@ using json = nlohmann::ordered_json;
 
 constexpr int HTTP_POLLING_SECONDS = 1;
 
+static bool speculative_flat_result_has_bonus(
+        const llama_tokens & ids,
+        const llama_tokens & draft) {
+    if (ids.empty()) {
+        return false;
+    }
+
+    if (ids.size() > draft.size()) {
+        return true;
+    }
+
+    for (size_t i = 0; i < ids.size(); ++i) {
+        if (ids[i] != draft[i]) {
+            return true;
+        }
+    }
+
+    return false;
+}
+
 static uint32_t server_n_outputs_max(const common_params & params) {
     const uint32_t n_batch  = params.n_batch;
 
@@ -182,6 +202,8 @@ struct server_slot {
     llama_tokens spec_prompt;
     std::vector<int32_t> spec_i_batch;
     common_prompt_checkpoint spec_ckpt;
+    llama_seq_id dflash_seq_backup = -1;
+    llama_pos dflash_n_pos_before_draft = 0;
 
     // DFlash state
     dflash::dflash_slot_state dflash_state;
@@ -462,6 +484,18 @@ struct server_slot {
             n_draft_max = std::min(n_draft_max, n_remaining - 1);
         }
 
+        int configured_n_max = task->params.speculative.draft.n_max;
+        if (task->params.speculative.has_type(COMMON_SPECULATIVE_TYPE_DFLASH)) {
+            configured_n_max = task->params.speculative.n_max;
+            if (task->params.speculative.draft.n_max > 0) {
+                configured_n_max = configured_n_max > 0
+                    ? std::min(configured_n_max, task->params.speculative.draft.n_max)
+                    : task->params.speculative.draft.n_max;
+            }
+        }
+        if (configured_n_max > 0) {
+            n_draft_max = std::min(n_draft_max, configured_n_max);
+        }
 
         return n_draft_max;
     }
@@ -3203,7 +3237,8 @@ private:
             if (slot.can_speculate()) {
                 common_speculative_get_draft_params(slot.get_spec(), slot.get_seq_id()).drafting = false;
 
-                const bool use_ckpt_tgt = ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_FULL;
+                const bool force_dflash_ckpt = params_base.speculative.has_type(COMMON_SPECULATIVE_TYPE_DFLASH) && std::getenv("GGML_DFLASH_FORCE_CKPT_ROLLBACK");
+                const bool use_ckpt_tgt = ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_FULL || force_dflash_ckpt;
                 const bool use_ckpt_dft = ctx_dft_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_FULL;
 
                 const int n_draft_max = slot.get_n_draft_max();
@@ -3277,9 +3312,11 @@ private:
             }
 
             if (!draft.empty()) {
+                const bool force_dflash_ckpt = params_base.speculative.has_type(COMMON_SPECULATIVE_TYPE_DFLASH) && std::getenv("GGML_DFLASH_FORCE_CKPT_ROLLBACK");
                 const bool use_ckpt_tgt =
                     ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_FULL ||
-                   (ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_RS && draft.size() > llama_n_rs_seq(ctx_tgt));
+                   (ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_RS && draft.size() > llama_n_rs_seq(ctx_tgt)) ||
+                   force_dflash_ckpt;
 
                 const bool use_ckpt_dft =
                    (ctx_dft_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_RS && draft.size() > llama_n_rs_seq(ctx_dft.get()));
@@ -3306,6 +3343,24 @@ private:
 
         // update the batch with the sampled/drafted tokens
         iterate(generating, [&](server_slot & slot) {
+            if (slot.can_speculate() && !slot.spec_draft.empty() &&
+                    params_base.speculative.has_type(COMMON_SPECULATIVE_TYPE_DFLASH) &&
+                    std::getenv("GGML_DFLASH_FORCE_TAPE_SYNC")) {
+                llama_tape_replay_sync(ctx_tgt);
+            }
+            if (slot.can_speculate() && !slot.spec_draft.empty() &&
+                    params_base.speculative.has_type(COMMON_SPECULATIVE_TYPE_DFLASH) &&
+                    std::getenv("GGML_DFLASH_TEST_ROLLBACK")) {
+                slot.dflash_seq_backup = slot.id + (llama_seq_id) slots.size();
+                slot.dflash_n_pos_before_draft = slot.prompt.tokens.pos_next();
+                if (llama_context_recurrent_expand(ctx_tgt, (uint32_t) slot.dflash_seq_backup + 1)) {
+                    auto * mem = llama_get_memory(ctx_tgt);
+                    llama_memory_seq_rm(mem, slot.dflash_seq_backup, -1, -1);
+                    llama_memory_seq_cp_recurrent(mem, slot.id, slot.dflash_seq_backup, -1, -1);
+                } else {
+                    slot.dflash_seq_backup = -1;
+                }
+            }
             slot.handle_last_sampled_token(batch);
         });
 
@@ -4282,9 +4337,11 @@ private:
 
                 const uint32_t n_rollback = slot.spec_draft.size() + 1 - accepted.size();
 
+                const bool force_dflash_ckpt = params_base.speculative.has_type(COMMON_SPECULATIVE_TYPE_DFLASH) && std::getenv("GGML_DFLASH_FORCE_CKPT_ROLLBACK");
                 const bool use_ckpt_tgt =
                     ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_FULL ||
-                    (ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_RS && n_rollback > llama_n_rs_seq(ctx_tgt));
+                    (ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_RS && n_rollback > llama_n_rs_seq(ctx_tgt)) ||
+                    force_dflash_ckpt;
 
                 // check for partial draft acceptance
                 if (n_rollback > 0) {
@@ -4324,18 +4381,54 @@ private:
                 }
 
                 // set active slot for DFlash cross-attention ring write
+                const bool speculative_has_bonus = speculative_flat_result_has_bonus(accepted, slot.spec_draft);
+                const int n_accepted_draft = std::max(0, (int) accepted.size() - (speculative_has_bonus ? 1 : 0));
+                const int n_hidden_keep = accepted.empty() ? 0 : n_accepted_draft + 1;
+                if (std::getenv("GGML_DFLASH_QA_TRACE")) {
+                    fprintf(stderr, "[DFLASH_QA] verify slot=%d draft=%zu accepted=%zu has_bonus=%d n_accepted_draft=%d n_hidden_keep=%d\n",
+                        slot.id, slot.spec_draft.size(), accepted.size(), speculative_has_bonus ? 1 : 0,
+                        n_accepted_draft, n_hidden_keep);
+                }
+
                 if (params_base.speculative.has_type(COMMON_SPECULATIVE_TYPE_DFLASH)) {
                     llama_dflash_set_active_slot(ctx_tgt, slot.id);
                 }
-                common_speculative_accept(slot.get_spec(), slot.get_seq_id(), accepted.size() - 1);
+                common_speculative_accept(slot.get_spec(), slot.get_seq_id(), n_accepted_draft);
 
-                // DFlash: append the accepted tokens' hidden states to the cross-attention
-                // ring. The DFlash impl's accept() is a no-op; the append happens via
-                // update_logits -> append_target_hiddens (fork adb92b36a calls this at
-                // lines 6418/6420/6984). Without it the ring stays stale (committed_len
-                // never grows) -> cross-attention uses stale context -> garbled drafts
-                // (6.7% acceptance vs fork 34%).
-                common_speculative_update_logits_deferred_dflash_kv(slot.get_spec(), ctx_tgt, accepted, accepted.size());
+                // DFlash hidden capture uses rows from the verification batch:
+                // root plus accepted draft tokens. Do not append the bonus or
+                // resampled rejection token to the cross-attention ring.
+                llama_tokens batch_tokens;
+                batch_tokens.push_back(slot.sampled);
+                batch_tokens.insert(batch_tokens.end(), slot.spec_draft.begin(), slot.spec_draft.end());
+                common_speculative_update_logits_deferred_dflash_kv(slot.get_spec(), ctx_tgt, batch_tokens, n_hidden_keep);
+                if (std::getenv("GGML_DFLASH_TEST_ROLLBACK") && slot.dflash_seq_backup >= 0) {
+                    const bool all_accepted_flat = n_accepted_draft == (int) slot.spec_draft.size();
+                    if (!all_accepted_flat) {
+                        const int n_reeval = llama_dflash_rollback(ctx_tgt, slot.id, slot.dflash_seq_backup,
+                            slot.dflash_n_pos_before_draft, n_hidden_keep);
+                        if (n_reeval > 0) {
+                            llama_batch batch_reeval = llama_batch_init(n_reeval, 0, 1);
+                            for (int j = 0; j < n_reeval && j < (int) batch_tokens.size(); ++j) {
+                                common_batch_add(batch_reeval, batch_tokens[j], slot.dflash_n_pos_before_draft + j, { slot.id }, false);
+                            }
+                            const int ret_reeval = llama_decode(ctx_tgt, batch_reeval);
+                            llama_batch_free(batch_reeval);
+                            if (std::getenv("GGML_DFLASH_QA_TRACE")) {
+                                fprintf(stderr, "[DFLASH_QA] rollback_reeval slot=%d n_reeval=%d ret=%d\n",
+                                    slot.id, n_reeval, ret_reeval);
+                            }
+                        }
+                        if (std::getenv("GGML_DFLASH_QA_TRACE")) {
+                            fprintf(stderr, "[DFLASH_QA] rollback slot=%d backup=%d n_before=%d n_hidden_keep=%d n_reeval=%d\n",
+                                slot.id, slot.dflash_seq_backup, (int) slot.dflash_n_pos_before_draft, n_hidden_keep, n_reeval);
+                        }
+                    } else {
+                        auto * mem = llama_get_memory(ctx_tgt);
+                        llama_memory_seq_rm(mem, slot.dflash_seq_backup, -1, -1);
+                    }
+                    slot.dflash_seq_backup = -1;
+                }
 
                 slot.spec_draft = std::move(accepted);
             }

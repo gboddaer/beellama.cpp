@@ -390,6 +390,9 @@ llama_context::llama_context(
 
     cparams.fused_gdn_ar = !params.no_fused_gdn;
     cparams.fused_gdn_ch = !params.no_fused_gdn;
+    if (std::getenv("GGML_DFLASH_DISABLE_FGDN_CH")) {
+        cparams.fused_gdn_ch = false;
+    }
     cparams.auto_fgdn    = !params.no_fused_gdn;
 
     // with causal attention, the batch size is limited by the context size

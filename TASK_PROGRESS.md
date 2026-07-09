@@ -939,3 +939,192 @@ Built knowledge graphs for both fork and merge using graphify:
 ### NEXT STEPS
 - Execute the plan from Task 1 using the three-way diff/blame workflow.
 - Keep updating `TASK_PROGRESS.md` after each task with facts separated from hypotheses.
+
+## 2026-07-09 12:02 UTC - Task 1 comparison harness execution
+
+### FACTS
+- Current branch after returning from baseline test: `merge_llama_into_beellama_2`.
+- Created `scripts/dflash-regression/extract_cli_output.py`.
+- Created `scripts/dflash-regression/qwen36_compare.sh`.
+- Made both scripts executable.
+- `origin/main` comparison ran at commit `130ea2480bee8268907a102bd814e276f4e88bdf`.
+- `merge_llama_into_beellama_2` comparison ran at commit `0fe0bf5c66b3b63939c9237607292edeef346b91`.
+- Graphify query over DFlash/Qwen35 concepts identified connected nodes including `common_speculative_impl_dflash`, `dflash_capture_data`, `llm_graph_params`, `build_inp_out_ids`, `llama_context`, and DFlash/Qwen model builders.
+
+### HYPOTHESES
+- The comparison harness's current byte-identical pass criterion is too strict because working `origin/main` DFlash can produce coherent but slightly different text from non-DFlash under the current CLI/sampler settings.
+- The merge branch regression remains real because its DFlash output is visibly corrupted/noisy and much slower, while its non-DFlash output remains coherent.
+
+### TEST RESULTS
+- Command: `git switch --detach origin/main && cmake --build build_vulkan --target llama-cli -j "$(nproc)" && scripts/dflash-regression/qwen36_compare.sh /tmp/qwen36-origin-main`
+- Result: `origin/main` non-DFlash rc=0, prompt `85.6 t/s`, generation `11.0 t/s`; DFlash rc=0, prompt `120.9 t/s`, generation `20.9 t/s`; harness reported `result=fail-output-mismatch`, but the DFlash output was coherent and differed only slightly in wording from non-DFlash in the visible excerpt.
+- Output files: `/tmp/qwen36-origin-main/summary.txt`, `/tmp/qwen36-origin-main/nodflash.out`, `/tmp/qwen36-origin-main/dflash.out`
+- Command: `git switch merge_llama_into_beellama_2 && cmake --build build_vulkan --target llama-cli -j "$(nproc)" && scripts/dflash-regression/qwen36_compare.sh /tmp/qwen36-merge-branch`
+- Result: merge branch non-DFlash rc=0, prompt `83.2 t/s`, generation `11.0 t/s`; DFlash rc=0, prompt `84.2 t/s`, generation `4.4 t/s`; DFlash visible output becomes corrupted/noisy after the first few tokens; harness reported `result=fail-output-mismatch`.
+- Output files: `/tmp/qwen36-merge-branch/summary.txt`, `/tmp/qwen36-merge-branch/nodflash.out`, `/tmp/qwen36-merge-branch/dflash.out`
+- Command: `graphify_query` for DFlash hidden_gpu capture, Qwen35 graph building, dflash_draft outputs, and common_speculative verifier/state paths.
+- Result: Graphify found connected code concepts and files for follow-up inspection.
+
+### NEXT STEPS
+- Adjust interpretation of Task 1: byte-identical output is not required for a passing working baseline; use coherence plus throughput and visible corruption comparison for now.
+- Execute Task 2 three-way ref capture and diff generation.
+
+## 2026-07-09 12:08 UTC - Task 2 three-way refs and diff artifacts
+
+### FACTS
+- Local branch `merge_llama_into_beellama_2` contains local commit `0fe0bf5c6` for the investigation plan.
+- Three-way diff helper compares `origin/merge_llama_into_beellama_2`, not the local plan commit, so analysis targets the integration result `d5c80cb99eb7a13bd726921f22dc5c224f03bec9`.
+- `origin/main` commit: `130ea2480bee8268907a102bd814e276f4e88bdf`.
+- `origin/merge_llama_into_beellama_2` commit: `d5c80cb99eb7a13bd726921f22dc5c224f03bec9`.
+- `ggml/master` commit after fetch: `259f2e2a531af9ed3efa7f66adaa5eb5b53da95f`.
+- `merge-base(origin/main, ggml/master)`: `6ddc9430b145f61a0c1733b9d79c99c0ebdedf50`.
+- `merge-base(ggml/master, origin/merge_llama_into_beellama_2)`: `f708a5b2caaee0226c0af220e366785699ba41e2`.
+- `merge-base(origin/main, origin/merge_llama_into_beellama_2)`: `130ea2480bee8268907a102bd814e276f4e88bdf`.
+- Fork delta over suspect files: 7 files changed, 13698 insertions, 2256 deletions.
+- Upstream delta over suspect files: 6 files changed, 2412 insertions, 525 deletions.
+- Merge-result delta over suspect files: 7 files changed, 14557 insertions, 2493 deletions.
+- Generated three-way artifacts under `/tmp/qwen36-three-way/` including refs, stats, full diffs, focused DFlash/Qwen snippets, and blame files.
+
+### HYPOTHESES
+- None yet.
+
+### TEST RESULTS
+- Command: `git fetch origin --prune && git fetch https://github.com/ggml-org/llama.cpp.git master:refs/remotes/ggml/master --no-tags`
+- Result: refs fetched successfully.
+- Command: `scripts/dflash-regression/three_way_dflash_diff.sh /tmp/qwen36-three-way`
+- Result: generated refs, stat, diff, focus, and blame artifacts.
+- Output files: `/tmp/qwen36-three-way/refs-full.txt`, `/tmp/qwen36-three-way/refs.txt`, `/tmp/qwen36-three-way/fork-delta.diff`, `/tmp/qwen36-three-way/upstream-delta.diff`, `/tmp/qwen36-three-way/merge-result.diff`, `/tmp/qwen36-three-way/*.focus.txt`, `/tmp/qwen36-three-way/blame-*.txt`
+
+### NEXT STEPS
+- Perform Task 3 semantic diff/blame analysis, starting with Qwen35 hidden capture and output semantics.
+
+## 2026-07-09 12:18 UTC - Task 3 semantic diff finding: Qwen35 NextN main-loop boundary
+
+### FACTS
+- `origin/main:src/models/qwen35.cpp` lines 168-170 define `const int n_transformer_layers = n_layer - (int) hparams.nextn_predict_layers;` and loop `for (int il = 0; il < n_transformer_layers; ++il)`.
+- `origin/main:src/models/qwen35.cpp` line 187 uses `if (il == n_transformer_layers - 1 && inp_out_ids && !need_full_h_nextn)` for output row selection.
+- `origin/merge_llama_into_beellama_2:src/models/qwen35.cpp` lines 158-160 keep the comment `MTP/NextN layers are loaded as extra decoder blocks but not executed in the main pass`, but loop `for (int il = 0; il < n_layer; ++il)` and set `res->t_layer_inp[il] = inpL`.
+- `origin/main:src/models/qwen35moe.cpp` lines 191-193 define `const int n_transformer_layers = n_layer - (int) hparams.nextn_predict_layers;` and loop `for (int il = 0; il < n_transformer_layers; ++il)`.
+- `origin/main:src/models/qwen35moe.cpp` line 210 uses `if (il == n_transformer_layers - 1 && inp_out_ids && !need_full_h_nextn)` for output row selection.
+- `origin/merge_llama_into_beellama_2:src/models/qwen35moe.cpp` lines 180-182 keep the comment `MTP/NextN layers are loaded as extra decoder blocks but not executed in the main pass`, but loop `for (int il = 0; il < n_layer; ++il)` and set `res->t_layer_inp[il] = inpL`.
+- Blame for the merge-result `for (int il = 0; il < n_layer; ++il)` lines points to `7acb4e8cd2ce21f457d1298e75fad729520d263c hparams : refactor hparams.n_layer (#24060)`.
+- Blame for the merge-result `res->t_layer_inp[il] = inpL` lines points to `b14e3fb90ca8c760f4254ddc9aa7845ebbdb2edf spec: support eagle3 for qwen3.5 & 3.6 (#24593)`.
+
+### HYPOTHESES
+- HYPOTHESIS 1: The merge branch corrupts DFlash for Qwen3.6 because the target Qwen35/Qwen35MoE main pass now executes NextN/MTP layers that `origin/main` deliberately excluded, so DFlash hidden capture and/or verifier target logits are taken from the wrong graph boundary.
+- HYPOTHESIS 2: The `res->t_layer_inp[il]` Eagle3 support may need to be preserved for all loaded layers, but the main transformer compute loop should still stop at `n_layer - nextn_predict_layers` for Qwen35 DFlash target correctness.
+
+### TEST RESULTS
+- Command: targeted `git show` extraction for `src/models/qwen35.cpp` and `src/models/qwen35moe.cpp` in `origin/main` and `origin/merge_llama_into_beellama_2`.
+- Result: Confirmed loop-boundary difference and output-selection condition difference between the working fork baseline and merge result.
+- Command: `git blame -L 156,164 origin/merge_llama_into_beellama_2 -- src/models/qwen35.cpp` and `git blame -L 178,186 origin/merge_llama_into_beellama_2 -- src/models/qwen35moe.cpp`.
+- Result: Identified upstream commits responsible for the merge-result loop and Eagle3 layer-input lines.
+- Output files: `/tmp/qwen36-three-way/merge-result.diff`, `/tmp/qwen36-three-way/fork-delta.diff`, `/tmp/qwen36-three-way/upstream-delta.diff`
+
+### NEXT STEPS
+- Apply a minimal local experiment restoring the `n_transformer_layers` loop bound and last-transformer output condition in `src/models/qwen35.cpp` and `src/models/qwen35moe.cpp`, while preserving `res->t_layer_inp[il] = inpL` inside the loop for layers actually executed.
+- Build `llama-cli` and rerun `/tmp/qwen36-merge-branch` comparison to test whether DFlash output coherence and generation throughput recover.
+
+## 2026-07-09 12:32 UTC - Failed experiment: Qwen35 row-selection condition
+
+### FACTS
+- The earlier loop-bound hypothesis was refined: in the merge branch, `n_layer` appears to be the main-layer count and `n_layer_all` includes NextN/MTP layers, so changing the loop bound was not applied.
+- A minimal local experiment changed `src/models/qwen35.cpp` and `src/models/qwen35moe.cpp` to restore the origin-equivalent `need_full_h_nextn` row-selection condition at the final main layer.
+- The experiment was reverted after testing because it did not fix the DFlash corruption or throughput regression.
+- Failed experiment diff was saved to `/tmp/qwen36-failed-row-select-fix.diff`.
+
+### HYPOTHESES
+- HYPOTHESIS 1 was not supported by this experiment: final-main-layer row selection alone is not the root cause of the merge branch DFlash corruption.
+- The root cause is more likely in DFlash-specific hidden capture, drafter output sizing, verifier acceptance/state handling, or an interaction not changed by the row-selection experiment.
+
+### TEST RESULTS
+- Command: `cmake --build build_vulkan --target llama-cli -j "$(nproc)" && scripts/dflash-regression/qwen36_compare.sh /tmp/qwen36-after-row-select-fix`
+- Result: build succeeded; non-DFlash rc=0, prompt `83.2 t/s`, generation `11.0 t/s`; DFlash rc=0, prompt `86.1 t/s`, generation `3.8 t/s`; DFlash output remained corrupted/noisy.
+- Output files: `/tmp/qwen36-after-row-select-fix/summary.txt`, `/tmp/qwen36-after-row-select-fix/nodflash.out`, `/tmp/qwen36-after-row-select-fix/dflash.out`, `/tmp/qwen36-failed-row-select-fix.diff`
+
+### NEXT STEPS
+- Continue Task 3 semantic analysis, focusing next on `src/models/dflash_draft.cpp` output sizing and `common/speculative.cpp` DFlash verifier/state paths.
+
+## 2026-07-09 12:45 UTC - Additional isolation tests: GPU ring off and draft horizon 1
+
+### FACTS
+- `GGML_DFLASH_GPU_RING=0` did not restore coherent DFlash output on the merge branch.
+- `--spec-draft-n-max 1` still produced corrupted/truncated DFlash output on the merge branch.
+- The row-selection experiment remained reverted; current source files `src/models/qwen35.cpp` and `src/models/qwen35moe.cpp` are restored to pre-experiment state.
+
+### HYPOTHESES
+- The failing boundary is not solely the Vulkan GPU cross-ring path, because disabling `GGML_DFLASH_GPU_RING` did not fix output.
+- The failing boundary occurs at or before the first drafted token verification/acceptance path, because `--spec-draft-n-max 1` still produced bad output.
+- Candidate boundaries now rank higher: drafter logits/argmax row mapping, target verifier acceptance logic, target/draft KV alignment, or DFlash hidden/cross data passed into the drafter independent of the GPU ring setting.
+
+### TEST RESULTS
+- Command: `GGML_DFLASH_GPU_RING=0 scripts/dflash-regression/qwen36_compare.sh /tmp/qwen36-merge-gpu-ring-off`
+- Result: non-DFlash rc=0, prompt `82.6 t/s`, generation `11.0 t/s`; DFlash rc=0, prompt `143.9 t/s`, generation `4.3 t/s`; DFlash output remained corrupted/noisy.
+- Output files: `/tmp/qwen36-merge-gpu-ring-off/summary.txt`, `/tmp/qwen36-merge-gpu-ring-off/dflash.out`
+- Command: manual `llama-cli` DFlash run with `--spec-draft-n-max 1`, seed 7, temp 0, `Vulkan1`, 192 generated-token cap.
+- Result: rc=0; output starts `[Start thinking]\n3.` and stops; visible generation throughput `6.8 t/s`.
+- Output files: `/tmp/qwen36-merge-dflash-nmax1/out.txt`, `/tmp/qwen36-merge-dflash-nmax1/err.txt`
+
+### NEXT STEPS
+- Inspect DFlash verifier acceptance logic and token trace support.
+- Run merge branch with DFlash token/KV/ring traces if available to determine whether the first draft token is invalid but accepted, or whether the target verifier itself produces the bad token.
+
+## 2026-07-09 - DFlash merge regression: verifier/rollback boundary
+
+### FACTS
+- Added temporary QA traces around flat DFlash draft output, verifier sampling, and server accept bookkeeping.
+- The active path is flat DFlash (`common_speculative_draft`), with GPU argmax rows available.
+- `merge_llama_into_beellama_2` ignored `--spec-draft-n-max` in `server_slot::get_n_draft_max()`, causing the first DFlash cycle to draft/verify 15 tokens despite `--spec-draft-n-max 3`.
+- Capping by the configured draft horizon changed first-cycle `draft=15` to `draft=3` and improved short-prompt output/perf, but did not fully fix full-prompt corruption.
+- With `--spec-draft-n-max 3`, token traces show DFlash and non-DFlash match through token index 12, then diverge at token index 13 (`non-DFlash=2570`, `DFlash=279`).
+- The divergence occurs after several fully accepted multi-token verification batches, not at the initial prompt prefill or first draft token.
+- Testing `GGML_DFLASH_DISABLE_FGDN_CH=1` did not move the first divergence.
+- Testing an env-gated `llama_tape_replay_sync(ctx_tgt)` before building the DFlash verifier batch did not move the first divergence.
+- A separate `/tmp/beellama-origin-main` worktree built from `origin/main` produced coherent DFlash output on the same prompt/flags, with DFlash generation about `28.5 t/s` versus non-DFlash about `11.2 t/s`.
+- `origin/main` DFlash server code contains recurrent backup + `llama_dflash_rollback()` handling around DFlash verification. The merge branch's simpler path only uses `common_context_seq_rm()` after verification.
+- `llama_dflash_rollback()` exists on the merge branch and restores recurrent state from a backup sequence, keeps accepted attention KV, and replays accepted token recurrent state.
+
+### HYPOTHESES
+- Confirmed partial cause: the merge branch fails to honor `--spec-draft-n-max` for DFlash because `get_n_draft_max()` used only context/remaining budget and DFlash top-level `n_max`, while the CLI flag populates `speculative.draft.n_max`.
+- Current leading hypothesis: the remaining corruption is due to missing DFlash recurrent backup/rollback around multi-token verification. Accepted tokens match initially, but the recurrent state left by the verifier batch diverges from sequential decode; `origin/main` avoids this with `llama_dflash_rollback()`.
+- Rejected/low-priority hypotheses: Vulkan GPU ring corruption (already reproduced with `GGML_DFLASH_GPU_RING=0`), fused GDN chunk kernel as sole cause, and tape sync alone.
+
+### TEST RESULTS
+- `/tmp/qwen36-after-draft-cap-fix`: DFlash `rc=0`, improved to about `12.1 t/s` but still repeated/corrupted on full prompt.
+- `/tmp/qwen36-after-cap-nmax1`: DFlash `rc=0`, coherent prefix, about `9.1 t/s`, indicating lower horizon avoids most visible corruption but is slower.
+- `/tmp/qwen36-first-divergence`: first token divergence at generated token index 13 after accepted DFlash verification cycles.
+- `/tmp/qwen36-force-ckpt-divergence`: env-gated full checkpoint rollback experiment did not fix divergence and worsened output; this path is not compatible as a simple substitute for DFlash rollback.
+- `/tmp/qwen36-no-fgdn-ch-divergence`: disabling fused chunk GDN did not change first divergence.
+- `/tmp/qwen36-tape-sync-divergence`: adding tape replay sync before verification batch did not change first divergence.
+- `/tmp/qwen36-origin-main-first-divergence`: origin/main DFlash coherent and fast on same prompt/flags.
+
+### NEXT STEPS
+- Test a minimal DFlash recurrent backup + `llama_dflash_rollback()` transplant in the merge branch, preferably env-gated first.
+- Keep the DFlash draft horizon cap as a candidate fix, but clean it up after the rollback root cause is confirmed.
+- Remove temporary QA/sample trace instrumentation before finalizing any patch.
+- Re-run `scripts/dflash-regression/qwen36_compare.sh` and local DFlash tests after any candidate rollback fix.
+
+## 2026-07-09 - DFlash merge regression: rollback test refined
+
+### FACTS
+- Added an env-gated minimal recurrent backup + `llama_dflash_rollback()` test path (`GGML_DFLASH_TEST_ROLLBACK=1`) in the merge branch.
+- Calling `llama_dflash_rollback()` on every DFlash verification batch was incorrect: origin/main skips rollback for all-accepted flat batches.
+- After changing the test to call rollback only for partial flat accepts, the first divergence still occurred at generated token index 13.
+- `llama_dflash_rollback()` returned `n_reeval > 0` on Vulkan, and the diagnostic re-decode path returned `ret=0`, but the sampled token at the first partial verify was already different from non-DFlash before rollback could help.
+- The first bad DFlash token is produced by target verifier row 0 of a multi-token DFlash verification batch, not by post-verify rollback alone.
+- Comparing Qwen35 diffs showed that `origin/main` has DFlash-specific tape capture and tree-aware recurrent/conv paths (`ggml_ssm_conv_tree`, `ggml_gated_delta_net_tree` usage) that are absent from the merge branch's Qwen35 graph.
+
+### HYPOTHESES
+- Refined leading hypothesis: the merge branch target verifier is computing non-sequential-equivalent logits for multi-token DFlash verification batches on Qwen3.6 recurrent layers. Future draft tokens in the same verification batch contaminate row-0/early-row recurrent computation unless the DFlash tree-aware/tape-aware Qwen35 paths from `origin/main` are present.
+- Rollback remains necessary for partial acceptance on Vulkan, but it is not sufficient: the verifier logits themselves must be fixed first.
+- The draft horizon cap remains a valid partial fix because it prevents uncontrolled 15-token verification batches, but it does not address verifier row correctness.
+
+### TEST RESULTS
+- `/tmp/qwen36-dflash-rollback-divergence`: rolling back every batch caused early EOS after token index 5; not a valid fix because all-accepted flat batches should not rollback.
+- `/tmp/qwen36-dflash-rollback-reeval-divergence`: adding re-decode after rollback still diverged early when rollback was applied to all batches.
+- `/tmp/qwen36-dflash-rollback-partial-divergence`: rollback only on partial accepts preserved the original first divergence at token index 13; DFlash still corrupted.
+
+### NEXT STEPS
+- Test restoring the DFlash-specific Qwen35 verifier graph pieces from `origin/main`, especially tree-aware SSM/GDN paths and tape capture.
+- Consider setting linear parent IDs for flat DFlash verification only after the Qwen35/delta-net graph can consume `tree_parent_ids` again.
+- Clean up env-gated rollback experiments and temporary tracing once the graph-level verifier fix is proven.

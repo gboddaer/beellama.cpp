@@ -3176,6 +3176,15 @@ struct common_speculative_impl_dflash : public common_speculative_impl {
                     const char * env = std::getenv("GGML_DFLASH_TOKEN_TRACE");
                     return env && std::atoi(env) != 0;
                 }();
+                static const bool enable_qa_trace = [] {
+                    const char * env = std::getenv("GGML_DFLASH_QA_TRACE");
+                    return env && std::atoi(env) != 0;
+                }();
+                if (enable_qa_trace) {
+                    fprintf(stderr, "[DFLASH_QA] draft_output seq=%d committed=%d output_len=%d argmax=%p rows=%d K=%d probs=%p\n",
+                        (int) seq_id, committed_len, output_len, (void *) argmax, argmax_rows, K_flat, (void *) argmax_probs);
+                }
+
                 if (enable_token_trace && argmax && K_flat > 0) {
                     std::string ids = "[";
                     int trace_n = std::min(8, output_len - 1);
@@ -3222,6 +3231,10 @@ struct common_speculative_impl_dflash : public common_speculative_impl {
 
                     // GPU argmax path - only top-k ids/probs are transferred.
                     for (int i = 1; i < output_len && (int) result.size() < n_draft; ++i) {
+                        if (enable_qa_trace && i <= 4) {
+                            fprintf(stderr, "[DFLASH_QA] draft_output row=%d token=%d logp=%f\n",
+                                i, argmax[i * K_flat], argmax_probs ? argmax_probs[i * K_flat] : 0.0f);
+                        }
                         const auto params = dp;
                         if (argmax_probs && p_min > 0.0f && (int) result.size() >= params.n_min) {
                             float log_prob = argmax_probs[i * K_flat];
@@ -3251,6 +3264,10 @@ struct common_speculative_impl_dflash : public common_speculative_impl {
                     }
                 } else {
                     // fallback: CPU argmax over full vocab
+                    if (enable_qa_trace) {
+                        fprintf(stderr, "[DFLASH_QA] draft_output fallback_cpu_argmax seq=%d committed=%d output_len=%d\n",
+                            (int) seq_id, committed_len, output_len);
+                    }
                     const int n_vocab_dft = llama_vocab_n_tokens(llama_model_get_vocab(model_dft));
                     for (int i = 1; i < output_len && (int) result.size() < n_draft; ++i) {
                         float * logits = llama_get_logits_ith(ctx_dft, i);
@@ -4317,7 +4334,16 @@ void common_speculative_draft(common_speculative * spec) {
         }
     }
 
+    static const bool enable_qa_trace = [] {
+        const char * env = std::getenv("GGML_DFLASH_QA_TRACE");
+        return env && std::atoi(env) != 0;
+    }();
+
     for (auto & impl : spec->impls) {
+        if (enable_qa_trace) {
+            fprintf(stderr, "[DFLASH_QA] common_speculative_draft impl=%s n_seq=%zu\n",
+                common_speculative_type_to_str(impl->type).c_str(), spec->dparams.size());
+        }
         {
             common_time_meas tm(impl->t_draft_us, !impl->gen_perf);
             impl->draft(dparams);
@@ -4896,6 +4922,15 @@ void common_speculative_draft_batch(
     const int K_flat       = llama_get_logits_argmax_k(ctx_dft);
     const int argmax_rows  = llama_get_logits_argmax_n(ctx_dft);
 
+    static const bool enable_qa_trace = [] {
+        const char * env = std::getenv("GGML_DFLASH_QA_TRACE");
+        return env && std::atoi(env) != 0;
+    }();
+    if (enable_qa_trace) {
+        fprintf(stderr, "[DFLASH_QA] batch_draft n_ready=%d batch_len=%d output_len=%d argmax=%p rows=%d K=%d probs=%p\n",
+            n_ready, batch_len, output_len, (void *) argmax, argmax_rows, K_flat, (void *) argmax_probs);
+    }
+
     for (int r = 0; r < n_ready; r++) {
         auto & rs     = ready[r];
         auto & result = result_per_spec[rs.spec_idx];
@@ -4913,6 +4948,10 @@ void common_speculative_draft_batch(
             }
 
             for (int i = 1; i < output_len && (int) result.size() < n_draft; i++) {
+                if (enable_qa_trace && i <= 4) {
+                    fprintf(stderr, "[DFLASH_QA] batch_draft row=%d token=%d logp=%f\n",
+                        offset + i, argmax[(offset + i) * K_flat], argmax_probs ? argmax_probs[(offset + i) * K_flat] : 0.0f);
+                }
                 if (argmax_probs && params.p_min > 0.0f && (int) result.size() >= params.n_min) {
                     float log_prob = argmax_probs[(offset + i) * K_flat];
                     if (log_prob < logf(params.p_min)) {
@@ -4937,12 +4976,17 @@ void common_speculative_draft_batch(
                     log_probs->push_back(argmax_probs[(offset + i) * K_flat]);
                 }
             }
-        } else {            const int n_vocab = llama_vocab_n_tokens(llama_model_get_vocab(model_dft));
+        } else {
+            if (enable_qa_trace) {
+                fprintf(stderr, "[DFLASH_QA] batch_draft fallback_cpu_argmax ready_index=%d output_len=%d\n", r, output_len);
+            }
+            const int n_vocab = llama_vocab_n_tokens(llama_model_get_vocab(model_dft));
             for (int i = 1; i < output_len && (int) result.size() < n_draft; i++) {
                 float * logits = llama_get_logits_ith(ctx_dft, offset + i);
                 if (!logits) {
                     break;
-                }                llama_token best = (llama_token)(std::max_element(logits, logits + n_vocab) - logits);
+                }
+                llama_token best = (llama_token)(std::max_element(logits, logits + n_vocab) - logits);
                 result.push_back(best);
                 if (log_probs) {
                     log_probs->push_back(0.0f);

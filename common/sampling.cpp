@@ -552,6 +552,11 @@ llama_token common_sampler_sample(struct common_sampler * gsmpl, struct llama_co
 
     gsmpl->set_logits(ctx, idx);
 
+    static const bool enable_sample_trace = [] {
+        const char * env = std::getenv("GGML_DFLASH_SAMPLE_TRACE");
+        return env && std::atoi(env) != 0;
+    }();
+
     // Check if a backend sampler has already sampled a token in which case we
     // return that token id directly.
     {
@@ -584,6 +589,10 @@ llama_token common_sampler_sample(struct common_sampler * gsmpl, struct llama_co
     llama_sampler_apply(chain, &cur_p);
 
     id = cur_p.data[cur_p.selected].id;
+    if (enable_sample_trace) {
+        fprintf(stderr, "[DFLASH_SAMPLE] sample idx=%d id=%d selected=%d size=%zu\n",
+            idx, (int) id, cur_p.selected, cur_p.size);
+    }
 
     if (grammar_first || !grammar_should_apply(gsmpl)) {
         return id;
@@ -624,12 +633,20 @@ llama_token common_sampler_sample(struct common_sampler * gsmpl, struct llama_co
 std::vector<llama_token> common_sampler_sample_and_accept_n(struct common_sampler * gsmpl, struct llama_context * ctx, const std::vector<int> & idxs, const llama_tokens & draft, bool grammar_first) {
     GGML_ASSERT(idxs.size() == draft.size() + 1 && "idxs.size() must be draft.size() + 1");
 
+    static const bool enable_qa_trace = [] {
+        const char * env = std::getenv("GGML_DFLASH_QA_TRACE");
+        return env && std::atoi(env) != 0;
+    }();
+
     std::vector<llama_token> result;
     result.reserve(idxs.size());
 
     size_t i = 0;
     for (; i < draft.size(); i++) {
         const llama_token id = common_sampler_sample(gsmpl, ctx, idxs[i], grammar_first);
+        if (enable_qa_trace) {
+            fprintf(stderr, "[DFLASH_QA] sample_accept i=%zu idx=%d match=%d\n", i, idxs[i], draft[i] == id ? 1 : 0);
+        }
 
         common_sampler_accept(gsmpl, id, true);
 
@@ -642,6 +659,9 @@ std::vector<llama_token> common_sampler_sample_and_accept_n(struct common_sample
 
     if (i == draft.size()) {
         const llama_token id = common_sampler_sample(gsmpl, ctx, idxs[i], grammar_first);
+        if (enable_qa_trace) {
+            fprintf(stderr, "[DFLASH_QA] sample_accept bonus_i=%zu idx=%d\n", i, idxs[i]);
+        }
 
         common_sampler_accept(gsmpl, id, true);
 
