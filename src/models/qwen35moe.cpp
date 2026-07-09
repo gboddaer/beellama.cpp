@@ -1,4 +1,5 @@
 #include "models.h"
+#include "llama-context.h"
 #include "llama-memory-recurrent.h"
 
 void llama_model_qwen35moe::load_arch_hparams(llama_model_loader & ml) {
@@ -224,6 +225,86 @@ llama_model_qwen35moe::graph::graph(const llama_model & model, const llm_graph_p
         cur = build_cvec(cur, il);
         cb(cur, "l_out", il);
 
+        // DFlash GPU-embedded hidden state capture (ported from gboddaer/main).
+        // When hidden_gpu is allocated (via llama_dflash_allocate_slots), the graph
+        // embeds copies of layer outputs to hidden_gpu buffers.
+        const int64_t dflash_capture_n_seqs_dfl =
+            ubatch.n_seqs_unq > 1 ? (int64_t) ubatch.n_seqs_unq : 1;
+        const int64_t dflash_capture_n_tokens_dfl =
+            ubatch.n_seqs_unq > 1 ? (int64_t) ubatch.n_seq_tokens : (int64_t) ubatch.n_tokens;
+        if (cparams.hidden_gpu_n_seqs > 0 &&
+            cur->ne[1] == dflash_capture_n_tokens_dfl * dflash_capture_n_seqs_dfl) {
+            for (int s = 0; s < (int) dflash_capture_n_seqs_dfl && s < cparams.hidden_gpu_n_seqs; ++s) {
+                auto * hgpu = cparams.hidden_gpu_seqs[s];
+                if (!hgpu) {
+                    continue;
+                }
+
+                int hi = -1;
+                for (int i = 0; i < (int) hgpu->layer_ids.size(); ++i) {
+                    if (hgpu->layer_ids[i] == il) {
+                        hi = i;
+                        break;
+                    }
+                }
+                if (hi < 0 || dflash_capture_n_tokens_dfl > hgpu->max_tokens) {
+                    continue;
+                }
+
+                ggml_tensor * h_slice = ggml_view_2d(ctx0, cur,
+                    cur->ne[0], dflash_capture_n_tokens_dfl,
+                    cur->nb[1],
+                    (size_t) s * (size_t) dflash_capture_n_tokens_dfl * cur->nb[1]);
+                ggml_tensor * h_dst = ggml_view_2d(ctx0, hgpu->layers[hi],
+                    hgpu->layers[hi]->ne[0], (int64_t) dflash_capture_n_tokens_dfl,
+                    hgpu->layers[hi]->nb[1], 0);
+                ggml_build_forward_expand(gf, ggml_cpy(ctx0, h_slice, h_dst));
+            }
+        }
+
+        // DFlash prefill suffix-span GPU capture (ported from gboddaer/main).
+        if (cparams.prefill_gpu_n_seqs > 0 &&
+            cparams.dflash_prefill_capture_active &&
+            cparams.dflash_prefill_n_tokens > 0 &&
+            cur->ne[1] == dflash_capture_n_tokens_dfl * dflash_capture_n_seqs_dfl) {
+            for (int s = 0; s < (int) dflash_capture_n_seqs_dfl && s < cparams.prefill_gpu_n_seqs; ++s) {
+                const int n_copy  = cparams.dflash_prefill_n_tokens_seqs[s];
+                const int src_off = cparams.dflash_prefill_src_offsets[s];
+                const int dst_off = cparams.dflash_prefill_dst_offsets[s];
+                if (n_copy <= 0 || src_off < 0 || src_off + n_copy > dflash_capture_n_tokens_dfl) {
+                    continue;
+                }
+
+                auto * pgpu = cparams.prefill_gpu_seqs[s];
+                if (!pgpu) {
+                    continue;
+                }
+
+                int hi = -1;
+                for (int i = 0; i < (int) pgpu->layer_ids.size(); ++i) {
+                    if (pgpu->layer_ids[i] == il) {
+                        hi = i;
+                        break;
+                    }
+                }
+                if (hi < 0 || dst_off < 0 || dst_off + n_copy > pgpu->max_tokens) {
+                    continue;
+                }
+
+                ggml_tensor * h_slice = ggml_view_2d(ctx0, cur,
+                    cur->ne[0], (int64_t) n_copy,
+                    cur->nb[1],
+                    (size_t) s * (size_t) dflash_capture_n_tokens_dfl * cur->nb[1] +
+                    (size_t) src_off * cur->nb[1]);
+                ggml_tensor * h_cont = ggml_cont(ctx0, h_slice);
+                ggml_tensor * h_dst = ggml_view_2d(ctx0, pgpu->layers[hi],
+                    pgpu->layers[hi]->ne[0], (int64_t) n_copy,
+                    pgpu->layers[hi]->nb[1],
+                    (size_t) dst_off * pgpu->layers[hi]->nb[1]);
+                ggml_build_forward_expand(gf, ggml_cpy(ctx0, h_cont, h_dst));
+            }
+        }
+
         // Input for next layer
         inpL = cur;
     }
@@ -415,10 +496,24 @@ ggml_tensor * llama_model_qwen35moe::graph::build_layer_attn_linear(
     state = ggml_reshape_4d(ctx0, state, head_v_dim, head_v_dim, num_v_heads, n_seqs);
     cb(state, "state_predelta", il);
 
-    ggml_tensor * conv_output_proper = ggml_ssm_conv(ctx0, conv_input, conv_kernel);
-    cb(conv_output_proper, "conv_output_raw", il);
+    const bool tree_mode = (tree_parent_ids != nullptr && n_seq_tokens > 1 && n_seqs == 1 &&
+                            n_seq_tokens <= ggml_nelements(tree_parent_ids));
 
-    ggml_tensor * conv_output_silu = ggml_silu(ctx0, conv_output_proper);
+    ggml_tensor * conv_output_proper;
+    if (tree_mode) {
+        conv_output_proper = ggml_ssm_conv_tree(ctx0, conv_input, conv_kernel, tree_parent_ids);
+        cb(conv_output_proper, "conv_output_tree", il);
+    } else {
+        conv_output_proper = ggml_ssm_conv(ctx0, conv_input, conv_kernel);
+        cb(conv_output_proper, "conv_output_raw", il);
+    }
+
+    ggml_tensor * conv_output_silu;
+    if (tree_mode) {
+        conv_output_silu = conv_output_proper;
+    } else {
+        conv_output_silu = ggml_silu(ctx0, conv_output_proper);
+    }
     cb(conv_output_silu, "conv_output_silu", il);
 
     ggml_tensor * conv_qkv_mix = conv_output_silu;

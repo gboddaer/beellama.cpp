@@ -4271,6 +4271,15 @@ private:
                 scoped_timer timer(t_sampl, n_sampl);
                 id = common_sampler_sample(slot.smpl.get(), slot.ctx_tgt, tok_idx);
             }
+            if (std::getenv("GGML_NODFLASH_TOKEN_TRACE")) {
+                llama_token raw_argmax = LLAMA_TOKEN_NULL;
+                if (const float * logits = llama_get_logits_ith(slot.ctx_tgt, tok_idx)) {
+                    const int n_vocab = llama_vocab_n_tokens(llama_model_get_vocab(llama_get_model(slot.ctx_tgt)));
+                    raw_argmax = (llama_token)(std::max_element(logits, logits + n_vocab) - logits);
+                }
+                fprintf(stderr, "[NODFLASH_TOK] slot=%d tok_idx=%d sampled=%d target_argmax=%d\n",
+                    slot.id, tok_idx, (int) id, (int) raw_argmax);
+            }
 
             slot.i_batch = -1;
 

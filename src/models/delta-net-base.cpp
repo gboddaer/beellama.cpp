@@ -432,6 +432,46 @@ std::pair<ggml_tensor *, ggml_tensor *> llm_build_delta_net_base::build_delta_ne
         ggml_tensor * s,
         int           il) {
     const int64_t n_seq_tokens = q->ne[2];
+    const int64_t n_seqs_in    = q->ne[3];
+
+    // DDTree: use the tree-aware kernel when parent ids are set for a single-sequence
+    // multi-token verification batch. Multi-sequence batches fall back to the normal
+    // fused/chunked paths because parent_ids and persistent scratch are sized for one tree.
+    if (tree_parent_ids && n_seq_tokens > 1 && n_seqs_in == 1 && tree_ssm_intermediates &&
+        n_seq_tokens <= ggml_nelements(tree_parent_ids)) {
+        int recurrent_idx = 0;
+        for (int i = 0; i < il; ++i) {
+            if (hparams.is_recurrent(i)) {
+                ++recurrent_idx;
+            }
+        }
+
+        GGML_ASSERT(recurrent_idx < tree_n_recurrent_layers);
+        ggml_tensor * persist_inter = (*tree_ssm_intermediates)[recurrent_idx];
+
+        const int64_t S_v      = v->ne[0];
+        const int64_t H_v      = v->ne[1];
+        const int64_t n_tokens = v->ne[2];
+        const int64_t n_seqs   = v->ne[3];
+
+        ggml_tensor * result = ggml_gated_delta_net_tree(ctx0, q, k, v, g, b, s, tree_parent_ids, persist_inter);
+        cb(result, "fgdn_tree", il);
+
+        ggml_tensor * output = ggml_view_4d(ctx0, result,
+                S_v, H_v, n_tokens, n_seqs,
+                ggml_row_size(result->type, S_v),
+                ggml_row_size(result->type, S_v * H_v),
+                ggml_row_size(result->type, S_v * H_v * n_tokens), 0);
+
+        ggml_tensor * new_state = ggml_view_4d(ctx0, result,
+                S_v, S_v, H_v, n_seqs,
+                ggml_row_size(result->type, S_v),
+                ggml_row_size(result->type, S_v * S_v),
+                ggml_row_size(result->type, S_v * S_v * H_v),
+                ggml_row_size(result->type, S_v * H_v * n_tokens * n_seqs));
+
+        return {output, new_state};
+    }
 
     if (n_seq_tokens == 1) {
         if (cparams.fused_gdn_ar) {
@@ -453,7 +493,8 @@ ggml_tensor * llm_build_delta_net_base::build_conv_state(
         ggml_tensor *        qkv_mixed,
         int64_t              conv_kernel_size,
         int64_t              conv_channels,
-        int                  il) {
+        int                  il,
+        bool                 qkv_mixed_transposed) {
     const auto * mctx_cur = inp->mctx;
 
     const auto kv_head  = mctx_cur->get_head();
@@ -467,8 +508,10 @@ ggml_tensor * llm_build_delta_net_base::build_conv_state(
     conv_states = ggml_reshape_3d(ctx0, conv_states, conv_kernel_size - 1, conv_channels, n_seqs);
     cb(conv_states, "conv_states_reshaped", il);
 
-    qkv_mixed = ggml_transpose(ctx0, qkv_mixed);
-    cb(qkv_mixed, "qkv_mixed_transposed", il);
+    if (!qkv_mixed_transposed) {
+        qkv_mixed = ggml_transpose(ctx0, qkv_mixed);
+        cb(qkv_mixed, "qkv_mixed_transposed", il);
+    }
 
     ggml_tensor * conv_input = ggml_concat(ctx0, conv_states, qkv_mixed, 0);
     cb(conv_input, "conv_input", il);

@@ -645,7 +645,13 @@ std::vector<llama_token> common_sampler_sample_and_accept_n(struct common_sample
     for (; i < draft.size(); i++) {
         const llama_token id = common_sampler_sample(gsmpl, ctx, idxs[i], grammar_first);
         if (enable_qa_trace) {
-            fprintf(stderr, "[DFLASH_QA] sample_accept i=%zu idx=%d match=%d\n", i, idxs[i], draft[i] == id ? 1 : 0);
+            llama_token raw_argmax = LLAMA_TOKEN_NULL;
+            if (const float * logits = llama_get_logits_ith(ctx, idxs[i])) {
+                const int n_vocab = llama_vocab_n_tokens(llama_model_get_vocab(llama_get_model(ctx)));
+                raw_argmax = (llama_token)(std::max_element(logits, logits + n_vocab) - logits);
+            }
+            fprintf(stderr, "[DFLASH_QA] sample_accept i=%zu idx=%d draft=%d target_argmax=%d sampled=%d match=%d\n",
+                i, idxs[i], (int) draft[i], (int) raw_argmax, (int) id, draft[i] == id ? 1 : 0);
         }
 
         common_sampler_accept(gsmpl, id, true);
@@ -653,6 +659,10 @@ std::vector<llama_token> common_sampler_sample_and_accept_n(struct common_sample
         result.push_back(id);
 
         if (draft[i] != id) {
+            if (enable_qa_trace) {
+                fprintf(stderr, "[DFLASH_QA] sample_accept REJECT at i=%zu (draft=%d sampled=%d) -> break\n",
+                    i, (int) draft[i], (int) id);
+            }
             break;
         }
     }
@@ -660,7 +670,7 @@ std::vector<llama_token> common_sampler_sample_and_accept_n(struct common_sample
     if (i == draft.size()) {
         const llama_token id = common_sampler_sample(gsmpl, ctx, idxs[i], grammar_first);
         if (enable_qa_trace) {
-            fprintf(stderr, "[DFLASH_QA] sample_accept bonus_i=%zu idx=%d\n", i, idxs[i]);
+            fprintf(stderr, "[DFLASH_QA] sample_accept bonus_i=%zu idx=%d bonus_sampled=%d\n", i, idxs[i], (int) id);
         }
 
         common_sampler_accept(gsmpl, id, true);

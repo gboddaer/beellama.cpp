@@ -877,3 +877,35 @@ Stop and ask the user whether they want a commit. If yes, use a concise commit m
 **Placeholder scan:** The plan avoids `TBD`, `TODO`, and vague test instructions. The only bracketed fields are in evidence sections that must be filled with measured data during execution.
 
 **Type consistency:** Script interfaces are consistent: `qwen36_compare.sh <output-dir>` writes runtime comparison output and `summary.txt`; `three_way_dflash_diff.sh <output-dir>` writes refs, stats, focused diffs, and blame artifacts.
+
+## Root Cause Notes
+
+### 2026-07-09 18:49 UTC - Code-verified Qwen35 tree-aware verifier graph comparison (gboddaer/main reference)
+
+**FACTS**
+- Comparison refs: `gboddaer/main` = `130ea2480` (reference), merge branch HEAD = `c5c17182e`. Code trusted over the prior 19:30 comments.
+- Tree-aware op usage in graph builders: `gboddaer/main` has `ggml_ssm_conv_tree`/`ggml_gated_delta_net_tree`/`tree_parent_ids` in qwen35.cpp, qwen35moe.cpp, delta-net-base.cpp (3 matches each); merge branch has 0 in all three.
+- qwen35.cpp: hidden_gpu capture PRESENT in merge (matches main). prefill_gpu capture ABSENT in merge (main lines 259-296). tape_gpu capture block ABSENT in merge (main lines 583+). tree_mode conv dispatch ABSENT in merge (main lines 513-528).
+- qwen35moe.cpp: ALL THREE capture blocks (hidden_gpu main:237, prefill_gpu main:268, tape_gpu main:593) ABSENT in merge; tree_mode conv dispatch ABSENT (main lines 523-536).
+- delta-net-base.cpp build_delta_net tree branch ABSENT in merge (main lines 440-457, `ggml_gated_delta_net_tree` with `tree_ssm_intermediates`/`persist_inter`).
+- build_conv_state signature diff (merge always transposes internally; main has `qkv_mixed_transposed` param, called with `true` after an explicit external transpose) VERIFIED EQUIVALENT: the transposed `qkv_mixed` in main is consumed ONLY by build_conv_state; downstream uses the saved `qkv_mixed_pretranspose`. Merge transposes a local copy. Net: one transpose before concat in both. NOT a root cause.
+- build_delta_net_fused K argument (merge passes K=1 explicitly; main omits) VERIFIED EQUIVALENT: `K_actual` is derived as 1 from the 4D recurrent state in both. NOT a root cause.
+- tape_gpu INFRASTRUCTURE is PRESENT and near-identical on merge: `dflash_tape_gpu_layer::qkv` allocated at llama-context.cpp:2268, `tape_gpu_n_seqs` set from `dflash_capture->tapes` (2106, 2672), graph-invalidation tracking present (6653-7041).
+- tape_gpu CONSUME sites PRESENT on merge and read `gpu_layer->qkv` directly: llama-context.cpp:3450, 3800 (`get_tensor_data(gpu_layer->qkv, ...)`), 5671. Gating `use_gpu_qkv = gpu_backend && gpu_layer && gpu_layer->qkv` (3756/5648). When true, line 3800 reads `gpu_layer->qkv` which ONLY the missing graph-builder block would write.
+- ALTERNATIVE CPU readback path exists on merge: `dflash_read_tensor` (llama-context.cpp:1773) via `tape_name_map` (2060-2071, includes `"linear_attn_qkv_mixed-"+il` matching qwen35.cpp:277) populates `tape.qkv_mixed`; CPU->GPU upload at 3637/3652. Whether the missing GPU block corrupts output depends on `use_gpu_qkv` being true at runtime.
+- Existing diagnostic on merge: `[dflash-tr-conv] layer=%d OK use_gpu_qkv=%d ...` (llama-context.cpp:3770), gated by `GGML_DFLASH_DEBUG=1` (env var `GGML_DFLASH_DEBUG`, dflash_diagnostic_debug_enabled at 1346-1352).
+- Test-model relevance: Qwen3.6-27B is DENSE -> uses qwen35.cpp (not qwen35moe.cpp). So for the observed regression, the Vulkan-relevant qwen35.cpp differences are: prefill_gpu (missing) and tape_gpu (missing, NEW). qwen35moe.cpp absences only affect MoE models. Tree pieces inert on Vulkan (ops unimplemented in Vulkan backend on both branches).
+
+**HYPOTHESES**
+- HYPOTHESIS A (newly elevated, Vulkan-relevant): missing tape_gpu graph-builder capture block in qwen35.cpp causes the corruption. `gpu_layer->qkv` is allocated and, when `use_gpu_qkv==true` on Vulkan, the replay path (llama-context.cpp:3800) reads it unwritten -> corrupt recurrent-state conv replay -> corrupt verifier logits on multi-token batches. Consistent with prior "first bad token from verifier row 0 of a multi-token batch" and "rollback necessary-but-not-sufficient" findings. NOT YET PROVEN: needs `use_gpu_qkv` runtime confirmation.
+- HYPOTHESIS B (from 19:30, still open): prefill_gpu capture missing in qwen35.cpp -> stale drafter cross-attention context. May bite longer prompts (for the 17-token test prompt the capture span = whole prompt).
+- DISPROVEN for Vulkan (re-affirmed): tree-aware conv/GDN dispatch port fixes the Vulkan regression. Vulkan implements neither tree op on either branch, so `tree_parent_ids` is null on Vulkan and both branches take the identical non-tree path. Tree port is for CUDA/tree-verify completeness only.
+
+**TEST RESULTS**
+- Static code comparison only (no build/run). Output files: `/tmp/cmp/{qwen35,qwen35moe,deltanet}.{main,merge}.cpp`.
+- New finding vs the 19:30 entry: the tape_gpu graph-builder capture block is missing in BOTH qwen35.cpp and qwen35moe.cpp on merge, and qwen35moe.cpp is missing all three capture blocks. The 19:30 NEXT STEPS list (a)-(e) omitted tape_gpu entirely.
+
+**NEXT STEPS**
+- Confirm HYPOTHESIS A at runtime before any code change (systematic debugging): build `llama-cli` (Vulkan) in the worktree; run Qwen3.6-27B DFlash comparison with `GGML_DFLASH_DEBUG=1`; inspect `[dflash-tr-conv] ... use_gpu_qkv=%d ...` lines. `use_gpu_qkv=1` during multi-token verification/replay confirms the missing tape_gpu block is a live bug (gpu_layer->qkv read unwritten). `use_gpu_qkv=0` with a working CPU-readback fallback disproves HYPOTHESIS A for the graph-builder path -> pivot to HYPOTHESIS B / server-side verifier+rollback.
+- If HYPOTHESIS A confirmed, apply the minimal port (Task 5 Strategy A, extended): restore tape_gpu capture in qwen35.cpp AND qwen35moe.cpp from `gboddaer/main` (qkv_mixed_pretranspose + k_conv/v_conv/gate/beta_presigmoid copies into tgpu->layers[li]), PLUS prefill_gpu (HYPOTHESIS B) and hidden_gpu for qwen35moe. Tree pieces ported for CUDA completeness but not expected to affect Vulkan.
+- If HYPOTHESIS A disproven, save failed diff per Task 5 Step 5 and pivot to the server-side verifier/rollback boundary.
