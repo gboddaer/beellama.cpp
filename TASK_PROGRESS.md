@@ -915,3 +915,27 @@ Built knowledge graphs for both fork and merge using graphify:
 - Merge-only: 107 nodes (new conversion, profile functions, renamed DFlash classes)
 - The missing functions (apply_dflash_effective_defaults, reset_dflash_only_args) have
   equivalent defaults in the merge's struct definition, so they're not the root cause.
+
+## 2026-07-09 09:50 UTC - Merge DFlash regression plan update
+
+### FACTS
+- Installed the Superpowers skill repository from `https://github.com/obra/superpowers` into `~/.pi/agent/skills/superpowers`.
+- Existing progress file `TASK_PROGRESS.md` was found and read for context.
+- `TASK_PROGRESS.md` contains prior merge/DFlash investigation sections, including HF-035 through HF-040, with prior notes on single-slot DFlash, multi-slot DFlash, hidden GPU capture, `n_outputs_max`, graph invalidation, and quality regressions.
+- Updated `docs/superpowers/plans/2026-07-09-fix-merge-llama-dflash-regression.md` to replace bisect-first investigation with a three-way semantic diff/blame workflow.
+- Updated the plan to require future agents to write progress to `TASK_PROGRESS.md` after each meaningful investigation or code step.
+- Updated the plan to require future reports and progress entries to separate `FACTS`, `HYPOTHESES`, `TEST RESULTS`, and `NEXT STEPS`.
+
+### HYPOTHESES
+- A three-way semantic diff/blame workflow is likely more appropriate than git bisect for this integration branch because the branch contains upstream merge resolution, WIP/debug/fixup commits, and possible non-buildable intermediate states.
+
+### TEST RESULTS
+- Command: `find . -iname '*task*progress*.md' -o -iname 'TASK_PROGRESS.md' -o -path './docs/superpowers/*TASK_PROGRESS*' | sort | head -100`
+- Result: Found `./TASK_PROGRESS.md`.
+- Command: read/summarize `TASK_PROGRESS.md` for DFlash and merge context.
+- Result: Existing DFlash/merge progress context was present and used to update the plan.
+- Output files: `docs/superpowers/plans/2026-07-09-fix-merge-llama-dflash-regression.md`
+
+### NEXT STEPS
+- Execute the plan from Task 1 using the three-way diff/blame workflow.
+- Keep updating `TASK_PROGRESS.md` after each task with facts separated from hypotheses.
