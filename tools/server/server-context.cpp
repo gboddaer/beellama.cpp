@@ -4333,6 +4333,14 @@ private:
 
             GGML_ASSERT(n_draft > 0);
 
+            if (std::getenv("GGML_DFLASH_QA_TRACE")) {
+                fprintf(stderr, "[DFLASH_QA] verify_pre slot=%d n_pos_before_draft=%d pos_next=%d id_last=%d n_draft=%zu seq_backup=%d spec_i_batch0=%d spec_draft=",
+                    slot.id, (int) slot.dflash_n_pos_before_draft, (int) slot.prompt.tokens.pos_next(), (int) slot.sampled, n_draft,
+                    (int) slot.dflash_seq_backup, slot.spec_i_batch.empty() ? -1 : slot.spec_i_batch[0]);
+                for (size_t i = 0; i < slot.spec_draft.size() && i < 4; ++i) fprintf(stderr, "%s%d", i ? "," : "", (int) slot.spec_draft[i]);
+                fprintf(stderr, "\n");
+            }
+
             // verify and try to accept the draft
             {
                 // save the sampler sampler state in case we need to restore it
@@ -4351,6 +4359,13 @@ private:
                     ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_FULL ||
                     (ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_RS && n_rollback > llama_n_rs_seq(ctx_tgt)) ||
                     force_dflash_ckpt;
+
+            if (std::getenv("GGML_DFLASH_QA_TRACE")) {
+                fprintf(stderr, "[DFLASH_QA] verify_post slot=%d accepted=%zu n_rollback=%u use_ckpt_tgt=%d seq_rm_type=%d n_rs_seq=%d test_rollback_env=%d all_accepted=%d\n",
+                    slot.id, accepted.size(), n_rollback, (int) use_ckpt_tgt, (int) ctx_tgt_seq_rm_type,
+                    (int) llama_n_rs_seq(ctx_tgt), std::getenv("GGML_DFLASH_TEST_ROLLBACK") ? 1 : 0,
+                    (int)(n_rollback == 0));
+            }
 
                 // check for partial draft acceptance
                 if (n_rollback > 0) {
