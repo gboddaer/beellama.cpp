@@ -1518,3 +1518,34 @@ Built knowledge graphs for both fork and merge using graphify:
 - Recommend: track the production DFlash rollback port as a dedicated follow-up. The next investigation should focus on WHY set_tape_recording(true) does not make cparams.tape_gpu_n_seqs > 0 in the verify-batch graph (trace cparams.tape_gpu_n_seqs at graph reservation; check the graph invalidation path at llama-context.cpp:6653-7041; compare with gboddaer/main's dflash_graph_tape_ready wiring at 6967-6989). Once the tape populates (n_tokens>0, tl.qkv written), the production rollback (already structurally present) should work.
 - Ship state remains Phase 1 (a3732a5c3): p1 IDENTICAL 19.3 t/s; p2/p3 have the residual late divergence + slow speed (the known Phase-2 residual). No regression.
 - Do NOT re-enable the production rollback until the tape populates correctly.
+
+## 2026-07-10 05:30 UTC - Plan execution: tape populates (n_tokens>0 ✅) but rollback still corrupts p1 (❌); reverted, NOT finalized
+
+### FACTS
+- Read the approved plan (/crypt/openclaw/workspace/dflash_rollback_plan.md). The plan's premise ("tape-readiness to graph-cparams wiring is missing") was INCORRECT: the wiring logic ALREADY EXISTS in the merge's src/llama-context.cpp (dflash_graph_tape_ready computation at 6946, tp->n_tokens population at 6971, cparams.tape_gpu_seqs assignment, graph invalidation via gf_res_prev->reset() at 6996). It is byte-identical to gboddaer/main (the merge even has an extra prev_hidden_ns invalidation improvement for HF-039/040).
+- Added a GGML_DFLASH_DEBUG-gated diagnostic in llama-context.cpp after the dflash_graph_tape_ready computation (fprintf to stderr: capture_active, tape_enabled, gpu_cap_ready, use_prefill_staging, n_tokens, tapes_empty, graph_tape_ready). Ran on the Phase 1 state (no port): capture_active=1, gpu_cap_ready=1, use_prefill_staging=0, n_tokens=4, tapes_empty=0, but tape_enabled=0 -> graph_tape_ready=0. So the ONLY failing condition was tape_enabled=0 (the merge never calls llama_set_tape_recording(true) in production).
+- Applied the fix: llama_set_tape_recording(ctx_tgt, true) before the verify decode + false after, in decode() (gated on DFlash + any slot has spec_draft). Re-ran with the diagnostic: tape_enabled=1, graph_tape_ready=1 for 16/18 batches (the first 2 are prefill with use_prefill_staging=1, correctly 0). CRITERION 1 (n_tokens>0) MET: 47 verify batches with n_tokens=4 (+ 7/8/7 batches with n_tokens=1/2/3 for partial re-decodes, + 1 prefill n_tokens=44).
+- Also re-applied the full coordinated port (tape_gpu graph block in qwen35.cpp + backup creation + production rollback in server-context.cpp). Built 0 errors.
+- CRITERION 2 (p1 identical) NOT MET: p1 DIVERGENT (line 6, 20 rollbacks, 10.4 t/s) even with the tape populated. The [DFLASH_QA] rollback trace shows n_reeval == n_hidden_keep (1=1, 2=2) — the re-decode count is CORRECT. So the corruption is NOT the re-decode count; it is in the rollback state restore + re-decode interaction itself (the restored recurrent state + re-decoded positions produce a WRONG recurrent state, even though the tape (tl.qkv) is now populated and the re-decode count is correct).
+- Per the user's instruction ("verify n_tokens>0 and p1 remains identical before finalizing"), since criterion 2 is NOT met, the port was NOT finalized.
+- REVERTED all port changes (server-context.cpp + qwen35.cpp + llama-context.cpp diagnostic) to the committed state (e7e206d0a). Rebuilt + verified: p1 back to IDENTICAL at 23.6 t/s. No regression shipped. Working tree clean.
+
+### HYPOTHESES
+- The tape population is now understood and fixable (set_tape_recording(true) before the verify decode -> tape_enabled=1 -> graph_tape_ready=1 -> tape populates, n_tokens>0). This is a small, verified change.
+- The REMAINING corruption (p1 divergent even with tape populated) is in the rollback+re-decode logic, NOT the tape population. Candidates: (i) the rollback keeps the verify batch's KV at accepted positions (flat mode: seq_rm(seq_id, n_past_before+n_accepted, -1)) while restoring the recurrent state to the backup — the kept KV (computed with the over-advanced verify state) may be inconsistent with the restored+re-decoded recurrent state; (ii) the re-decode at n_past_before+j conflicts with the kept KV at those positions (re-decoding at an existing position); (iii) the recurrent state cell_idx after seq_cp_recurrent(backup) + seq_rm may not be correctly positioned for the re-decode. These require comparing the merge's dflash_rollback + re-decode against gboddaer/main's EXACT sequence (main re-decodes slot.prompt.tokens[n_tokens_before_draft+j], merge re-decodes batch_tokens=[slot.sampled,spec_draft...]; main's n_pos_before_draft vs merge's dflash_n_pos_before_draft — these may differ by one position).
+- Most likely: dflash_n_pos_before_draft (= pos_next() BEFORE handle_last_sampled_token adds id_last) may be the position of id_last, while the re-decode should start at the position AFTER id_last (or the backup should be taken AFTER id_last is committed). A one-position offset in the backup/restore/re-decode alignment would corrupt the state.
+
+### TEST RESULTS
+- Command: add GGML_DFLASH_DEBUG diagnostic to llama-context.cpp; run p1 DFlash (Phase 1 state).
+- Result: graph_tape_ready=0 because tape_enabled=0 (the only failing condition). Confirmed set_tape_recording never called in production.
+- Command: add set_tape_recording(true/false) bracket around verify decode; run with diagnostic.
+- Result: tape_enabled=1, graph_tape_ready=1 for 16/18 batches. n_tokens=4 for 47 verify batches. CRITERION 1 MET.
+- Command: apply full coordinated port (tape block + backup + rollback + set_tape_recording); build; run p1 DFlash vs non-DFlash.
+- Result: p1 DIVERGENT (line 6, 20 rollbacks, 10.4 t/s). n_reeval==n_hidden_keep (correct count). CRITERION 2 NOT MET.
+- Command: git restore all 3 files; build; run p1.
+- Result: p1 IDENTICAL 23.6 t/s. Reverted clean.
+- Output files: /tmp/p2/diag2.{out,err}, /tmp/p2/tapecap.{out,err}, /tmp/p2/fullp1v2.{out,err}, /tmp/p2/revlast.out.
+
+### NEXT STEPS
+- The tape-population fix (set_tape_recording bracket) is verified and small. The remaining rollback corruption needs a focused investigation of the dflash_rollback + re-decode position alignment: compare dflash_n_pos_before_draft (merge) vs n_pos_before_draft/n_tokens_before_draft (main), and the re-decode token source (batch_tokens vs slot.prompt.tokens). The backup-creation timing (before vs after handle_last_sampled_token adds id_last) may cause a one-position offset that corrupts the restore+re-decode.
+- Do NOT finalize the port until p1 is identical WITH the rollback enabled. The shipped state remains Phase 1 (a3732a5c3): p1 IDENTICAL 23.6 t/s.
