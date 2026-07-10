@@ -1493,3 +1493,28 @@ Built knowledge graphs for both fork and merge using graphify:
 ### NEXT STEPS
 - The production rollback port is a deeper, multi-piece effort (tape-recording lifecycle + graph block + replay-gdn + re-decode + pre-expand). Recommend EITHER: (a) a focused follow-up that ports the tape-RECORDING lifecycle from gboddaer/main server-context.cpp (set_tape_recording/active_tape around the verify batch) FIRST, re-test that the tape populates (n_tokens>0, tl.qkv written) via GGML_DFLASH_DEBUG, THEN re-enable rollback; OR (b) accept the Phase 1 shader fix (a3732a5c3) as the milestone and track the p2/p3 residual as a follow-up issue. Do NOT re-enable the production rollback until the tape populates correctly (it corrupts otherwise).
 - Ship state remains: a3732a5c3 (Phase 1 shader fix, p1 IDENTICAL 19.5 t/s) + 100a9ae24 (Phase 2 QA trace, gated). No regression.
+
+## 2026-07-10 04:10 UTC - PHASE 2 full coordinated port attempt: tape STILL not populated (n_tokens=0) even with set_tape_recording(true); reverted
+
+### FACTS
+- Implemented the FULL coordinated production port (all pieces): (1) tape_gpu graph-builder capture block in qwen35.cpp build_layer_attn_linear (copies k_conv/v_conv/gate/beta_presigmoid/qkv_mixed into tgpu->layers[li].{k,v,gate,beta,qkv} when cparams.tape_gpu_n_seqs>0; saved beta_presigmoid before sigmoid); (2) draft-setup backup creation re-enabled (no env gate, cp_recurrent unconditional); (3) llama_set_tape_recording(ctx_tgt, true) before the verify decode + false after (in decode(); set_tape_recording(false) does NOT clear the tape buffer, only stops the graph block from running on subsequent decodes); (4) production rollback re-enabled (verify loop gates on DFlash type, not env). Built 0 errors.
+- Tested p1 with GGML_DFLASH_DEBUG=1 + GGML_DFLASH_QA_TRACE=1: STILL DIVERGENT (line 6, 20 rollbacks, 10.5 t/s). Tape diagnostics: n_tokens=0 for ALL 960 tape_replay_conv calls, use_gpu_qkv=1. So even with llama_set_tape_recording(true) before the verify decode, the tape is NOT populated (n_tokens stays 0, tl.qkv not written).
+- Root cause of the remaining failure: the tape-recording lifecycle does not propagate to the verify-batch graph cparams in the merge. set_tape_recording(true) sets dflash_capture->tape_enabled and clears n_tokens, but the graph builder's cparams.tape_gpu_n_seqs is NOT set > 0 for the verify-batch graph (or the graph is not invalidated/rebuilt to include the tape_gpu block). So the tape_gpu block (cparams.tape_gpu_n_seqs > 0) never runs -> tl.qkv never written -> tape_replay reads uninitialized GPU memory -> corrupt restore -> p1 diverges. The merge's upstream-derived server never wires the tape recording into the production verify graph reservation (it was env-gated test-only and the test path used a different, fuller wiring that is also missing).
+- REVERTED all port changes (server-context.cpp + qwen35.cpp) to the committed state (18becc071). Rebuilt + verified: p1 back to IDENTICAL at 19.3 t/s. No regression shipped. Working tree clean (no tracked modifications).
+- Shipped state: a3732a5c3 (Phase 1 shader slot fix) + 100a9ae24 (Phase 2 QA trace) + 18becc071 (Phase 2 port investigation docs). All pushed to gboddaer/merge_llama_into_beellama_2.
+
+### HYPOTHESES
+- The production DFlash rollback port requires fixing the tape-recording -> graph-cparams wiring: set_tape_recording(true) must cause cparams.tape_gpu_n_seqs > 0 AND the verify-batch graph must be invalidated/rebuilt so the tape_gpu block runs and populates tl.qkv (with n_tokens bookkept). gboddaer/main does this via a different server structure (the full ~652-line DFlash server integration, HF-017) that wires set_tape_recording + active_tape + dflash_graph_tape_ready (llama-context.cpp:6967-6989) into the verify graph reservation. The merge's upstream-derived server lacks this entire wiring path. Porting it is a substantial structural port, not a few edits.
+- This is beyond a quick fix and should be tracked as a dedicated follow-up: port gboddaer/main's full DFlash server integration (set_tape_recording + active_tape + dflash_graph_tape_ready + the verify graph reservation with tape_gpu_n_seqs>0) so the tape populates, THEN the production rollback (which is already structurally present) will work.
+
+### TEST RESULTS
+- Command: apply full coordinated port (tape block + recording + backup + rollback); build; GGML_DFLASH_DEBUG=1 run p1.
+- Result: p1 DIVERGENT (line 6, 20 rollbacks, 10.5 t/s); n_tokens=0 for all 960 tape_replay_conv calls (tape not populated even with recording enabled). Port still corrupts.
+- Command: git restore server-context.cpp + qwen35.cpp; build; run p1.
+- Result: p1 IDENTICAL 19.3 t/s. Reverted clean.
+- Output files: /tmp/p2/fullp1.{out,err}, /tmp/p2/rev.out.
+
+### NEXT STEPS
+- Recommend: track the production DFlash rollback port as a dedicated follow-up. The next investigation should focus on WHY set_tape_recording(true) does not make cparams.tape_gpu_n_seqs > 0 in the verify-batch graph (trace cparams.tape_gpu_n_seqs at graph reservation; check the graph invalidation path at llama-context.cpp:6653-7041; compare with gboddaer/main's dflash_graph_tape_ready wiring at 6967-6989). Once the tape populates (n_tokens>0, tl.qkv written), the production rollback (already structurally present) should work.
+- Ship state remains Phase 1 (a3732a5c3): p1 IDENTICAL 19.3 t/s; p2/p3 have the residual late divergence + slow speed (the known Phase-2 residual). No regression.
+- Do NOT re-enable the production rollback until the tape populates correctly.
