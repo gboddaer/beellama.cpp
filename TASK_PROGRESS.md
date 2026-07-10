@@ -1608,3 +1608,33 @@ Built knowledge graphs for both fork and merge using graphify:
 ### NEXT STEPS
 - Dump the full-attention KV (K cache for a non-recurrent layer, e.g., the first full-attention layer) at post_verify and post_reeval, compare with pre_verify. This requires adding a KV dump (the current dump only checks recurrent layers). Pinpoint whether the pre-verify KV [0, n_past_before) is modified by the verify decode, or the re-decode doesn't correctly re-compute the KV at [n_past_before, +1...].
 - Do NOT finalize the port. Criteria: n_tokens>0 ✅ (with port) but p1 identical ❌ (rollback corrupts full-attention KV at the first partial-accept). Ship state: a3732a5c3 (Phase 1) — p1 IDENTICAL 26.6 t/s.
+
+## 2026-07-10 12:00 UTC - KV-cache dump: BOTH recurrent state AND KV are CORRECT after rollback; ghost bug
+
+### FACTS
+- Implemented a full-attention KV-cache dump in llama_dflash_dump_recurrent_state_dbg: reads the K storage tensor for the first full-attention (non-recurrent) layer (kv_il=3, confirming Qwen3.6's hybrid pattern: layers 0,1,2 recurrent, 3 full-attention, ...) at the CURRENT positions (near kv_pos_max, using the position stride nb[1]). Dumped kv_pos_max + k_sum + k_abs (fingerprint of 512 K values at the current tail). Ran with F32 cache (--cache-type-k f32 --cache-type-v f32) for readable values.
+- KEY RESULT: post_reeval (after rollback+re-decode) MATCHES pre_verify (the next batch's backup) for BOTH the recurrent state (s_l + r_l, all layers) AND the full-attention KV (kv_pos_max + k_sum + k_abs):
+  - post_reeval pos=104: k_sum=-29.82, k_abs=430.6 == pre_verify pos=104: k_sum=-29.82, k_abs=430.6 ✅
+  - post_reeval pos=111: k_sum=-2.323, k_abs=446.6 == pre_verify pos=111: k_sum=-2.323, k_abs=446.6 ✅
+  - The KV carry-forward is correct: post_restore (after rollback, before re-decode) has kv_pm trimmed (e.g., 99), post_reeval has kv_pm restored (100), matching the next pre_verify.
+- So BOTH the delta-net recurrent state AND the full-attention KV cache are CORRECTLY restored by the rollback+re-decode. The state fingerprint (recurrent s_l/r_l + KV k_sum/k_abs) matches the correct carry-forward at every rollback.
+- YET p1 DIVERGES with the rollback (at token 53, the first rollback). This is a GHOST BUG: the state (recurrent + KV) is correct but the output (logits/argmax) diverges.
+- The divergence is NOT in the state. It must be in: (i) the logits computation (attention output / output_norm / LM_head) — something between the correct state and the argmax; (ii) a graph/buffer interaction between the re-decode (llama_decode with logits=false) and the next verify decode (llama_decode with logits=true) — the re-decode's graph (logits=false) differs from the verify graph (logits=true), and the graph cache / buffer reuse may cause a corruption; (iii) a detail the sum/abs fingerprint (512 values) doesn't capture (the actual K values differ in a way the sum/abs doesn't show, though sum/abs of 512 values matching is a strong signal).
+- Reverted all port + dump changes. Baseline IDENTICAL at 23.4 t/s. No regression.
+
+### HYPOTHESES
+- H-GHOST (lead): the re-decode (llama_decode with logits=false) leaves the graph/buffers in a state that makes the NEXT verify decode (logits=true) produce wrong logits despite the correct recurrent + KV state. The re-decode's graph (no LM head, no output buffer) differs from the verify graph (LM head + output), and the graph cache invalidation / buffer reuse between them may alias or corrupt the output buffer. This would explain why the state is correct but the logits are wrong.
+- H-DETAIL (lower): the K values differ in details the sum/abs fingerprint doesn't capture (unlikely — sum/abs of 512 matching values is a strong signal, but possible if the divergent values are a small fraction).
+- The next diagnostic: dump the actual LOGITS (the target's argmax token) right after the next verify decode (the batch AFTER the rollback) and compare with non-DFlash. If the logits diverge despite the correct state, the issue is in the logits computation or the graph/buffer. This requires dumping the logits tensor (or the argmax) during the verify decode after a rollback.
+
+### TEST RESULTS
+- Command: add KV dump to dflash_dump_recurrent_state_dbg (K storage at current tail via position stride nb[1]); re-apply full port + RS_DUMP calls; build; run with F32 cache + GGML_DFLASH_RS_DUMP.
+- Result: post_reeval = pre_verify for BOTH recurrent state AND KV (kv_pos_max + k_sum + k_abs). State fully correct. But p1 diverges (ghost bug).
+- Command: git restore all; baseline nodflash vs dflash.
+- Result: IDENTICAL 23.4 t/s. No regression.
+- Output files: /tmp/p2/fix.err (F32 KV dumps), /tmp/p2/curtail.err, /tmp/p2/tail.err, /tmp/p2/f32.err.
+
+### NEXT STEPS
+- Dump the actual logits/argmax during the verify decode AFTER a rollback (the batch at pos=104, which uses the correct post-reeval state). Compare the argmax with non-DFlash. If the argmax diverges despite the correct state, the issue is in the logits computation or graph/buffer management (H-GHOST). 
+- A targeted test for H-GHOST: run the re-decode with logits=TRUE (instead of false) to see if forcing the output buffer allocation fixes the divergence (if the graph/buffer aliasing is the cause, allocating the output in the re-decode would prevent the aliasing).
+- Do NOT finalize the port. Criteria: n_tokens>0 ✅ but p1 identical ❌ (ghost bug — state correct but logits diverge). Ship state: a3732a5c3 (Phase 1) — p1 IDENTICAL 23.4 t/s.
