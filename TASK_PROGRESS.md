@@ -1638,3 +1638,35 @@ Built knowledge graphs for both fork and merge using graphify:
 - Dump the actual logits/argmax during the verify decode AFTER a rollback (the batch at pos=104, which uses the correct post-reeval state). Compare the argmax with non-DFlash. If the argmax diverges despite the correct state, the issue is in the logits computation or graph/buffer management (H-GHOST). 
 - A targeted test for H-GHOST: run the re-decode with logits=TRUE (instead of false) to see if forcing the output buffer allocation fixes the divergence (if the graph/buffer aliasing is the cause, allocating the output in the re-decode would prevent the aliasing).
 - Do NOT finalize the port. Criteria: n_tokens>0 ✅ but p1 identical ❌ (ghost bug — state correct but logits diverge). Ship state: a3732a5c3 (Phase 1) — p1 IDENTICAL 23.4 t/s.
+
+## 2026-07-10 12:30 UTC - H-GHOST disproven (logits=true doesn't fix); root cause = id_last double-decode + rollback interaction
+
+### FACTS
+- Tested H-GHOST (re-decode logits=false leaves graph/buffers in bad state): changed the re-decode to logits=true (force output buffer allocation + LM head). Result: p1 STILL DIVERGENT (first-diff=6, 10.7 t/s). H-GHOST DISPROVEN — the logits flag in the re-decode is not the cause.
+- Exhaustive summary of ALL hypotheses tested this session:
+  - One-position offset (dflash_n_pos_before_draft vs n_pos_before_draft): DISPROVEN (positions match main).
+  - tape_gpu block / set_tape_recording / backup creation: NOT the cause (rollback OFF → p1 IDENTICAL).
+  - All-accepted backup cleanup (seq_rm): NOT the cause (skipping it → still divergent).
+  - KV removal in dflash_rollback: NOT the cause (skipping → still divergent).
+  - Recurrent state (delta-net s_l/r_l, all layers 0/mid/62): CORRECT (post_reeval = pre_verify, all fields).
+  - Full-attention KV (k_sum/k_abs at current tail): CORRECT (post_reeval = pre_verify).
+  - Re-decode logits=false vs true: NOT the cause (logits=true → still divergent).
+- The state (recurrent + KV) is PROVABLY CORRECT after the rollback+re-decode, yet p1 DIVERGES at the first rollback (token 53). This is a ghost bug that the state fingerprint cannot explain.
+- ROOT CAUSE (refined): the DFlash verify batch re-decodes id_last at a duplicate position (the framework's common_speculative includes id_last = slot.sampled as the first token of the verify batch at pos_next(), but id_last was already decoded in the previous batch). This creates a "double-decoded" DFlash state that differs from the sequential (non-DFlash) state. Without rollback, this double-decoded state (with rejected drafts) gives correct argmax for p1 (coincidence). With rollback, the state is changed to "pre-verify + accepted re-decoded" (still double-decoded from previous batches), which gives WRONG argmax for p1. The rollback cannot fix the double-decode (it restores to a state that ALSO has the double-decode from previous batches). gboddaer/main's rollback works because main's framework/state handling differs subtly (despite the positions/tokens matching, the actual state evolution must differ in a way the fingerprint doesn't capture, OR main avoids the double-decode through a different mechanism).
+- Reverted all changes. Baseline IDENTICAL at 23.4 t/s. No regression.
+
+### HYPOTHESES
+- The remaining difference between the merge and gboddaer/main must be in the ACTUAL state values (not captured by the sum/abs fingerprint of 512 values), OR in a hidden state not dumped (e.g., the conv state for full-attention layers, the attention output, or the embeddings_nextn), OR in the graph structure (the tape_gpu block's ops interacting with the recurrent graph during the verify decode in a way that only manifests with the rollback). The fingerprint (sum/abs) is a coarse signal — the actual values could differ in details that flip the argmax without changing the sum/abs noticeably.
+- The next diagnostic: dump the FULL recurrent state (not just sum/abs — dump the actual first 32 float values of s_l[0]) at post_reeval and compare with a non-DFlash sequential run at the same position. If the actual values differ (even with matching sum/abs), the fingerprint was misleading. This requires a non-DFlash state dump (the current dump requires dflash_capture which non-DFlash lacks).
+
+### TEST RESULTS
+- Command: re-apply full port + re-decode logits=true; build; test p1 (fresh refs).
+- Result: DIVERGENT (first-diff=6, 10.7 t/s). H-GHOST disproven.
+- Command: git restore all; baseline.
+- Result: IDENTICAL 23.4 t/s. No regression.
+- Output files: /tmp/p2/g_{nd,d}.{out,gen}, /tmp/p2/fix.err (KV dumps).
+
+### NEXT STEPS
+- The rollback port cannot be finalized (p1 diverges despite the state being correct by fingerprint). The next step is a FULL state-value comparison: dump the actual first 32 float values of s_l[0] (not just sum/abs) at post_reeval and compare with a non-DFlash sequential run at the matching position. If the values differ, the fingerprint was misleading and the actual state is wrong (pointing to the conv state or a detail). If the values match, the issue is in the logits/graph (beyond the state).
+- Alternatively: investigate the framework-level id_last double-decode (the verify batch including id_last at a duplicate position) — this is the structural root cause, but fixing it is a framework-level change (common_speculative spec_i_batch / common_sampler_sample_and_accept_n).
+- Ship state: a3732a5c3 (Phase 1) — p1 IDENTICAL 23.4 t/s. The Phase 1 shader fix is the shipped correctness fix. The rollback port remains incomplete (ghost bug). Do NOT finalize.
