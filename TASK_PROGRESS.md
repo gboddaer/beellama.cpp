@@ -1702,3 +1702,30 @@ Built knowledge graphs for both fork and merge using graphify:
 ### NEXT STEPS
 - Fix the cell-pos misalignment: after the rollback restore, the cell pos should be dflash_n_pos_before_draft - 1 (the backup's state position), not dflash_n_pos_before_draft + 1. Investigate seq_cp_recurrent / seq_rm in llama-context.cpp to find why the cell pos is set to n_past+1. The fix may be: (a) correct seq_cp_recurrent to copy the cell pos from the backup, or (b) add a cell-pos adjustment (e.g., llama_memory_seq_rm(seq_id, dflash_n_pos_before_draft, -1) to trim the cell pos to n_past-1) after the restore, or (c) adjust the re-decode to start at the cell pos (n_past+1) instead of n_past (but this would decode id_last at the wrong position).
 - Do NOT finalize the port. Criteria: n_tokens>0 ✅ but p1 identical ❌ (cell-pos misalignment in the re-decode). Ship state: a3732a5c3 (Phase 1) — p1 IDENTICAL 23.4 t/s.
+
+## 2026-07-10 18:00 UTC - Cell-pos trim fix: PARTIAL improvement (8 lines → 1 line divergent), state still differs 1-8%
+
+### FACTS
+- Implemented the cell-pos trim fix: after llama_dflash_rollback, add `llama_memory_seq_rm(mem, slot.id, slot.dflash_n_pos_before_draft, -1)` to trim the recurrent cells from n_pos_before_draft onwards, aligning the cell pos with the backup's state position (n_pos-1) so the re-decode at n_pos advances correctly. Also used accepted tokens (instead of original drafts) and 1-token-at-a-time re-decode (AR path). Built OK.
+- RESULT: p1 output MUCH CLOSER — the diff changed from "6,13c" (8 lines divergent, before the fix) to "6c" (1 line divergent, after the fix). So the cell-pos trim fix is a PARTIAL fix — it significantly improved correctness but did not achieve full p1 identity.
+- The svals (first 32 s_l[0] values) at post_reeval still DIFFER from nodflash by 1-8% (e.g., pos=100: 2.1%, pos=103: 5.0%, pos=107: 8.1%). So the recurrent state after the re-decode is still wrong (but closer than before the fix, where it was 0.4-8.1% with a different pattern).
+- The cell-pos trim fix changed the rollback behavior (9 post_reeval events vs 4 before), suggesting the fix altered the partial-accept/rollback pattern (the state being closer changed which drafts are accepted/rejected).
+- The remaining 1-line divergence is at a specific rollback where the 1-8% state difference flips the argmax. The state is CLOSE but not identical to sequential.
+- Reverted all changes. Baseline IDENTICAL at 23.6 t/s. No regression.
+
+### HYPOTHESES
+- The cell-pos trim fix is the RIGHT DIRECTION (output improved from 8 to 1 line divergent) but INCOMPLETE. The remaining 1-8% state difference suggests the re-decode still doesn't perfectly reproduce the sequential state. Candidates: (i) the cell-pos trim removes one too many/few cells (off-by-one in the trim range); (ii) the seq_cp_recurrent restore + the trim + the re-decode interact subtly (the recurrent state tensors vs the cell metadata alignment); (iii) the conv state (r_l) is not correctly restored/advanced (the dump only checks s_l, not r_l at the rollback positions with the fix); (iv) the 1-token re-decode at the trimmed cell pos still has a residual misalignment.
+- The next step: with the cell-pos trim fix applied, dump the svals at post_restore (after the trim) and post_reeval, and compare with nodflash at the EXACT matching state (accounting for the pos semantics). If post_restore (after trim) = nodflash at n_pos-1, the restore+trim is correct, and the re-decode is the remaining issue. If post_restore ≠ nodflash, the trim removed too much/too little.
+
+### TEST RESULTS
+- Command: apply cell-pos trim fix + accepted tokens + 1-token re-decode; build; test p1 (fresh refs).
+- Result: p1 diff "6c" (1 line divergent, down from "6,13c" 8 lines). PARTIAL fix.
+- Command: RS_DUMP svals comparison (post_reeval vs nodflash).
+- Result: svals differ 1-8% at 9 rollback positions. State still wrong but closer.
+- Command: git restore; baseline.
+- Result: IDENTICAL 23.6 t/s. No regression.
+- Output files: /tmp/p2/cf_{nd,d}.{out,gen}, /tmp/p2/cf4_{d,nd}.{out,err}.
+
+### NEXT STEPS
+- The cell-pos trim fix is a promising partial fix (8→1 line divergent). Refine it: dump post_restore (after trim) svals vs nodflash at n_pos-1 to verify the trim range. If the trim is off-by-one, adjust the range. If the trim is correct, investigate the re-decode (conv state r_l, or the 1-token AR path at the trimmed cell pos).
+- Do NOT finalize. Criteria: n_tokens>0 ✅ but p1 identical ❌ (1 line divergent, state 1-8% off). Ship state: a3732a5c3 (Phase 1) — p1 IDENTICAL 23.6 t/s.
