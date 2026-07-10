@@ -1577,3 +1577,34 @@ Built knowledge graphs for both fork and merge using graphify:
 - The rollback port cannot be finalized until the RESTORE corruption is fixed. The next step is an empirical recurrent-state-dump comparison: dump the state at backup/verify/restore/re-decode points and compare with non-DFlash to find where the state diverges. This requires adding llama_dflash_dump_recurrent_state_dbg calls and a non-DFlash comparison run.
 - Ship state remains Phase 1 (a3732a5c3): p1 IDENTICAL 19.4 t/s. The tape-population fix (set_tape_recording) is verified (n_tokens>0) but cannot be shipped until the rollback restore is correct (p1 must remain identical).
 - Do NOT finalize the port. Both user criteria (n_tokens>0 ✅ + p1 identical ❌) are not simultaneously met.
+
+## 2026-07-10 10:30 UTC - Empirical recurrent-state-dump: recurrent state CORRECT, full-attention KV is the corruptor
+
+### FACTS
+- Used llama_dflash_dump_recurrent_state_dbg to dump the recurrent state (s_l + r_l for layers 0, mid, 62) at 4 points: pre_verify (backup), post_verify (after verify decode), post_restore (after llama_dflash_rollback, before re-decode), post_reeval (after re-decode). Also extended the dump to add rL0 (layer 62's conv state) and sM0 (middle layer's s_l).
+- KEY RESULT: post_reeval MATCHES pre_verify for ALL dumped fields (s0/sum/abs for layer 0, sL0/sLsum/sLabs for layer 62, r0/rsum/rabs for layer 0's conv, rL0/rLsum/rLab for layer 62's conv, sM0/sMsum for the middle layer). So the recurrent state (delta-net layers) is CORRECTLY restored by the rollback+re-decode.
+- But p1 DIVERGES with the rollback. So the corruption is NOT in the recurrent state (delta-net layers).
+- Pinpointed the EXACT first divergence via token traces (GGML_DFLASH_QA_TRACE + GGML_NODFLASH_TOKEN_TRACE): first divergence at TOKEN INDEX 53 (DFlash=1577, non-DFlash=7722), at pos ~100 (batch 13). This is exactly at the FIRST partial-accept rollback (4 rollbacks total in the -n 80 run). Earlier "line 6" was a text-line artifact (line 6 of the thinking section corresponds to token 53, not token 20).
+- Qwen3.6-27B is a HYBRID model: each layer is either build_layer_attn_linear (delta-net, recurrent state in mem_recr, checked by the dump) or build_layer_attn (full attention with KV cache in mem_attn, NOT checked by the dump). The is_recr pattern (llama-hparams.cpp:27: `il % n_pattern != 0` or `il % n_pattern < n_pattern-1`) means most layers are recurrent (delta-net) and every Nth layer is full-attention (KV cache).
+- The rollback's mem_attn->seq_rm (flat mode: seq_rm(seq_id, n_past_before + n_accepted, -1) + seq_rm(seq_backup, -1, -1) + if n_reeval>0: seq_rm(seq_id, n_past_before, -1)) + the re-decode handle the full-attention KV. The recurrent state (mem_recr) is correctly restored (dumped), but the full-attention KV (mem_attn) is apparently left in a WRONG state after the rollback+re-decode -> the full-attention layers' output is wrong -> logits wrong -> divergence at the first rollback.
+- Isolation tests (all with FRESH references from the same build): set_tape_recording + tape_gpu block + backup, rollback OFF → p1 IDENTICAL. Rollback ON → p1 DIVERGENT at token 53. Empty rollback block → IDENTICAL. Block = only dflash_seq_backup=-1 → IDENTICAL. Block = full if/else (with llama_dflash_rollback for partial-accept) → DIVERGENT at token 53. So the partial-accept llama_dflash_rollback + re-decode is the SOLE corruptor, and it corrupts the full-attention KV (not the recurrent state, which is correct).
+- Reverted all port changes. Baseline IDENTICAL at 26.6 t/s. No regression.
+
+### HYPOTHESES
+- The rollback's full-attention KV handling is wrong. The rollback restores the recurrent state (delta-net) correctly but leaves the full-attention KV (mem_attn) in an inconsistent state after the seq_rm + re-decode. Candidates: (i) the re-decode doesn't correctly re-compute the full-attention KV for the re-decoded positions (logits=false might skip KV store for some path, or the positions conflict with freed cells); (ii) the full-attention KV at [0, n_past_before) was modified by the verify decode (e.g., SWA sliding window shifted); (iii) the seq_rm on mem_attn removes the wrong range (n_past_before + n_accepted vs the actual KV positions for the hybrid model).
+- The next diagnostic: dump the full-attention KV (K cache for a non-recurrent layer) at post_verify vs post_reeval and compare with the pre_verify (backup) KV. If the KV at [0, n_past_before) differs between post_reeval and pre_verify, the verify decode or the rollback modified the pre-verify KV (wrong). If [n_past_before, +1...] differs, the re-decode didn't correctly re-compute.
+
+### TEST RESULTS
+- Command: add llama_dflash_dump_recurrent_state_dbg calls at 4 points; extend dump with rL0/sM0; run DFlash -n 60 with GGML_DFLASH_RS_DUMP.
+- Result: post_reeval = pre_verify (ALL fields, including extended rL0/sM0). Recurrent state correct.
+- Command: token traces (GGML_DFLASH_QA_TRACE + GGML_NODFLASH_TOKEN_TRACE); Python compare.
+- Result: first divergence at token 53 (pos ~100, first rollback). 4 rollbacks total.
+- Command: isolation (fresh refs) — rollback OFF/ON, empty block, only var, full if/else.
+- Result: rollback ON (full if/else) is the sole corruptor; divergence at token 53 (first rollback).
+- Command: git restore; baseline nodflash vs dflash.
+- Result: IDENTICAL 26.6 t/s. No regression.
+- Output files: /tmp/p2/rs2.err, /tmp/p2/tt_d.{out,err}, /tmp/p2/tt_nd.{out,err}, /tmp/p2/{bl_nodflash,bl_dflash,pf_nd,pf_d,of_nd,of_d,eb_nd,eb_d,ov_nd,ov_d,rev_nd,rev_d}.out.
+
+### NEXT STEPS
+- Dump the full-attention KV (K cache for a non-recurrent layer, e.g., the first full-attention layer) at post_verify and post_reeval, compare with pre_verify. This requires adding a KV dump (the current dump only checks recurrent layers). Pinpoint whether the pre-verify KV [0, n_past_before) is modified by the verify decode, or the re-decode doesn't correctly re-compute the KV at [n_past_before, +1...].
+- Do NOT finalize the port. Criteria: n_tokens>0 ✅ (with port) but p1 identical ❌ (rollback corrupts full-attention KV at the first partial-accept). Ship state: a3732a5c3 (Phase 1) — p1 IDENTICAL 26.6 t/s.
