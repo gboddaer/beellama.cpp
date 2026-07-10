@@ -1413,3 +1413,83 @@ Built knowledge graphs for both fork and merge using graphify:
 ### NEXT STEPS
 - Implement the server-context.cpp port (map main's slot.seq_id_backup / n_pos_before_draft / n_tokens_before_draft / n_hidden_keep / all_accepted_flat / is_draft_tree / commit_depth onto the merge's verify loop and slot members). Build; re-run p1/p2/p3 DFlash vs non-DFlash greedy. Expect: p1 stays identical; p2 duplicate-436 gone + tokens match non-DFlash longer; p2/p3 speed recovers toward ~19.7-19.8 t/s. Keep the verify_pre/verify_post QA trace gated for the verification run, then decide whether to keep or remove.
 - This port is larger and riskier than the shader fix (the merge took upstream's server, so the verify-loop structure differs from main's). Do NOT commit until verified; ask the user before the port if a checkpoint is wanted.
+
+## 2026-07-09 23:15 UTC - PHASE 2 checkpoint commit + production verify/rollback port START
+
+### FACTS
+- Checkpoint committed + pushed Phase 2 QA trace as commit 100a9ae24 to gboddaer/merge_llama_into_beellama_2 ("dflash(server): add verify_pre/verify_post QA trace for n_past/seq_backup (Phase 2 diagnostic)"). Remote head now 100a9ae24.
+- Re-confirmed the exact gating that makes the merge's DFlash rollback dead in production:
+  - Draft-setup backup-creation block (server-context.cpp ~3351-3362) is gated by `std::getenv("GGML_DFLASH_TEST_ROLLBACK")` -> never runs in production -> dflash_seq_backup stays -1, dflash_n_pos_before_draft stays 0 (matches the QA trace: seq_backup=-1, n_pos_before_draft=0 every batch).
+  - Verify-loop rollback block (~4404-4445) is gated by `std::getenv("GGML_DFLASH_TEST_ROLLBACK") && slot.dflash_seq_backup >= 0` -> never runs in production.
+  - Both blocks are otherwise structurally close to gboddaer/main's production path (backup = slot.id + slots.size() + llama_memory_seq_cp_recurrent; on partial accept llama_dflash_rollback + re-decode accepted tokens; on all-accepted rm seq_backup).
+- The merge's backup cp_recurrent is INSIDE `if (llama_context_recurrent_expand(...))` with an `else { dflash_seq_backup = -1; }`. recurrent_expand returns false once the backup seq already exists (after the first batch), so even with the env gate removed, subsequent batches would set dflash_seq_backup=-1 and skip cp. The cp must be moved out of the `if (expand)` so it runs whenever the slot exists (expand creates it on first batch; it already exists on later batches).
+
+### HYPOTHESES
+- The production port is a SMALL, server-context.cpp-only change (the llama-context.cpp rollback infrastructure is already present and identical): (1) in the draft-setup block, drop the GGML_DFLASH_TEST_ROLLBACK env gate and move llama_memory_seq_cp_recurrent out of the `if (recurrent_expand)` so the backup is always created for DFlash; (2) in the verify-loop rollback block, drop the env gate (gate on DFlash type instead) so llama_dflash_rollback + re-decode runs in production on partial accept. This should make seq_backup real and restore the recurrent state after every partial accept -> eliminate the duplicate-436 / drift and recover p2/p3 speed.
+
+### NEXT STEPS
+- Apply the two edits. Build. Re-run p1 (must stay identical), p2/p3 DFlash vs non-DFlash greedy (expect divergence gone + speed recovered). Keep GGML_DFLASH_QA_TRACE on for the verification run to confirm seq_backup is now real and rollbacks happen on partial accepts.
+- If verified, commit the port; ask the user before pushing.
+
+### TEST RESULTS
+- (port not yet applied)
+
+## 2026-07-09 23:35 UTC - PHASE 2 port attempt: naive production rollback REGRESSES p1; reverted
+
+### FACTS
+- Applied the minimal production port (two edits in server-context.cpp): (1) draft-setup backup-creation block - drop the GGML_DFLASH_TEST_ROLLBACK env gate, move llama_memory_seq_cp_recurrent out of `if (recurrent_expand)` so the backup is always created for DFlash; (2) verify-loop rollback block - gate on DFlash type instead of the env var, so llama_dflash_rollback + re-decode runs in production on partial accept. Built 0 errors.
+- QA trace after port (p2): seq_backup now real (=1 every batch, was -1), n_pos_before_draft now correct (81/85/89...), 58 rollback events (was 0). So the mechanism engaged as intended.
+- BUT the port REGRESSED correctness and speed: p1 DFlash diverged (was IDENTICAL) at gen line 6 with 21 partial accepts (was 0) and 10.7 t/s (was 19.7); p2 8.0 t/s divergent; p3 8.5 t/s divergent.
+- Isolation test (backup-creation ON, rollback OFF): p1 stays IDENTICAL to non-DFlash but slows to 13.1 t/s with 11 partial accepts (was 0) and 0 rollbacks. So:
+  - backup-creation alone does NOT corrupt correctness (p1 identical), but it increases partial accepts (0->11) and slows generation (19.7->13.1 t/s). The per-batch `llama_context_recurrent_expand` (expanding the recurrent memory to the backup seq) is the likely cause of the extra rejections/slowdown (it perturbs the target recurrent state each batch, causing more draft rejections even though the resampled token still matches non-DFlash greedy for short p1).
+  - the rollback+re-decode path is what CORRUPTS p1 (divergent). So the merge's llama_dflash_rollback + re-decode (batch_tokens=[slot.sampled, spec_draft...] at dflash_n_pos_before_draft+j) is itself BUGGY: enabling it corrupts the recurrent state, not restores it.
+- Reverted server-context.cpp to the checkpoint state (commit 100a9ae24, env-gated test path). Rebuilt + verified: p1 back to IDENTICAL at 19.6 t/s. No regression introduced; the Phase 1 shader fix (commit a3732a5c3) remains the shipped correctness fix.
+- Working tree: only TASK_PROGRESS.md modified (this entry); server-context.cpp is back at 100a9ae24.
+
+### HYPOTHESES
+- The production DFlash verify/rollback port is NOT a simple gate-removal. Two distinct sub-issues:
+  - H-A (slowdown): per-batch llama_context_recurrent_expand perturbs the target recurrent state / causes extra draft rejections. gboddaer/main pre-expands the recurrent memory ONCE (llama_context_recurrent_expand(ctx_tgt, n_seq_max_full) at setup, server-context.cpp lines 2106/2649) rather than per-batch; the merge does it per-batch. Fix: pre-expand once at setup (port main's n_seq_max_full pre-expansion) instead of per-batch.
+  - H-B (corruption): the merge's llama_dflash_rollback + re-decode produces a wrong recurrent state. Candidates: (i) llama_dflash_rollback/tape_replay restores the wrong state (the merge's tape_replay infrastructure is "identical" per the diff, but the tape_gpu graph-builder capture block is MISSING - per the 19:30/Phase-1 finding - so the tape buffers gpu_layer->qkv are never written -> tape_replay_conv reads uninitialized data -> corrupt restore); (ii) the re-decode uses batch_tokens=[slot.sampled, spec_draft...] (includes the full draft list) and indexes [0..n_reeval), which may re-decode a rejected draft or use wrong positions vs main's `slot.prompt.tokens[n_tokens_before_draft+j]`. The most likely is (i): the missing tape_gpu graph-builder block (qwen35.cpp/qwen35moe.cpp) means the GPU tape is empty, so llama_dflash_rollback's tape_replay reads garbage -> corrupt recurrent state. This ties back to the Phase-1 finding that the tape_gpu capture block is missing and was NOT exercised by llama-cli (use_gpu_qkv not confirmed) - but llama_dflash_rollback DOES exercise tape_replay, so the missing tape_gpu block would bite once rollback is enabled.
+
+### TEST RESULTS
+- Command: apply 2-edit port; build; GGML_DFLASH_QA_TRACE=1 run p1/p2/p3 DFlash + non-DFlash.
+- Result: p1 diverged (21 partial accepts, 10.7 t/s); p2 8.0 t/s; p3 8.5 t/s. seq_backup=1 real, 58 rollbacks (p2). Port regressed.
+- Command: isolation - revert verify-loop gate to env-gated (rollback off), keep backup creation; build; run p1.
+- Result: p1 IDENTICAL but 13.1 t/s, 11 partial accepts, 0 rollbacks. Backup-creation alone correct but slow; rollback+re-decode corrupts.
+- Command: git restore server-context.cpp (revert to 100a9ae24); build; run p1.
+- Result: p1 IDENTICAL 19.6 t/s. Reverted clean.
+- Output files: /tmp/p2/port-*.{out,err}, /tmp/p2/iso1-dflash.{out,err}, /tmp/p2/revert-dflash.out.
+
+### NEXT STEPS
+- The port requires fixing H-B (rollback corruption) and H-A (slowdown) BEFORE it can be enabled. H-B most likely ties to the missing tape_gpu graph-builder capture block (Phase-1 finding): port that block into qwen35.cpp/qwen35moe.cpp so the GPU tape is populated, then re-test the production rollback. H-A: pre-expand the recurrent memory once at setup (port main's n_seq_max_full pre-expansion) instead of per-batch.
+- Do NOT re-enable the production rollback until H-B is fixed (it corrupts). The shipped state (100a9ae24 + Phase 1 shader fix a3732a5c3) remains: p1 correct (IDENTICAL, 19.6 t/s); p2/p3 have the residual late divergence + slow speed (the known Phase-2 residual). This is strictly better than the naive port (which regressed p1).
+- Ask the user before further port work (the rollback port is now a multi-piece effort: tape_gpu block + pre-expand + rollback, not a single gate-removal).
+
+## 2026-07-09 23:55 UTC - PHASE 2 multi-piece port attempt: tape_gpu block alone does NOT fix rollback corruption; reverted, deeper port needed
+
+### FACTS
+- Proceeded with Option A (multi-piece port). First confirmed H-B with a diagnostic: re-applied the production rollback port (both server-context.cpp edits), ran p1 with GGML_DFLASH_DEBUG=1. tape_replay_conv ran 1008 times with use_gpu_qkv=1, qkv_mixed.size=0 (CPU tape empty), n_tokens=0, n_accepted=1. So on partial-accept rollback the GPU path reads gpu_layer->qkv (the GPU tape buffer) which is NEVER written by the graph -> reads uninitialized GPU memory -> corrupt recurrent-state restore -> p1 diverges. H-B confirmed.
+- Ported the tape_gpu graph-builder capture block into qwen35.cpp build_layer_attn_linear (after cb(v_conv,"v_conv_predelta")): copies k_conv/v_conv/gate/beta_presigmoid/qkv_mixed into tgpu->layers[li].{k,v,gate,beta,qkv} when cparams.tape_gpu_n_seqs>0. (Saved beta_presigmoid before the sigmoid.) Built OK (after fixing colon-leak edit artifacts). qwen35moe.cpp NOT yet ported (dense test uses qwen35.cpp).
+- Re-tested p1 WITH the tape_gpu block + production rollback ON: STILL DIVERGENT (line 6, 21 partial accepts, 21 rollbacks, 10.6 t/s). GGML_DFLASH_DEBUG=1 still shows n_tokens=0 for every tape_replay_conv call.
+- So the tape_gpu graph-builder block alone does NOT fix the corruption. The GPU tape buffer tl.qkv is allocated (use_gpu_qkv=1, gpu_layer->qkv non-null) but either (a) the block is not running during the verify-batch graph (tape_gpu_n_seqs may be 0 in the verify-batch cparams - the tape RECORDING lifecycle is not enabled for production verify in the merge), and/or (b) the tape n_tokens bookkeeping (set by the recording logic, not the graph block) stays 0, and/or (c) tape_replay_gdn (the GDN recurrent-state replay) and/or the re-decode (llama_decode of batch_tokens at dflash_n_pos_before_draft+j) are themselves wrong on the merge.
+- The merge's production DFlash verify/rollback is therefore a MULTI-PIECE port, not a 2-edit gate-removal: (1) enable the tape RECORDING lifecycle for the production verify batch (set_tape_recording / active_tape / tape_gpu_n_seqs in the verify-batch cparams + n_tokens bookkeeping), (2) the tape_gpu graph block (done for qwen35.cpp, pending qwen35moe.cpp), (3) tape_replay_gdn correctness, (4) the re-decode (positions/tokens - main uses slot.prompt.tokens[n_tokens_before_draft+j] at n_pos_before_draft+j; merge uses batch_tokens=[slot.sampled,spec_draft...] which may re-decode a rejected draft or use wrong offsets), (5) pre-expand the recurrent memory once at setup (not per-batch) for the slowdown (H-A).
+- REVERTED both port attempts (server-context.cpp production rollback + qwen35.cpp tape_gpu block) to the checkpoint state (100a9ae24). Rebuilt + verified: p1 back to IDENTICAL at 19.5 t/s. No regression shipped. The Phase 1 shader slot fix (a3732a5c3) remains the shipped correctness fix.
+- Working tree: only TASK_PROGRESS.md modified (this entry + the prior port-start entry). server-context.cpp and qwen35.cpp are back at 100a9ae24 / a3732a5c3.
+
+### HYPOTHESES
+- The production rollback port needs the full tape-RECORDING lifecycle from gboddaer/main (not just the graph-builder block): the merge took upstream's server which never wires tape recording into the production verify path (it was env-gated test-only). gboddaer/main's server sets the tape active/recording around the verify batch (set_tape_recording / active_tape / dflash_graph_tape_ready at llama-context.cpp:6967-6989) so tape_gpu_n_seqs>0 in the verify-batch cparams and n_tokens is bookkept. Without that, the graph block never runs and tl.qkv stays uninitialized.
+- The re-decode may also need main's exact token/position source (slot.prompt.tokens[n_tokens_before_draft+j]) rather than the merge's batch_tokens=[slot.sampled, spec_draft...].
+- These are separable sub-pieces; each must be verified (the naive enable corrupts, so the port must be done piece-by-piece with the QA trace confirming the tape populates and the recurrent state restores correctly before re-enabling rollback).
+
+### TEST RESULTS
+- Command: re-apply production rollback port; GGML_DFLASH_DEBUG=1 run p1.
+- Result: tape_replay_conv 1008x use_gpu_qkv=1 n_tokens=0 -> reads uninitialized gpu_layer->qkv -> p1 diverges. H-B confirmed.
+- Command: add tape_gpu graph block to qwen35.cpp; build; run p1 with rollback ON.
+- Result: still divergent (line 6, 21 rollbacks, 10.6 t/s); n_tokens still 0. Block alone insufficient.
+- Command: git restore server-context.cpp + qwen35.cpp; rebuild; run p1.
+- Result: p1 IDENTICAL 19.5 t/s. Reverted clean.
+- Output files: /tmp/p2/dbg-dflash.{out,err}, /tmp/p2/tape-dflash.{out,err}, /tmp/p2/dbg2.{out,err}, /tmp/p2/final-dflash.out.
+
+### NEXT STEPS
+- The production rollback port is a deeper, multi-piece effort (tape-recording lifecycle + graph block + replay-gdn + re-decode + pre-expand). Recommend EITHER: (a) a focused follow-up that ports the tape-RECORDING lifecycle from gboddaer/main server-context.cpp (set_tape_recording/active_tape around the verify batch) FIRST, re-test that the tape populates (n_tokens>0, tl.qkv written) via GGML_DFLASH_DEBUG, THEN re-enable rollback; OR (b) accept the Phase 1 shader fix (a3732a5c3) as the milestone and track the p2/p3 residual as a follow-up issue. Do NOT re-enable the production rollback until the tape populates correctly (it corrupts otherwise).
+- Ship state remains: a3732a5c3 (Phase 1 shader fix, p1 IDENTICAL 19.5 t/s) + 100a9ae24 (Phase 2 QA trace, gated). No regression.
