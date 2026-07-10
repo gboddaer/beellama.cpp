@@ -1670,3 +1670,35 @@ Built knowledge graphs for both fork and merge using graphify:
 - The rollback port cannot be finalized (p1 diverges despite the state being correct by fingerprint). The next step is a FULL state-value comparison: dump the actual first 32 float values of s_l[0] (not just sum/abs) at post_reeval and compare with a non-DFlash sequential run at the matching position. If the values differ, the fingerprint was misleading and the actual state is wrong (pointing to the conv state or a detail). If the values match, the issue is in the logits/graph (beyond the state).
 - Alternatively: investigate the framework-level id_last double-decode (the verify batch including id_last at a duplicate position) — this is the structural root cause, but fixing it is a framework-level change (common_speculative spec_i_batch / common_sampler_sample_and_accept_n).
 - Ship state: a3732a5c3 (Phase 1) — p1 IDENTICAL 23.4 t/s. The Phase 1 shader fix is the shipped correctness fix. The rollback port remains incomplete (ghost bug). Do NOT finalize.
+
+## 2026-07-10 16:00 UTC - Full state-value comparison: re-decode cell-pos misalignment is the root cause
+
+### FACTS
+- Modified dflash_dump_recurrent_state_dbg to work without dflash_capture (find recurrent layers via is_recr) and dump the first 32 s_l[il0] values (svals) for precise comparison. Added dump calls at pre_verify (backup), post_restore (after rollback), post_reeval (after re-decode), and nodflash (non-DFlash sequential).
+- KEY RESULT 1: pre_verify (DFlash batch-decode state, BEFORE any rollback) MATCHES nodflash (sequential) at ALL positions (pos 47-83, 0.0000% diff, svals identical). So the DFlash batch decode = sequential (no numerical difference). The state is CORRECT before the rollback.
+- KEY RESULT 2: post_restore (after seq_cp_recurrent from backup) MATCHES pre_verify (svals identical). So the backup is correctly restored to seq_id. ✅
+- KEY RESULT 3: post_restore pos = dflash_n_pos_before_draft + 1 (e.g., post_restore pos=100 when dflash_n_pos_before_draft=99). The cell pos after the restore is ONE AHEAD of dflash_n_pos_before_draft.
+- KEY RESULT 4: post_reeval (after re-decode) ≠ nodflash (svals differ, growing divergence: 0.44% at pos=100, 3.3% at pos=102, 7.9% at pos=104, 8.1% at pos=111). The re-decode produces a WRONG state.
+- KEY RESULT 5: The re-decode at dflash_n_pos_before_draft (99) CONFLICTS with the cell pos (100) after the restore. The re-decode decodes id_last at pos 99, but the cell is at pos 100 (one ahead). This cell-pos misalignment causes the re-decode to advance from the wrong cell/position, producing a wrong state.
+- Tested fixes:
+  - Re-decode with accepted tokens (instead of original drafts): NO effect (accepted drafts == original drafts at accepted positions; rejected positions not re-decoded).
+  - Re-decode 1-token-at-a-time (AR path instead of batch): NO effect (the AR vs chunked path is not the issue; the cell-pos misalignment is).
+- ROOT CAUSE: the rollback's seq_cp_recurrent (or seq_rm) leaves the cell pos at dflash_n_pos_before_draft + 1 (one ahead of the backup's state position). The re-decode at dflash_n_pos_before_draft then conflicts with the cell pos, advancing from the wrong position → wrong state → divergence at the first rollback (token 53).
+- Reverted all changes. Baseline IDENTICAL at 23.4 t/s. No regression.
+
+### HYPOTHESES
+- The cell pos after the rollback restore should be dflash_n_pos_before_draft - 1 (the backup's last decoded position) or dflash_n_pos_before_draft (the position where id_last will be re-decoded). But it's dflash_n_pos_before_draft + 1 (one ahead). The seq_cp_recurrent copies the backup's recurrent state tensors but the cell pos metadata is set to the wrong value (possibly the post-verify cell pos, not the backup's cell pos). The re-decode at dflash_n_pos_before_draft then decodes at a position BEHIND the cell pos, causing a conflict/misalignment.
+- The fix: after the rollback restore, set the cell pos to dflash_n_pos_before_draft - 1 (or align it with the backup's state position) so the re-decode at dflash_n_pos_before_draft correctly advances from the backup. This requires either fixing seq_cp_recurrent to copy the cell pos correctly, OR adding a cell-pos adjustment after the restore in the server's rollback path.
+
+### TEST RESULTS
+- Command: rewrite dump (svals, no dflash_capture needed); add pre_verify/post_restore/post_reeval/nodflash dumps; run DFlash + non-DFlash with GGML_DFLASH_RS_DUMP; compare svals.
+- Result: pre_verify = nodflash (correct before rollback); post_restore = pre_verify (backup restored); post_restore pos = n_past+1 (cell pos misaligned); post_reeval ≠ nodflash (re-decode wrong, growing divergence).
+- Command: re-decode with accepted tokens; re-decode 1-token-at-a-time.
+- Result: both NO effect. The cell-pos misalignment is the cause, not the re-decode tokens or path.
+- Command: git restore; baseline.
+- Result: IDENTICAL 23.4 t/s. No regression.
+- Output files: /tmp/p2/pv_{d,nd}.{out,err}, /tmp/p2/pr_{d,nd}.{out,err}, /tmp/p2/fix2_{d,nd}.{out,err}.
+
+### NEXT STEPS
+- Fix the cell-pos misalignment: after the rollback restore, the cell pos should be dflash_n_pos_before_draft - 1 (the backup's state position), not dflash_n_pos_before_draft + 1. Investigate seq_cp_recurrent / seq_rm in llama-context.cpp to find why the cell pos is set to n_past+1. The fix may be: (a) correct seq_cp_recurrent to copy the cell pos from the backup, or (b) add a cell-pos adjustment (e.g., llama_memory_seq_rm(seq_id, dflash_n_pos_before_draft, -1) to trim the cell pos to n_past-1) after the restore, or (c) adjust the re-decode to start at the cell pos (n_past+1) instead of n_past (but this would decode id_last at the wrong position).
+- Do NOT finalize the port. Criteria: n_tokens>0 ✅ but p1 identical ❌ (cell-pos misalignment in the re-decode). Ship state: a3732a5c3 (Phase 1) — p1 IDENTICAL 23.4 t/s.
