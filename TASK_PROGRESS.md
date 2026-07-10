@@ -1549,3 +1549,31 @@ Built knowledge graphs for both fork and merge using graphify:
 ### NEXT STEPS
 - The tape-population fix (set_tape_recording bracket) is verified and small. The remaining rollback corruption needs a focused investigation of the dflash_rollback + re-decode position alignment: compare dflash_n_pos_before_draft (merge) vs n_pos_before_draft/n_tokens_before_draft (main), and the re-decode token source (batch_tokens vs slot.prompt.tokens). The backup-creation timing (before vs after handle_last_sampled_token adds id_last) may cause a one-position offset that corrupts the restore+re-decode.
 - Do NOT finalize the port until p1 is identical WITH the rollback enabled. The shipped state remains Phase 1 (a3732a5c3): p1 IDENTICAL 23.6 t/s.
+
+## 2026-07-10 06:00 UTC - One-position offset investigation: DISPROVEN; rollback RESTORE itself corrupts (even without re-decode)
+
+### FACTS
+- Investigated the one-position offset hypothesis. Compared the merge's verify-batch construction (handle_last_sampled_token: pos0 = pos_next(), adds sampled at pos0, drafts at pos0+1...) with gboddaer/main's (line 4744: common_batch_add(batch, slot.sampled, n_pos_before_draft, ...)). BOTH re-decode id_last (slot.sampled) at pos_next() = n_pos_before_draft. The QA trace confirms: batch 1 n_pos_before_draft=81 pos_next=85 (id_last=8160 at 81, bonus 1817 at 84); batch 2 n_pos_before_draft=85 (id_last=1817 at 85, re-decoded from batch 1's bonus at 84). This duplicate id_last decode is STANDARD speculative decoding (main does it too and main's rollback works). The one-position offset hypothesis is DISPROVEN — the positions match main.
+- The re-decode tokens (batch_tokens=[slot.sampled, spec_draft...] vs main's slot.prompt.tokens[n_tokens_before_draft+j]) are the SAME tokens (id_last + accepted drafts). The re-decode count n_reeval == n_hidden_keep (correct). tree_parent_ids is null (never set), so llama_clear_tree_parent_ids is a no-op (not the fix).
+- ISOLATION TEST: applied the full port (set_tape_recording + tape_gpu block + backup creation + production rollback) but DISABLED the re-decode (skipped llama_decode(batch_reeval)). Result: p1 STILL DIVERGENT (line 6, 15 rollbacks, 12.3 t/s). So the corruption is in the RESTORE itself (llama_dflash_rollback → seq_cp_recurrent from backup + tape_replay), NOT the re-decode.
+- This means: the backup (seq_cp_recurrent at draft setup) or the tape_replay produces a WRONG recurrent state when restored. Without the rollback, the over-advanced state (from the verify batch) happens to produce correct argmax for p1 (IDENTICAL). With the rollback, the restored backup state produces WRONG argmax (DIVERGENT). So the backup ≠ the correct pre-verify state.
+- REVERTED all port changes. p1 back to IDENTICAL at 19.4 t/s. No regression.
+
+### HYPOTHESES
+- The backup (seq_cp_recurrent from seq_id to seq_backup at draft setup) captures a recurrent state that, when restored by the rollback, does NOT match the correct pre-verify state. Candidates: (i) the backup is taken at the wrong time (after id_last is already in the recurrent state from the previous batch, but the rollback assumes it's before); (ii) the tape_replay (tape_replay_conv + tape_replay_gdn) reads the populated tl.qkv but reconstructs the conv/GDN state incorrectly on the merge (the tape data layout from the tape_gpu block may not match what tape_replay expects); (iii) the seq_cp_recurrent + seq_rm interaction leaves the recurrent state cell_idx misaligned.
+- The next diagnostic: use llama_dflash_dump_recurrent_state_dbg to dump the recurrent state (i) at backup creation, (ii) after the verify decode, (iii) after the rollback restore, (iv) after the re-decode — and compare with a non-DFlash sequential run's state at the matching position. This will pinpoint WHERE the state diverges.
+- This is a deep investigation that requires recurrent state comparison, beyond the position-alignment fix originally hypothesized.
+
+### TEST RESULTS
+- Command: compare merge handle_last_sampled_token with main's batch construction; check QA trace n_pos_before_draft progression.
+- Result: both re-decode id_last at pos_next()=n_pos_before_draft; positions match main. One-position offset DISPROVEN.
+- Command: full port with re-decode DISABLED (restore only); run p1.
+- Result: p1 DIVERGENT (line 6, 15 rollbacks, 12.3 t/s). RESTORE itself corrupts.
+- Command: git restore all; build; run p1.
+- Result: p1 IDENTICAL 19.4 t/s. Reverted clean.
+- Output files: /tmp/p2/iso_redecode.{out,err}, /tmp/p2/revf2.out.
+
+### NEXT STEPS
+- The rollback port cannot be finalized until the RESTORE corruption is fixed. The next step is an empirical recurrent-state-dump comparison: dump the state at backup/verify/restore/re-decode points and compare with non-DFlash to find where the state diverges. This requires adding llama_dflash_dump_recurrent_state_dbg calls and a non-DFlash comparison run.
+- Ship state remains Phase 1 (a3732a5c3): p1 IDENTICAL 19.4 t/s. The tape-population fix (set_tape_recording) is verified (n_tokens>0) but cannot be shipped until the rollback restore is correct (p1 must remain identical).
+- Do NOT finalize the port. Both user criteria (n_tokens>0 ✅ + p1 identical ❌) are not simultaneously met.
