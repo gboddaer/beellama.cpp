@@ -446,6 +446,8 @@ ggml_tensor * llama_model_qwen35::graph::build_layer_attn_linear(
     beta = ggml_reshape_4d(ctx0, beta, 1, num_v_heads, n_seq_tokens, n_seqs);
     cb(beta, "beta", il);
 
+    ggml_tensor * beta_presigmoid = beta;
+
     beta = ggml_sigmoid(ctx0, beta);
     cb(beta, "beta_sigmoid", il);
 
@@ -544,6 +546,21 @@ ggml_tensor * llama_model_qwen35::graph::build_layer_attn_linear(
     cb(q_conv, "q_conv_predelta", il);
     cb(k_conv, "k_conv_predelta", il);
     cb(v_conv, "v_conv_predelta", il);
+
+    if (cparams.tape_gpu_n_seqs > 0) {
+        for (int s = 0; s < (int)n_seqs && s < cparams.tape_gpu_n_seqs; ++s) {
+            auto * tgpu = cparams.tape_gpu_seqs[s];
+            if (!tgpu) continue;
+            int li = -1;
+            for (int i = 0; i < (int)tgpu->layer_ids.size(); ++i) { if (tgpu->layer_ids[i] == il) { li = i; break; } }
+            if (li < 0 || n_seq_tokens > tgpu->max_tokens) continue;
+            auto & tl = tgpu->layers[li];
+            ggml_tensor * qkv_slice = ggml_view_2d(ctx0, qkv_mixed, qkv_mixed->ne[0], n_seq_tokens, qkv_mixed->nb[1], s * qkv_mixed->nb[2]);
+            ggml_tensor * qkv_cont = ggml_cont(ctx0, qkv_slice);
+            ggml_tensor * qkv_dst = ggml_view_2d(ctx0, tl.qkv, tl.qkv->ne[0], (int64_t)n_seq_tokens, tl.qkv->nb[1], 0);
+            ggml_build_forward_expand(gf, ggml_cpy(ctx0, qkv_cont, qkv_dst));
+        }
+    }
 
     ggml_tensor * output = build_recurrent_attn(inp, ssm_states_all, q_conv, k_conv, v_conv, gate, beta, state, il);
 

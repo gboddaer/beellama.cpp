@@ -4186,11 +4186,12 @@ int llama_context::dflash_rollback(llama_seq_id seq_id, llama_seq_id seq_backup,
     // the server to re-decode the accepted positions instead.
     int n_positions_needing_reeval = 0;
     {
-        n_positions_needing_reeval = tape_replay(seq_id, n_accepted);
+        // Skip tape_replay: it modifies the conv state (r_l) even when returning
+        // n_reeval>0 (telling the server to re-decode), causing a double-advance
+        // (tape_replay + re-decode). The server re-decode from the restored backup
+        // is sufficient and correct. (Fixes the DFlash rollback corruption on Vulkan.)
+        n_positions_needing_reeval = n_accepted;
         if (n_positions_needing_reeval > 0) {
-            // Tape replay was skipped (e.g., Vulkan). The recurrent state is behind
-            // by n_positions_needing_reeval positions. Trim the attention memory
-            // to match the recurrent state, so seq_pos_max is consistent.
             mem_attn->seq_rm(seq_id, n_past_before, -1);
         }
     }

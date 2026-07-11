@@ -3349,17 +3349,13 @@ private:
                 llama_tape_replay_sync(ctx_tgt);
             }
             if (slot.can_speculate() && !slot.spec_draft.empty() &&
-                    params_base.speculative.has_type(COMMON_SPECULATIVE_TYPE_DFLASH) &&
-                    std::getenv("GGML_DFLASH_TEST_ROLLBACK")) {
+                    params_base.speculative.has_type(COMMON_SPECULATIVE_TYPE_DFLASH)) {
                 slot.dflash_seq_backup = slot.id + (llama_seq_id) slots.size();
                 slot.dflash_n_pos_before_draft = slot.prompt.tokens.pos_next();
-                if (llama_context_recurrent_expand(ctx_tgt, (uint32_t) slot.dflash_seq_backup + 1)) {
-                    auto * mem = llama_get_memory(ctx_tgt);
-                    llama_memory_seq_rm(mem, slot.dflash_seq_backup, -1, -1);
-                    llama_memory_seq_cp_recurrent(mem, slot.id, slot.dflash_seq_backup, -1, -1);
-                } else {
-                    slot.dflash_seq_backup = -1;
-                }
+                llama_context_recurrent_expand(ctx_tgt, (uint32_t) slot.dflash_seq_backup + 1);
+                auto * mem = llama_get_memory(ctx_tgt);
+                llama_memory_seq_rm(mem, slot.dflash_seq_backup, -1, -1);
+                llama_memory_seq_cp_recurrent(mem, slot.id, slot.dflash_seq_backup, -1, -1);
             }
             slot.handle_last_sampled_token(batch);
         });
@@ -4064,8 +4060,11 @@ private:
             }
         }
 
+        const bool dflash_tape_active = params_base.speculative.has_type(COMMON_SPECULATIVE_TYPE_DFLASH)
+            && std::any_of(slots.begin(), slots.end(), [](const server_slot & s) { return !s.spec_draft.empty(); });
+        if (dflash_tape_active) { llama_set_tape_recording(ctx_tgt, true); }
         const int ret = llama_decode(ctx_tgt, batch_view);
-
+        if (dflash_tape_active) { llama_set_tape_recording(ctx_tgt, false); }
         metrics.on_decoded(slots);
 
         if (ret != 0) {
@@ -4426,15 +4425,20 @@ private:
                 batch_tokens.push_back(slot.sampled);
                 batch_tokens.insert(batch_tokens.end(), slot.spec_draft.begin(), slot.spec_draft.end());
                 common_speculative_update_logits_deferred_dflash_kv(slot.get_spec(), ctx_tgt, batch_tokens, n_hidden_keep);
-                if (std::getenv("GGML_DFLASH_TEST_ROLLBACK") && slot.dflash_seq_backup >= 0) {
+                if (params_base.speculative.has_type(COMMON_SPECULATIVE_TYPE_DFLASH) && slot.dflash_seq_backup >= 0) {
                     const bool all_accepted_flat = n_accepted_draft == (int) slot.spec_draft.size();
                     if (!all_accepted_flat) {
                         const int n_reeval = llama_dflash_rollback(ctx_tgt, slot.id, slot.dflash_seq_backup,
                             slot.dflash_n_pos_before_draft, n_hidden_keep);
+                        {
+                            auto * mem_fix = llama_get_memory(ctx_tgt);
+                            llama_memory_seq_rm(mem_fix, slot.id, slot.dflash_n_pos_before_draft, -1);
+                        }
                         if (n_reeval > 0) {
                             llama_batch batch_reeval = llama_batch_init(n_reeval, 0, 1);
-                            for (int j = 0; j < n_reeval && j < (int) batch_tokens.size(); ++j) {
-                                common_batch_add(batch_reeval, batch_tokens[j], slot.dflash_n_pos_before_draft + j, { slot.id }, false);
+                            for (int j = 0; j < n_reeval; ++j) {
+                                llama_token tok = (j == 0) ? slot.sampled : accepted[j - 1];
+                                common_batch_add(batch_reeval, tok, slot.dflash_n_pos_before_draft + j, { slot.id }, false);
                             }
                             const int ret_reeval = llama_decode(ctx_tgt, batch_reeval);
                             llama_batch_free(batch_reeval);
