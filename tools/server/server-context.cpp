@@ -1355,10 +1355,17 @@ private:
             if (params_base.speculative.has_type(COMMON_SPECULATIVE_TYPE_DFLASH)) {
                 cparams.dflash_n_slots    = std::max(1, params_base.n_parallel);
                 cparams.dflash_cross_ctx  = params_base.speculative.dflash_cross_ctx;
-                // Ensure drafter has enough output positions for DFlash block_size drafts.
-                // (params_dft.n_outputs_max may have been copied from params_base which
-                // could be capped by server_n_outputs_max for DFlash.)
-                cparams.n_outputs_max = std::max<uint32_t>(cparams.n_outputs_max, 17);
+                // Size the drafter's output positions to the number of draft tokens actually
+                // consumed (n_draft + 1 = root + n_max drafts), NOT the full DFlash block_size.
+                // With n_outputs_max < block_size, the drafter graph (dflash_draft.cpp) uses
+                // build_inp_out_ids() to compute the LM head for only the needed rows instead
+                // of all block_size rows -- a ~4x smaller LM-head matmul (vocab 248320, weights
+                // shared from the 27B target), recovering main-parity drafter decode time
+                // (~23ms vs the ~54ms when n_outputs_max was forced to 17).
+                // The flat/batch draft only consumes argmax rows 1..n_draft (output_len =
+                // n_draft + 1), so n_draft + 1 output positions are sufficient.
+                cparams.n_outputs_max = std::max<uint32_t>(cparams.n_outputs_max,
+                    1u + (uint32_t) common_speculative_n_max(&params_base.speculative));
             }
 
             ctx_dft.reset(llama_init_from_model(model_dft.get(), cparams));
@@ -4153,7 +4160,7 @@ private:
                 if (params_base.speculative.has_type(COMMON_SPECULATIVE_TYPE_DFLASH)) {
                     llama_dflash_set_active_slot(ctx_tgt, pf.slot_id);
                 }
-                const int written = common_speculative_flush_prefill(pf_spec, pf.span.src_offset, pf.span.n_tokens);
+                const int written = common_speculative_flush_prefill(pf_spec, pf.span.src_offset, pf.span.n_tokens, pf.slot_id);
                 if (written != pf.span.n_tokens) {
                     SRV_ERR("dflash prefill flush mismatch: slot=%d requested=%d written=%d src_offset=%d; disabling DFlash drafting until fresh hiddens are available\n",
                             pf.slot_id, pf.span.n_tokens, written, pf.span.src_offset);
@@ -4424,7 +4431,7 @@ private:
                 llama_tokens batch_tokens;
                 batch_tokens.push_back(slot.sampled);
                 batch_tokens.insert(batch_tokens.end(), slot.spec_draft.begin(), slot.spec_draft.end());
-                common_speculative_update_logits_deferred_dflash_kv(slot.get_spec(), ctx_tgt, batch_tokens, n_hidden_keep);
+                common_speculative_update_logits_deferred_dflash_kv(slot.get_spec(), ctx_tgt, batch_tokens, n_hidden_keep, slot.id);
                 if (params_base.speculative.has_type(COMMON_SPECULATIVE_TYPE_DFLASH) && slot.dflash_seq_backup >= 0) {
                     const bool all_accepted_flat = n_accepted_draft == (int) slot.spec_draft.size();
                     if (!all_accepted_flat) {

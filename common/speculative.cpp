@@ -379,13 +379,13 @@ struct common_speculative_impl {
             common_speculative_tree         & /*tree*/) {}
 
     virtual void update_logits(llama_context * /*ctx*/, const llama_tokens & /*batch_tokens*/, int /*n_accepted*/) {}
-    virtual void update_logits_deferred_dflash_kv(llama_context * ctx, const llama_tokens & batch_tokens, int n_accepted) {
+    virtual void update_logits_deferred_dflash_kv(llama_context * ctx, const llama_tokens & batch_tokens, int n_accepted, llama_seq_id /*slot_id*/ = -1) {
         update_logits(ctx, batch_tokens, n_accepted);
     }
 
     virtual void update_logits_by_indices(llama_context * /*ctx*/, const std::vector<int> & /*capture_indices*/) {}
 
-    virtual int flush_prefill(int /*src_offset*/ = 0, int /*n_tokens*/ = 0) { return 0; }
+    virtual int flush_prefill(int /*src_offset*/ = 0, int /*n_tokens*/ = 0, llama_seq_id /*slot_id*/ = -1) { return 0; }
 
     virtual int prepare_batch_draft(llama_context * /*ctx_dft_ext*/) { return -1; }
 
@@ -2718,8 +2718,14 @@ struct common_speculative_impl_dflash : public common_speculative_impl {
         return true;
     }
 
-    int flush_prefill(int src_offset = 0, int n_tokens = 0) override {
-        llama_dflash_set_active_slot(ctx_tgt, seq_id);
+    int flush_prefill(int src_offset = 0, int n_tokens = 0, llama_seq_id slot_id = -1) override {
+        // The prefill plan/buffer are indexed by the PHYSICAL request slot (the server's
+        // slot.id), not this per-slot spec's internal seq_id (which is 0 by design: each
+        // slot has its own spec with n_seq=1). Use the caller-provided slot_id so a
+        // multi-slot server routes flush_prefill to the slot that scheduled the capture.
+        // Falls back to seq_id when no slot_id is provided (backward compat).
+        const llama_seq_id phys_slot = (slot_id >= 0) ? slot_id : seq_id;
+        llama_dflash_set_active_slot(ctx_tgt, phys_slot);
 
         prefill_flush_called = true;
         prefill_flush_requested += n_tokens;
@@ -2751,18 +2757,18 @@ struct common_speculative_impl_dflash : public common_speculative_impl {
 
             int32_t planned = 0;
             int32_t written = 0;
-            if (llama_dflash_prefill_capture_info(ctx_tgt, seq_id, &planned, &written)) {
+            if (llama_dflash_prefill_capture_info(ctx_tgt, phys_slot, &planned, &written)) {
                 captured = written;
             } else {
-                captured = llama_dflash_prefill_gpu_n_tokens(ctx_tgt, seq_id);
+                captured = llama_dflash_prefill_gpu_n_tokens(ctx_tgt, phys_slot);
             }
 
             // GPU staging is window-relative.
             offset = 0;
 
             if (n_tokens > 0 && captured < n_tokens) {
-                LOG_ERR("dflash prefill flush incomplete GPU capture: captured=%lld requested=%d seq=%d; refusing partial ring write\n",
-                        (long long) captured, n_tokens, seq_id);
+                LOG_ERR("dflash prefill flush incomplete GPU capture: captured=%lld requested=%d slot=%d; refusing partial ring write\n",
+                        (long long) captured, n_tokens, (int) phys_slot);
                 return 0;
             }
         } else {
@@ -2786,8 +2792,8 @@ struct common_speculative_impl_dflash : public common_speculative_impl {
 
             if (common_dflash_should_refuse_large_prefill_fallback_for_test(
                         n_tokens, (int) captured, use_prefill_gpu, gpu_ring_handle != nullptr)) {
-                LOG_ERR("dflash prefill flush expected GPU staging for large suffix span but only partial fallback capture is available: captured=%lld requested=%d seq=%d; refusing partial ring write\n",
-                        (long long) captured, n_tokens, seq_id);
+                LOG_ERR("dflash prefill flush expected GPU staging for large suffix span but only partial fallback capture is available: captured=%lld requested=%d slot=%d; refusing partial ring write\n",
+                        (long long) captured, n_tokens, (int) phys_slot);
                 return 0;
             }
 
@@ -2796,8 +2802,8 @@ struct common_speculative_impl_dflash : public common_speculative_impl {
             } else if (gpu_ring_handle) {
                 source = dflash_capture_source::verify_gpu_hidden;
             } else {
-                LOG_ERR("dflash prefill flush has GPU hidden capture but no GPU ring and no CPU hidden data: requested=%d seq=%d\n",
-                        n_tokens, seq_id);
+                LOG_ERR("dflash prefill flush has GPU hidden capture but no GPU ring and no CPU hidden data: requested=%d slot=%d\n",
+                        n_tokens, (int) phys_slot);
                 return 0;
             }
 
@@ -2855,10 +2861,10 @@ struct common_speculative_impl_dflash : public common_speculative_impl {
         }
 
         const bool force_cpu_ring_for_flush = source == dflash_capture_source::cpu_hidden;
-        const int actual_written = ring_write(to_write, offset, force_cpu_ring_for_flush, source);
+        const int actual_written = ring_write(to_write, offset, force_cpu_ring_for_flush, source, phys_slot);
         if (actual_written != to_write) {
-            LOG_ERR("dflash prefill flush wrote incomplete ring span: requested=%d written=%d seq=%d; discarding DFlash state\n",
-                    to_write, actual_written, seq_id);
+            LOG_ERR("dflash prefill flush wrote incomplete ring span: requested=%d written=%d slot=%d; discarding DFlash state\n",
+                    to_write, actual_written, (int) phys_slot);
             discard_cross_ring("incomplete prefill flush");
             return 0;
         }
@@ -3536,10 +3542,10 @@ struct common_speculative_impl_dflash : public common_speculative_impl {
         append_target_hiddens(n_accepted, false);
     }
 
-    void update_logits_deferred_dflash_kv(llama_context * ctx, const llama_tokens & batch_tokens, int n_accepted) override {
+    void update_logits_deferred_dflash_kv(llama_context * ctx, const llama_tokens & batch_tokens, int n_accepted, llama_seq_id slot_id = -1) override {
         GGML_UNUSED(ctx);
         GGML_UNUSED(batch_tokens);
-        append_target_hiddens(n_accepted, true);
+        append_target_hiddens(n_accepted, true, slot_id);
     }
 
     // tree variant: write specific capture-buffer indices to the ring
@@ -3587,9 +3593,17 @@ private:
     // write n_tokens from the capture buffer into the ring, starting at
     // src_offset in the capture buffer. wraps circularly in the ring.
     int ring_write(int n_tokens, int src_offset = 0, bool force_cpu_ring = false,
-                   dflash_capture_source source = dflash_capture_source::cpu_hidden) {
+                   dflash_capture_source source = dflash_capture_source::cpu_hidden,
+                   llama_seq_id phys_slot = -1) {
         if (n_tokens <= 0) return 0;
         ring_write_discarded = false;
+
+        // The prefill_gpu D2D write indexes prefill_gpu[slot]; use the physical request
+        // slot (passed from flush_prefill) so multi-slot servers read the slot that
+        // scheduled the capture. Falls back to seq_id when no phys_slot is provided
+        // (other ring_write callers — generation ring write — use the active slot via
+        // cross_ring_gpu_write_hidden, which has no slot param).
+        const llama_seq_id phys_slot_eff = (phys_slot >= 0) ? phys_slot : seq_id;
 
         const bool use_prefill_gpu = source == dflash_capture_source::prefill_gpu_hidden;
         const bool source_has_cpu_hidden = source == dflash_capture_source::cpu_hidden;
@@ -3673,7 +3687,7 @@ private:
                     if (!data) {
                         if (use_prefill_gpu) {
                             used_d2d = llama_dflash_prefill_gpu_write_hidden(
-                                gpu_ring_handle, ctx_tgt, seq_id, layer, plan.ring_pos,
+                                gpu_ring_handle, ctx_tgt, phys_slot_eff, layer, plan.ring_pos,
                                 src_offset + plan.src_token_offset, plan.n_tokens, embd);
                             if (!used_d2d) {
                                 used_d2d = llama_dflash_cross_ring_gpu_write_hidden(
@@ -3686,7 +3700,7 @@ private:
                                 src_offset + plan.src_token_offset, plan.n_tokens, embd);
                             if (!used_d2d) {
                                 used_d2d = llama_dflash_prefill_gpu_write_hidden(
-                                    gpu_ring_handle, ctx_tgt, seq_id, layer, plan.ring_pos,
+                                    gpu_ring_handle, ctx_tgt, phys_slot_eff, layer, plan.ring_pos,
                                     src_offset + plan.src_token_offset, plan.n_tokens, embd);
                             }
                         }
@@ -3872,12 +3886,16 @@ private:
     }
 
     // called after each verification decode — append only the accepted tokens' hidden states
-    void append_target_hiddens(int n_accepted, bool defer_drafter_kv_cache = false) {
+    void append_target_hiddens(int n_accepted, bool defer_drafter_kv_cache = false, llama_seq_id phys_slot = -1) {
         if (!common_dflash_target_capture_ready_or_skip(ctx_tgt)) {
             return;
         }
 
-        llama_dflash_set_active_slot(ctx_tgt, seq_id);
+        // Use the physical request slot (passed from the server via
+        // update_logits_deferred_dflash_kv) so multi-slot servers read the slot that
+        // captured during the verify decode. Falls back to seq_id when not provided.
+        const llama_seq_id phys_slot_eff = (phys_slot >= 0) ? phys_slot : seq_id;
+        llama_dflash_set_active_slot(ctx_tgt, phys_slot_eff);
 
         int32_t n_slots = llama_get_n_layer_hiddens(ctx_tgt);
         if (n_slots == 0) {
@@ -3914,7 +3932,7 @@ private:
         const int committed_before = committed_len;
         const int write_pos_before = ring_write_pos;
 
-        const int actual_written = ring_write(n_accepted);
+        const int actual_written = ring_write(n_accepted, 0, false, dflash_capture_source::cpu_hidden, phys_slot_eff);
         if (common_dflash_rx_diag_enabled()) {
             LOG_INF("DFLASH_RX append: seq=%d requested=%d actual_written=%d ring_filled_before=%d ring_filled_after=%d committed_before=%d write_pos_before=%d write_pos_after=%d discarded=%d defer_kv=%d\n",
                 seq_id, n_accepted, actual_written,
@@ -5082,12 +5100,12 @@ void common_speculative_update_logits(common_speculative * spec, llama_context *
     }
 }
 
-void common_speculative_update_logits_deferred_dflash_kv(common_speculative * spec, llama_context * ctx, const llama_tokens & batch_tokens, int n_accepted) {
+void common_speculative_update_logits_deferred_dflash_kv(common_speculative * spec, llama_context * ctx, const llama_tokens & batch_tokens, int n_accepted, llama_seq_id slot_id) {
     if (spec == nullptr) {
         return;
     }
     for (auto & impl : spec->impls) {
-        impl->update_logits_deferred_dflash_kv(ctx, batch_tokens, n_accepted);
+        impl->update_logits_deferred_dflash_kv(ctx, batch_tokens, n_accepted, slot_id);
         if (impl->type == COMMON_SPECULATIVE_TYPE_COPYSPEC) {
             static_cast<common_speculative_impl_copyspec *>(impl.get())->update_logits(ctx, batch_tokens, n_accepted);
         } else if (impl->type == COMMON_SPECULATIVE_TYPE_RECYCLE) {
@@ -5119,13 +5137,13 @@ void common_speculative_rollback_dft(common_speculative * spec, llama_seq_id seq
     }
 }
 
-int common_speculative_flush_prefill(common_speculative * spec, int src_offset, int n_tokens) {
+int common_speculative_flush_prefill(common_speculative * spec, int src_offset, int n_tokens, llama_seq_id slot_id) {
     if (spec == nullptr) {
         return 0;
     }
     int total_written = 0;
     for (auto & impl : spec->impls) {
-        total_written += impl->flush_prefill(src_offset, n_tokens);
+        total_written += impl->flush_prefill(src_offset, n_tokens, slot_id);
     }
     return total_written;
 }

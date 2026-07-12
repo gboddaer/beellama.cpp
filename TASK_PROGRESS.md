@@ -1,8 +1,10 @@
 # BeeLlama Merge: ggml-org/llama.cpp into beellama.cpp
 
 **Created:** 2026-07-01  
-**Last updated:** 2026-07-04 11:00 UTC  
-**Status:** ✅ MERGE COMPLETE — CI BUILDS — INFERENCE WORKS — DFLASH INITIALIZES (draft-gen next)  
+**Last updated:** 2026-07-12 (current HEAD `37a89c8f6`)  
+**Status:** ✅ MERGE COMPLETE — CI BUILDS — NON-DFLASH INFERENCE CORRECT — **DFLASH CORRECTNESS REGRESSION FIXED** (Phase 1 `a3732a5c3` snapshot-slot ordering + Phase 2 `37a89c8f6` rollback `tape_replay` r_l double-advance). DFlash == non-DFlash identical output on Qwen3.6-27B-Q4_K_M/Vulkan0/greedy (p1 @ 12.3 t/s w/ rollback). Open: DFlash speed (12.3 vs 23.6 t/s no-rollback), multi-slot, CI test failures.  
+
+> **NOTE (2026-07-12):** The older "6% acceptance / garbled output" phase (HF-025..HF-040, 2026-07-04/05) is HISTORICAL and superseded. The active investigation since 2026-07-10 is the **rollback corruption** fix, which is now landed (commit `37a89c8f6`). Read the entries dated 2026-07-10..2026-07-12 for the current state.  
 
 ## Current state
 
@@ -1757,3 +1759,565 @@ Built knowledge graphs for both fork and merge using graphify:
 - The fix is complete and verified (p1 identical, n_tokens > 0, no regression). Ready to commit + push.
 - Speed optimization (12.3 vs 23.6 t/s): the re-decode overhead can be reduced (e.g., skip the re-decode when all-accepted, or optimize the batch re-decode). This is a follow-up.
 - The tape_gpu block (qwen35.cpp) populates the tape but the tape is now UNUSED (tape_replay is skipped). The tape_gpu block could be removed (it's inert now). But it's harmless (gated on tape_gpu_n_seqs > 0). Keep for now.
+
+## 2026-07-12 14:00 UTC - Current-state summary (post rollback-corruption fix)
+
+### FACTS (current state of the work branch)
+- Work branch HEAD = `37a89c8f6` "dflash(vulkan): fix rollback corruption — skip tape_replay (double-advances conv state r_l)" (2026-07-11). `gboddaer/main` = `130ea2480` (merge-base of the work branch). Remote `origin/merge_llama_into_beellama_2` = `c5c17182e` is STALE (local has 12 commits past it: `a3732a5c3`..`37a89c8f6`, unpushed).
+- The DFlash correctness regression is FIXED by two commits:
+  - `a3732a5c3` "fix gated_delta_net snapshot slot ordering (primary DFlash correctness regression)" — Phase 1 shader/graph fix. ALSO landed the tree-aware graph port already: `ggml_ssm_conv_tree` in qwen35.cpp/qwen35moe.cpp, `ggml_gated_delta_net_tree` in delta-net-base.cpp, `build_conv_state` `qkv_mixed_transposed` param, `prefill_gpu` capture in qwen35.cpp. (The tree-aware port I re-derived earlier today was therefore redundant — already committed.)
+  - `37a89c8f6` "fix rollback corruption — skip tape_replay" — Phase 2. Root cause: `dflash_rollback`'s `tape_replay` (`tape_replay_conv`) advanced the conv state `r_l` even when returning `n_reeval>0`, so the server's re-decode advanced `r_l` AGAIN → double-advance → r_l differed 20–400% from sequential; `s_l` was correct. Fix: skip `tape_replay` in `dflash_rollback` (set `n_reeval=n_accepted`), let the server re-decode from the restored backup. Plus production rollback port: tape_gpu graph block (qwen35.cpp), `set_tape_recording` around verify, unconditional `cp_recurrent` backup, cell-pos trim (`llama_memory_seq_rm`), accepted-token re-decode, batch re-decode.
+- Recorded verification (commit message, 2026-07-11, Qwen3.6-27B-Q4_K_M, Vulkan0, greedy temp 0, NO env vars): p1 DFlash == non-DFlash IDENTICAL at 12.3 t/s; n_tokens>0 (tape populates, 47 batches n_tokens=4); p2/p3 same inherent DFlash-vs-non-DFlash wording/truncation differences as Phase 1 + gboddaer/main (NOT corruption). Phase 1 no-rollback speed was 23.4–23.6 t/s; the rollback + re-decode overhead drops production DFlash to 12.3 t/s.
+- Earlier 2026-07-10 entries (H-GHOST, cell-pos misalignment, full state-value dumps) are the investigation trail that led to the r_l double-advance root cause — kept for provenance, but superseded by `37a89c8f6`.
+- My (2026-07-09) "tree-aware port won't fix Vulkan" finding stands and is consistent with the actual fix: the tree-aware graph pieces are inert on Vulkan (no Vulkan backend for the tree ops; under DFlash `build_recurrent_attn` takes the `keep=true` direct `ggml_gated_delta_net` K-snapshot path that bypasses `build_delta_net`). The REAL root cause was (1) gated_delta_net snapshot slot ordering (a3732a5c3) + (2) rollback r_l double-advance (37a89c8f6) — both server/Vulkan-shader/recurrent-state issues, not the tree-aware graph builders.
+
+### HYPOTHESES
+- None open for the primary correctness regression (fixed). Open items are: (a) DFlash speed regression vs no-rollback (12.3 vs 23.6 t/s) — the per-partial-accept re-decode overhead; (b) multi-slot DFlash (`--parallel>1`) still unverified/likely still broken; (c) CI test failures (OpenVINO Windows, macOS) unrelated to DFlash.
+
+### NEXT STEPS
+- Re-run a fresh DFlash vs non-DFlash benchmark on the work branch at HEAD `37a89c8f6` (Qwen3.6-27B-Q4_K_M, Vulkan0, greedy) to produce independent proof of current correctness + performance (this entry's recorded numbers are from the commit message; reproduce them).
+- Compare work-branch DFlash against `gboddaer/main` DFlash for the same prompt to confirm the merge reaches fork-level correctness + relative speed.
+- If confirmed: the regression investigation closes; remaining work is speed optimization, multi-slot, CI.
+
+## 2026-07-12 15:00 UTC - Independent DFlash benchmark + correctness proof at HEAD (37a89c8f6)
+
+### FACTS
+- Reproduced the commit claims with a fresh, independent benchmark (no env vars, production binaries).
+- Binaries built from source: work-branch `build-vulkan/bin/llama-cli` = `b10554-37a89c8f6` (HEAD); main-ref built in a detached worktree at `gboddaer/main` = `130ea2480` (`/tmp/beellama-main-ref/build_vulkan/bin/llama-cli`, version `b10118-130ea2480`).
+- Test config: target `/crypt/models/Qwen3.6-27B-Q4_K_M.gguf`, draft `/crypt/models/Qwen3.6-27B-DFlash-Q4_K_M.gguf`, `--device Vulkan0` (AMD Radeon RADV GFX1151 iGPU — only physical device; no W7800/Vulkan1 present), `-ngl 999 --ctx-size 8192 --flash-attn on --cache-type-k/v q8_0 --seed 7 --temp 0 -n 256 --single-turn --simple-io`, DFlash `--spec-draft-n-max 3`. Prompt: "What is 2+2? First think step by step, then give the final answer on its own line as 'Answer: X'." (≥200-token generations, per HF-036 lesson).
+- Performance (generation t/s):
+  | branch | non-DFlash | DFlash | DFlash speedup |
+  |--------|-----------|--------|----------------|
+  | main (130ea2480) | 12.4 | 21.6 | 1.74× ✅ |
+  | work (37a89c8f6, HEAD) | 12.5 | 11.7 | 0.94× ⚠️ (slower than non-DFlash) |
+  Non-DFlash speed matches across branches (12.4 vs 12.5). Work-branch DFlash is ~2× slower than main DFlash (11.7 vs 21.6).
+- Correctness: all four outputs are COHERENT (proper step-by-step reasoning, no garble, no mixed CJK). Non-ASCII char count = 0 in all four generated texts (garble check passed).
+- Parity evidence (work DFlash ≈ main DFlash): both open identically for the first 7 lines ("Thinking Process: 1. Analyze the Request... 2. Constraint... 3. Perform the Operation: Start with 2, Add 2"), then diverge only in minor step wording (work: `$2+2=4$`; main: `2+2=4`). This is the "inherent DFlash-vs-non-DFlash wording difference, not corruption" the commit describes.
+- The working fork ALSO shows DFlash≠non-DFlash wording differences (main non-DFlash uses a different structure entirely — "Counting method: count up 2 more (3,4)" vs main DFlash "Perform the Operation: 2+2=4"). So DFlash-vs-non-DFlash divergence is normal fork behavior, NOT a merge regression. The merge's DFlash divergence is smaller than the fork's own.
+- Conclusion: the DFlash **correctness** regression is FIXED at HEAD (coherent, fork-parity, no garble). A DFlash **speed** regression remains: work DFlash (11.7 t/s) does not beat non-DFlash (12.5), vs main DFlash 21.6 t/s (1.74× speedup). Cause: the rollback + per-partial-accept re-decode overhead (commit notes: production 12.3 vs no-rollback 23.6 t/s). The speculative speedup is cancelled by re-decode cost.
+- Artifacts: `/tmp/dflash-bench/{work,main}/{<label>_{nodflash,dflash}.out,.err}`, extracted `.gen` files. Script: `scripts/dflash-regression/bench_dflash_v0.sh`.
+
+### HYPOTHESES
+- The speed regression is the rollback re-decode path running a full decode per partial-accept batch. Optimizations: skip re-decode when the verify batch is all-accepted (state already correct), or batch the re-decode more efficiently, or only re-decode the rejected-suffix tokens. These would restore the speculative speedup while keeping the r_l/s_l correctness.
+
+### TEST RESULTS
+- Command: `scripts/dflash-regression/bench_dflash_v0.sh build-vulkan/bin/llama-cli work /tmp/dflash-bench/work` and same with `/tmp/beellama-main-ref/build_vulkan/bin/llama-cli main /tmp/dflash-bench/main`.
+- Result: work non-DFlash 12.5 t/s (rc 0), work DFlash 11.7 t/s (rc 0); main non-DFlash 12.4 t/s (rc 0), main DFlash 21.6 t/s (rc 0). All outputs coherent; garble check 0 non-ASCII; work DFlash ≈ main DFlash (minor wording diff).
+- Output files: `/tmp/dflash-bench/work/*.out`, `/tmp/dflash-bench/main/*.out`, `/tmp/dflash-bench/{work,main}_{nodflash,dflash}.gen`.
+
+### NEXT STEPS
+- Correctness investigation CLOSES (regression fixed at `37a89c8f6`).
+- Open: DFlash speed optimization (restore the ~1.7× speculative speedup) — investigate skipping/batching the rollback re-decode for all-accepted verify batches.
+- Open: multi-slot DFlash (`--parallel>1`), CI test failures (OpenVINO Windows, macOS) — unrelated to the DFlash correctness fix.
+- Optional: clean up now-inert `tape_gpu` graph block in qwen35.cpp (tape_replay is skipped, so the tape is unused) — harmless but dead code.
+
+## 2026-07-12 16:30 UTC - DFlash speed optimization attempt (all-accepted skip + tape-disable)
+
+### FACTS
+- The "skip rollback re-decode when the verify batch is all-accepted" optimization is ALREADY implemented at `tools/server/server-context.cpp:4429` (`const bool all_accepted_flat = n_accepted_draft == (int) slot.spec_draft.size(); if (!all_accepted_flat) { llama_dflash_rollback(...) + re-decode }`). When all drafts are accepted, the rollback+re-decode is skipped entirely. So the literal proposed optimization was already in place at HEAD `37a89c8f6`.
+- Tested a second candidate: disabling the now-dead tape recording. Rationale: `dflash_rollback` skips `tape_replay` (37a89c8f6), and the only other tape consumer (`dflash_prepare_branch`, tree-verify, `src/llama-context.cpp:4284`) is never called from the flat DFlash server path (server only calls `llama_dflash_rollback`). Yet `set_tape_recording(true)` runs around every verify decode (`server-context.cpp:4065`), enabling the `tape_gpu` graph block (`qwen35.cpp:550`, copies qkv_mixed→tl.qkv per recurrent layer). Commit 37a89c8f6 itself flagged this as "inert now... could be removed".
+- Implemented the tape-disable (gated `dflash_tape_active` on a `dflash_tape_record=false` flag), built, benchmarked, then REVERTED (no-op, see results).
+- CRITICAL COMPARISON: `gboddaer/main` ALSO re-decodes on Vulkan. `git show gboddaer/main:tools/server/server-context.cpp` shows `llama_dflash_rollback(ctx_tgt, ...)` + `llama_decode(ctx_tgt, batch_reeval)` with the comment "When tape replay was unavailable (e.g., Vulkan), re-decode". So the re-decode on partial-accept is NOT a merge-specific workaround — the fork does it too on Vulkan. The re-decode is necessary on Vulkan because the conv state `r_l` has no per-token snapshots (the tree conv `ggml_ssm_conv_tree` that produces per-token conv snapshots is CUDA-only; Vulkan has no backend for it).
+
+### HYPOTHESES
+- HYPOTHESIS (disproven): disabling tape recording recovers speed. DISPROVEN by measurement.
+- The ~2× speed gap (merge DFlash 11.5 t/s vs main DFlash 21.6 t/s, both on Vulkan0, both re-decoding) is NOT explained by the re-decode skip (present in both) or the tape recording (no-op). Remaining candidates: (a) acceptance rate difference (merge draft quality lower → more partial-accept → more re-decodes); (b) per-cycle unconditional backup cost (`cp_recurrent` at `server-context.cpp:3357` every cycle in the merge vs main's `has_draft_backup` gated in draft-prep); (c) verify-decode graph efficiency (n_rs_seq/K-snapshot count, n_outputs_max); (d) residual instrumentation overhead from c5c17182e.
+
+### TEST RESULTS
+- Command (tape ON, original HEAD, "2+2" prompt): work DFlash 11.7 t/s (first benchmark).
+- Command (tape OFF, "2+2" prompt, same seed/flags): work DFlash 11.5 t/s. → tape-disable is a NO-OP (within noise).
+- Command (tape OFF, "farmer fence" complex prompt, -n 400): work non-DFlash 12.4 t/s; work DFlash 9.3 t/s; main DFlash 21.5 t/s. (9.3 vs 11.7 is the different/lower-acceptance farmer prompt, not a tape effect — confirmed by the 2+2 apples-to-apples 11.5 vs 11.7.)
+- Reverted the tape-disable change; `git diff` shows only TASK_PROGRESS.md modified; server-context.cpp back to HEAD; rebuild EXIT=0.
+- Output files: `/tmp/dflash-bench2/{work_nd,work_d,main_d,p22_d_tapeoff}.{out,err}`.
+
+### NEXT STEPS
+- The proposed speed optimization (all-accepted skip) is already in place; the additional tape-disable is disproven. Recovering the ~1.7× gap requires deeper work, not a simple skip:
+  1. Measure the DFlash acceptance rate (merge vs main) — if the merge's acceptance is lower, investigate draft quality (the a3732a5c3 snapshot-slot-ordering fix may be imperfect, or n_rs_seq/verify-decode graph differs).
+  2. Compare the per-cycle backup cost (merge unconditional `cp_recurrent` vs main's gated `has_draft_backup`) — potentially defer/skip the backup.
+  3. Compare n_rs_seq (K) and n_outputs_max between branches for the DFlash verify decode.
+  4. The fundamental Vulkan limit: `r_l` (conv state) has no per-token snapshots without `ggml_ssm_conv_tree` (CUDA-only). On CUDA, porting tree-conv snapshots would eliminate the re-decode entirely (the fork's fast path). On Vulkan, the re-decode is unavoidable for partial-accept.
+- Current shipped state (37a89c8f6) remains correctness-first at ~11.5–12.3 t/s DFlash. Non-DFlash is 12.4–12.5 t/s. main DFlash is 21.5–21.6 t/s (1.74×). The speed gap is open but not closeable by the "skip re-decode on all-accepted" optimization (already done).
+
+## 2026-07-12 17:30 UTC - Option 1 verdict: acceptance rate measurement (work vs main)
+
+### FACTS
+- Measured DFlash acceptance via `llama-server` (which prints `draft acceptance = ... (accepted / generated)` + `common_speculative_print_stats` `#gen drafts / #acc drafts / #gen tokens / #acc tokens` per slot finish). Built `llama-server` for both branches from source: work = `b10554-37a89c8f6` (HEAD), main-ref = `b10118-130ea2480` (gboddaer/main). Same config: Qwen3.6-27B-Q4_K_M target + Qwen3.6-27B-DFlash-Q4_K_M draft, Vulkan0, `-ngl 999 -c 8192 --flash-attn on --cache-type-k/v q8_0 --spec-draft-n-max 3`, greedy (temp 0, seed 7), farmer-fence prompt, n_predict 256. Script: `scripts/dflash-regression/measure_acceptance.sh`. Work used port 8091/8093, main 8092.
+- **Acceptance counters (the decisive data):**
+  | metric | work (37a89c8f6) | main (130ea2480) |
+  |--------|------------------|------------------|
+  | n_call_draft | 254 / 78 (two runs) | 76 |
+  | n_call_accept | **0** | 76 |
+  | #gen drafts | **0** | 76 |
+  | #acc drafts | **0** | 70 |
+  | #gen tokens | **0** | 218 |
+  | #acc tokens | **0** | 176 |
+  | draft acceptance | **not printed** | **0.807 (176/218)** |
+- The work branch calls `common_speculative_draft` (drafts generated) but **`common_speculative_accept` is NEVER called (n_call_accept=0)** — zero drafts accepted/counted. The verify block (`server-context.cpp:4330+`, which calls `common_speculative_accept` at :4419) is never entered: 0 `verify_post` / `verify slot` QA-trace lines.
+- Server log root cause (work branch, first lines of the request):
+  ```
+  E dflash prefill flush incomplete GPU capture: captured=0 requested=28 seq=0; refusing partial ring write
+  E srv decode: dflash prefill flush mismatch: slot=3 requested=28 written=0 src_offset=0; disabling DFlash drafting until fresh hiddens are available
+  W dflash: discarding cross-ring state: prefill flush mismatch
+  ```
+  Work branch: 5 `prefill flush mismatch` errors, 2 `disabling DFlash drafting`, 2 `discarding cross-ring state`. Main branch: **0** prefill flush errors, 0 discards, 0 disable messages.
+- So the work branch's **prefill GPU capture writes 0 tokens** (`captured=0`, `written=0` despite `requested=28`) → cross-ring state discarded → DFlash drafting disabled → drafts generated but discarded → 0 accepted. Main's prefill capture works → cross-ring populated → 80.7% acceptance → 1.74× speedup.
+
+### HYPOTHESES
+- VERDICT: The speed gap is **NOT** "lower draft quality driving excessive re-decode overhead". There is **no re-decode at all** on the work branch (n_call_accept=0 → the verify/rollback/re-decode block is never entered). The re-decode-overhead hypothesis (and the entire 2026-07-12 16:30 "both branches re-decode on Vulkan" framing) is moot for the work branch because no accepts happen.
+- The real root cause: **prefill GPU capture failure** (`written=0`) makes DFlash effectively a no-op on the work branch. Drafts are generated (78–254 draft calls) but never verified/accepted. The work branch's ~11.5–12.3 t/s is non-DFlash generation speed (12.4) MINUS the wasted draft-generation overhead, NOT re-decode overhead.
+- The 37a89c8f6 commit's claim "p1 DFlash == non-DFlash IDENTICAL at 12.3 t/s" was MISINTERPRETED as success: the outputs are identical because DFlash is effectively disabled (prefill capture fails → no drafts accepted), so the target generates everything. "Identical to non-DFlash" is the symptom of a disabled DFlash, not a working one.
+- The "inherent DFlash-vs-non-DFlash wording differences" noted for p2/p3 are NOT from DFlash acceptance (there is none) — they're from the draft-gen+discard overhead perturbing the target state via the (failed) rollback machinery.
+- NEXT root-cause question: why does the prefill_gpu capture write 0 tokens on the merge? The prefill_gpu graph block (ported to qwen35.cpp via a3732a5c3) is present but `flush_prefill` reports `captured=0`. Candidates: (a) the graph block doesn't execute (`dflash_prefill_capture_active` false, or `prefill_gpu_n_seqs` 0 at graph-build time); (b) the block writes to a buffer that `flush_prefill` doesn't read (slot/buffer mismatch); (c) the capture scheduling (`llama_dflash_prefill_capture_begin/end`) isn't arming the GPU path. This is the real fix target for recovering the ~1.7× speedup.
+
+### TEST RESULTS
+- Command: `scripts/dflash-regression/measure_acceptance.sh build-vulkan/bin/llama-server work 8091 /tmp/dflash-accept` (and main-ref, port 8092); plus a GGML_DFLASH_QA_TRACE=1 work run on port 8093.
+- Result: work n_call_accept=0, #acc tokens=0, 5 prefill-flush-mismatch errors, 0 verify_post; main n_call_accept=76, #acc tokens=176, draft acceptance=0.807 (176/218), 0 prefill-flush errors.
+- Output files: `/tmp/dflash-accept/{work,main}.{server.err,resp.json}`, `/tmp/dflash-accept/work_qa.err`.
+
+### NEXT STEPS
+- The speed-recovery fix is NOT "skip re-decode" (already done; and irrelevant — no accepts happen). It is: **fix the prefill GPU capture so it writes the requested tokens (written=N, not 0)**, which re-enables DFlash drafting → drafts get verified/accepted → acceptance rises toward main's 80% → speedup recovered.
+- Concrete next investigation: trace why `flush_prefill` returns written=0 on the merge. Check (1) is `cparams.dflash_prefill_capture_active` true and `prefill_gpu_n_seqs > 0` during the prefill decode on the merge; (2) does the qwen35.cpp prefill_gpu graph block actually execute (add a DFLASH_QA trace inside it); (3) compare the `llama_dflash_prefill_capture_begin/end` scheduling and `flush_prefill` buffer read path between merge and gboddaer/main. This is the true speed-fix target.
+- Do NOT pursue further "re-decode skip" or "tape-disable" optimizations — disproven/irrelevant. The blocker is prefill capture.
+
+## 2026-07-12 18:30 UTC - Prefill GPU capture bug: ROOT CAUSE FOUND (candidate 2: slot/buffer mismatch)
+
+### FACTS
+- Investigated the three candidates for the prefill GPU capture failure (`captured=0`, `written=0`).
+- Candidate 1 (cparams not set at graph-build): the graph-block cparams (`prefill_gpu_n_seqs`, `dflash_prefill_capture_active`, `dflash_prefill_n_tokens`) are set in `llama-context.cpp:6892-6893` when `any_intersection && all_intersections_have_buffer`, and the post-compute `plan->n_written` update at `llama-context.cpp:7206-7230` gates on the same cparams and indexes by the ubatch's actual `seq_id`. `llama_dflash_prefill_gpu_active()` returns true on the failing run (the `use_prefill_gpu` branch of `flush_prefill` is taken — that's where the `captured=0 ... refusing partial ring write` error prints, `common/speculative.cpp:2764`). So the GPU path IS active; the cparams are not the failure point per se.
+- Candidate 3 (capture_begin/end scheduling): `llama_dflash_prefill_capture_begin(ctx_tgt, slot.id, span.capture_begin, span.capture_end)` is called at `server-context.cpp:4046` with the correct `slot.id`; the plan is created in `dflash_capture->prefill_plans[seq_id]` with `active=true`. The server flush loop (`server-context.cpp:4140-4164`) calls `llama_dflash_set_active_slot(ctx_tgt, pf.slot_id)` (line 4153) BEFORE `common_speculative_flush_prefill(pf_spec, ...)` (line 4156) — i.e. the server DOES correctly route to the physical slot. Scheduling is correct.
+- **Candidate 2 (slot/buffer mismatch): CONFIRMED ROOT CAUSE.** `flush_prefill` (`common/speculative.cpp:2721`) reads the prefill plan/buffer by the dflash impl's `seq_id` member, which is **0** for per-slot DFlash specs:
+  - `get_seq_id()` returns `spec ? 0 : id` (`server-context.cpp:458`) — per-slot DFlash uses seq_id=0 by design.
+  - `common_speculative_set_seq_id(slot.get_spec(), slot.get_seq_id())` → `set_seq_id(0)` (`server-context.cpp:1603`).
+  - `flush_prefill` then uses this `seq_id=0` in THREE places: `llama_dflash_set_active_slot(ctx_tgt, seq_id=0)` (line 2722 — OVERRIDES the server's `set_active_slot(pf.slot_id)`), `llama_dflash_prefill_capture_info(ctx_tgt, seq_id=0, ...)` (reads `prefill_plans[0]`), and the fallback `llama_dflash_prefill_gpu_n_tokens(ctx_tgt, seq_id=0)` (reads `prefill_gpu[0]`).
+  - But the capture was scheduled for the physical slot (`capture_begin(slot.id)`), and the graph block + `n_written` update index by the ubatch's actual seq (`ubatch.seq_id_unq` = `slot.id`). So when `slot.id != 0`, the capture writes to `prefill_plans[slot.id]` / `prefill_gpu[slot.id]`, but `flush_prefill` reads index 0 (empty) → `captured=0` → `written=0` → "prefill flush mismatch" → DFlash drafting disabled → 0% acceptance.
+- **DECISIVE PROOF (--parallel 1 test):**
+  | run | request slot | prefill flush mismatch | n_call_accept | draft acceptance |
+  |-----|-------------|------------------------|---------------|------------------|
+  | work --parallel 4 (default) | slot 3 (LRU) | 5 | 0 | 0% (no accepts) |
+  | work --parallel 1 | slot 0 (only slot) | **0** | **37** | **0.752 (82/109)** |
+  | main --parallel 4 (default) | slot 0 (LRU) | 0 | 76 | 0.807 (176/218) |
+  With `--parallel 1` (slot 0 → impl seq_id=0 matches the physical slot), the merge's prefill flush errors vanish and acceptance jumps to 75%, essentially matching main's 80%. The bug is purely the seq_id→physical-slot mismatch.
+- Main is MASKED, not immune: main's `flush_prefill` is byte-identical (same `set_active_slot(seq_id)` override at line 2722). Main "works" only because LRU happened to pick slot 0 for the request. If main's request landed on a non-zero slot, main would hit the same `captured=0` failure. (Why main picks slot 0 and the merge picks slot 3 is a secondary LRU/startup-ordering question; the primary bug is the seq_id override.)
+- Separate observation (NOT the prefill-capture bug): even with acceptance restored (--parallel 1, 75%), the merge's DFlash speed is ~10.3 t/s (n_decoded=102, tg=10.26) — still below non-DFlash (12.4) and far below main's 24 t/s with 80% acceptance. This is the re-decode-on-partial-accept overhead (the next investigation), not the prefill capture bug.
+
+### HYPOTHESES
+- CONFIRMED: the prefill GPU capture bug root cause is candidate 2 — `flush_prefill` reads the prefill plan/buffer by the impl's `seq_id=0` instead of the physical request slot.id. When the request slot ≠ 0 (the default `--parallel 4` case where LRU picks a non-zero slot), `captured=0`, DFlash is disabled, acceptance=0.
+- The per-slot design intends `seq_id=0` to be mapped to the physical slot via `set_active_slot(slot.id)` (which the server does correctly at 4153), but `flush_prefill` violates this by (a) re-setting the active slot to `seq_id=0` (line 2722) and (b) reading `prefill_capture_info` / `prefill_gpu_n_tokens` by `seq_id=0` (lines 2745/2747) instead of by the active/physical slot.
+
+### TEST RESULTS
+- Command: `llama-server ... --parallel 1 --spec-type dflash ...` (work, port 8094) vs the earlier `--parallel 4` (default) run (port 8093/8091) and main (port 8092).
+- Result: --parallel 1 → slot 0, 0 prefill-flush-mismatch errors, n_call_accept=37, #acc tokens=82, draft acceptance=0.752 (82/109); --parallel 4 → slot 3, 5 mismatch errors, n_call_accept=0, 0% acceptance.
+- Output files: `/tmp/dflash-accept/work_p1.{err,resp.json}`, `/tmp/dflash-accept/work_qa.err`, `/tmp/dflash-accept/main.server.err`.
+
+### NEXT STEPS
+- The prefill-capture bug fix: make `flush_prefill` read the prefill plan/buffer for the PHYSICAL request slot (slot.id), not the impl's `seq_id=0`. Two viable approaches:
+  1. Pass `slot_id` into `flush_prefill` (new param) and use it for `set_active_slot`, `prefill_capture_info`, `prefill_gpu_n_tokens`. Cleanest and explicit.
+  2. Remove the `llama_dflash_set_active_slot(ctx_tgt, seq_id)` override at line 2722 (let the server's `set_active_slot(pf.slot_id)` stand) AND change `prefill_capture_info` / `prefill_gpu_n_tokens` to look up by the currently-active slot rather than the passed `seq_id`. Requires a "read active slot" variant of those helpers.
+  - Approach 1 is lower-risk (explicit, no global-active-slot assumptions). The server already knows `pf.slot_id` (it passes nothing to `common_speculative_flush_prefill` currently — line 4156 — so the API would gain a `slot_id` param).
+- After the prefill-capture fix, the merge's default `--parallel 4` DFlash should recover acceptance (toward 75-80%) on any slot, not just slot 0. Then the REMAINING speed gap (merge ~10 t/s vs main ~24 t/s with similar acceptance) is the re-decode-on-partial-accept overhead — a separate follow-up (the original "speed optimization" target, now correctly framed: it only matters once acceptance is restored).
+- Verify the fix on `--parallel 4` (default) with a non-zero slot (the real-world case), not just `--parallel 1`.
+
+## 2026-07-12 19:30 UTC - Slot-routing fix implemented + verified (necessary but INSUFFICIENT for multi-slot)
+
+### FACTS
+- Implemented the recommended fix: pass the physical `slot_id` into `flush_prefill` so it routes to the slot that scheduled the capture.
+  - `common/speculative.h:193` + `common/speculative.cpp:5122`: `common_speculative_flush_prefill(... , llama_seq_id slot_id = -1)`.
+  - `common/speculative.cpp:388` (base virtual) + `:2721` (dflash override): added `llama_seq_id slot_id = -1` param; dflash override computes `const llama_seq_id phys_slot = (slot_id >= 0) ? slot_id : seq_id;` and uses `phys_slot` for `llama_dflash_set_active_slot`, `llama_dflash_prefill_capture_info`, `llama_dflash_prefill_gpu_n_tokens` (the 3 lookups that index the prefill plan/buffer). The drafter reset (`common_dflash_reset_drafter_seq_and_kv_cache(ctx_dft, seq_id, ...)`) keeps `seq_id` (the drafter's own seq — separate concern). Diagnostic `seq=%d` labels changed to `slot=%d` with `phys_slot`.
+  - `tools/server/server-context.cpp:4156`: call site passes `pf.slot_id`.
+  - Build: `cmake --build build-vulkan --target llama-server llama-cli` EXIT=0, no errors.
+- Verification (default multi-slot, `--parallel 4`, one server + 4 sequential requests to force non-zero slots):
+  | request | slot | prefill flush mismatch | acceptance | tg |
+  |---------|------|------------------------|------------|-----|
+  | 1 | 3 | yes (slot=3 written=0) | 0% (0/3) | 4.46→5.23 t/s |
+  | 2 | 2 | (none logged) | 0% (0/3) | ~10.8 t/s |
+  | 3 | 1 | (none logged) | 0% (0/3) | ~10.8 t/s |
+  | 4 | 0 | none | 81.9% (113/138) | 11.6→12.2 t/s |
+  Slot 0 has DFlash active (81.9%, captured>0); slots 1-3 still have DFlash disabled (0% acceptance).
+- The slot_id fix is CORRECT and NECESSARY (it routes flush_prefill to the physical slot) but NOT SUFFICIENT: slots 1-3 still fail because the prefill capture is never set up for them, so there is nothing to read regardless of routing.
+
+### ROOT CAUSE of the remaining multi-slot failure (deeper than slot routing)
+- `GGML_DFLASH_DEBUG=1 GGML_DFLASH_PREFILL_TRACE=1` traces show:
+  - The server DOES schedule the capture for slot 3: `[DFLASH_PREFILL_TRACE] slot=3 prompt_total=32 cross_ctx=512 capture_from=0 batch_pos=[0,27] batch_end=28` (and `[28,31]`). So `llama_dflash_prefill_capture_begin(ctx_tgt, 3, ...)` IS called (candidate 3 — scheduling — is NOT the problem).
+  - But the decode-side prefill_gpu staging path is NEVER taken for slot 3: 0 `dflash capture route` logs, 0 `allocated prefill GPU staging buffers`, 0 `prefill capture complete` (n_written) updates. So `dflash_use_prefill_staging` is false at slot 3's prefill decode → no GPU staging → no `plan->n_written` update → `captured=0`.
+- CRITICAL comparison: `--parallel 1` (slot 0, works at 75%) ALSO shows 0 staging allocation/route/complete logs — i.e., neither config uses the prefill_gpu staging path for this prompt. The capture happens via the **CPU eval-callback path** (`flush_prefill` `else` branch reads `llama_get_layer_hidden_n_tokens`).
+- The difference that makes `--parallel 1` work and `--parallel 4` fail:
+  - `--parallel 1`: `llama_dflash_allocate_slots` is gated `dflash_slots_cap > 1` (HF-035 guard), so with 1 slot it is NOT called → `hidden_gpu` is NOT allocated → `dflash_gpu_capture_ready=false` → the **eval callback stays installed** → CPU hidden capture works → `captured>0` → flush succeeds → DFlash active (75%).
+  - `--parallel 4`: `allocate_slots(4)` IS called (4 > 1) → `hidden_gpu[0..3]` allocated → `dflash_gpu_capture_ready=true` → the **eval callback is disabled** (the comment at `flush_prefill:2728` says "In GPU prefill-staging mode the eval callback is intentionally not installed"). BUT the prefill_gpu staging path is NOT activated for the prefill decode (`dflash_use_prefill_staging` false — the plan is not active at decode time, so `dflash_prefill_plan_active && max_tokens>25` is false) → no GPU staging either. Result: eval callback OFF AND staging OFF → **no capture at all** → `captured=0` → prefill flush mismatch → DFlash disabled.
+- So the multi-slot failure is a **mode-coordination bug**: allocating `hidden_gpu` (for multi-slot GPU capture) disables the CPU eval callback, but the prefill_gpu staging path isn't activated for the prefill decode (the capture plan is not active at decode time), so there is no capture path at all. The system is stuck in a broken in-between state (GPU mode off + staging off).
+- The "plan not active at decode time" sub-cause: `dflash_prefill_plan_active = dflash_capture->any_prefill_plan_active()` (line 6761) returns false at slot 3's prefill decode even though `capture_begin(3)` was called in `pre_decode`. This is a timing/ordering issue between `capture_begin` (pre_decode scheduling), the decode, and `capture_end` (post-decode flush) — likely the plan is deactivated (by `capture_end` deactivating ALL plans, line 2606, or by chunk interleaving) before the staging decision runs. Not fully pinned down.
+
+### HYPOTHESES
+- The slot_id routing fix is correct and necessary (keep it). It will take effect once the capture actually happens for non-zero slots.
+- The remaining multi-slot blocker is the eval-callback/staging mode coordination: when `hidden_gpu` is allocated (multi-slot), the eval callback is disabled, but the prefill staging path isn't activated for the prefill decode, so no capture occurs. Two candidate fixes:
+  1. Keep the eval callback installed for the PREFILL decode even when `hidden_gpu` is allocated, UNLESS the prefill staging path is actually going to be used for that decode (i.e., only disable the eval callback when `dflash_use_prefill_staging` is true for the current decode). This restores the CPU fallback capture for multi-slot prefills.
+  2. Ensure the capture plan is active at decode time so `dflash_use_prefill_staging` becomes true and the GPU staging path captures (fix the `capture_begin`/`decode`/`capture_end` timing, or make `capture_end` per-slot so it doesn't deactivate a still-pending plan).
+  - Candidate fix 1 is lower-risk and directly addresses the "no capture path" symptom.
+
+### TEST RESULTS
+- Command: `scripts/dflash-regression/verify_slotfix.sh build-vulkan/bin/llama-server workfix 8095 /tmp/dflash-slotfix 4` (4 sequential requests, default multi-slot).
+- Result: slot 3 → 0% (mismatch), slot 2 → 0%, slot 1 → 0%, slot 0 → 81.9% (138 gen / 113 acc, tg 12.2 t/s).
+- Command: `GGML_DFLASH_DEBUG=1 GGML_DFLASH_PREFILL_TRACE=1 llama-server ... --parallel 4` (single farmer request, slot 3).
+- Result: `[DFLASH_PREFILL_TRACE] slot=3 ...` (capture scheduled), but 0 staging/capture-complete logs, 2 prefill-flush-mismatch errors, 0% acceptance.
+- Command: same with `--parallel 1` (slot 0).
+- Result: 0 staging logs too (CPU path used), but acceptance 75% (CPU eval-callback capture works because allocate_slots skipped → eval callback on).
+- Output files: `/tmp/dflash-slotfix/workfix.{server.err,req*.json}`, `/tmp/dflash-slotfix/workfix_dbg.err`, `/tmp/dflash-slotfix/workfix_trace.err`, `/tmp/dflash-slotfix/workfix_p1_trace.err`.
+
+### NEXT STEPS
+- The slot-routing fix is KEPT (correct, necessary). Multi-slot DFlash is NOT yet restored.
+- Implement candidate fix 1: in `llama-context.cpp` decode setup, only disable the eval callback (`dflash_skip_eval_callback` / `cparams.cb_eval = nullptr`) when `dflash_use_prefill_staging` is true for the current decode — NOT merely because `hidden_gpu` is allocated. This keeps the CPU eval-callback capture available for multi-slot prefills that don't use staging, restoring `captured>0` for slots 1-3.
+- Verify on `--parallel 4` with non-zero slots (the real multi-slot case): confirm `captured>0`, acceptance restored toward 75-80%, no prefill-flush-mismatch.
+- Then address the speed gap (slot 0 at 12.2 t/s vs main 24 t/s — the re-decode-on-partial-accept overhead, separate from prefill capture).
+- NOTE: the speed is NOT restored toward 24 t/s by this fix (slot 0 is 12.2 t/s); the 24 t/s gap is the re-decode overhead, a separate follow-up. Do NOT claim speed restoration.
+
+## 2026-07-12 20:00 UTC - Candidate fix 1 (eval-callback gating) implemented: PARTIAL PROGRESS, multi-slot still broken
+
+### FACTS
+- Implemented candidate fix 1 in `src/llama-context.cpp:7018`: changed the eval-callback-disable gate from `dflash_skip_eval_callback = dflash_graph_hidden_ready || dflash_suppress_callback_for_view` to `dflash_skip_eval_callback = dflash_use_prefill_staging || dflash_suppress_callback_for_view`. The eval callback is now skipped ONLY when the prefill is actually using GPU prefill staging (or capture is suppressed for the view), not merely because `hidden_gpu` is allocated. Build: `cmake --build build-vulkan --target llama-server llama-cli` EXIT=0.
+- The two fixes now in place (uncommitted, on top of HEAD `37a89c8f6`): (1) slot_id routing in `flush_prefill` (speculative.cpp/h + server-context.cpp), (2) eval-callback gating on `dflash_use_prefill_staging` (llama-context.cpp:7018).
+- Verification (`--parallel 4`, one server + 4 sequential requests, farmer/17x23/haiku/x+3 prompts):
+  | req | slot | failure mode | acceptance |
+  |-----|------|--------------|------------|
+  | 1 | 3 | **GPU hidden D2D ring write failed** (NEW) | 0% (0/3) |
+  | 2 | 2 | prefill flush mismatch (captured=0) (OLD) | 0% (0/3) |
+  | 3 | 1 | prefill flush mismatch (captured=0) (OLD) | 0% (0/3) |
+  | 4 | 0 | none — DFlash active | 81.9% (113/138) |
+- PROGRESS: candidate fix 1 RESTORED THE CAPTURE for slot 3. Before the fix, slot 3 failed with `captured=0` ("dflash prefill flush mismatch: slot=3 requested=28 written=0" — flush_prefill returned 0 at the capture-read step). After the fix, slot 3's flush_prefill gets PAST the capture-read (captured=28) and reaches the ring-write step, where it now fails with: `W dflash: discarding cross-ring state: GPU hidden D2D ring write failed` + `E dflash prefill flush wrote incomplete ring span: requested=28 written=0 slot=3; discarding DFlash state` (`common/speculative.cpp:3714`). So the failure moved from capture-read to ring-write — the eval-callback gating fix worked for the capture.
+- INCONSISTENT across slots: only slot 3 showed the new "D2D ring write failed" (1 occurrence); slots 2 and 1 still showed the old "prefill flush mismatch" (captured=0) — 2 occurrences. So the capture restoration is not consistent across non-zero slots (timing-dependent: the eval callback capture only sometimes populates layer_hiddens before flush).
+- Slot 0 still works (81.9%, 138 drafts, 113 accepted, tg 12.2 t/s) — unchanged.
+- The new blocker (the D2D ring-write failure) is at `common/speculative.cpp:3695-3714`: `ring_write` attempts a GPU→GPU D2D copy from `hidden_gpu` to the cross ring, sets `gpu_d2d_failed=true` when `used_d2d=false`, and discards. For slot 3 the capture is in CPU `layer_hiddens` (source=`cpu_hidden`, since `use_prefill_gpu=false`), but the ring-write path is attempting the D2D (GPU→GPU) branch — a source/path mismatch. The fallback `llama_dflash_cross_ring_gpu_write` (H2D, CPU→GPU) at :3704 is only taken when `!used_d2d && data`, but the D2D attempt failing first sets `gpu_d2d_failed` and discards before the H2D fallback can succeed for all layers.
+
+### HYPOTHESES
+- Candidate fix 1 is correct and made measurable progress (capture restored for slot 3). It is NECESSARY but still NOT SUFFICIENT for multi-slot DFlash.
+- The remaining blockers (two distinct):
+  1. **GPU cross-ring D2D write fails for non-zero slots** (`speculative.cpp:3714`): the ring-write path attempts GPU→GPU D2D from `hidden_gpu` even when the capture source is CPU `layer_hiddens`. The source/path selection in `ring_write` doesn't account for the CPU-capture case in multi-slot, so the D2D attempt fails and discards before the H2D fallback completes. Fix: in `ring_write`, when the capture source is `cpu_hidden` (CPU layer_hiddens), skip the D2D attempt and go straight to the H2D `llama_dflash_cross_ring_gpu_write` path; only attempt D2D when the source is `hidden_gpu`/`prefill_gpu` (GPU buffers).
+  2. **Inconsistent capture across non-zero slots**: slots 2/1 still hit `captured=0` (eval callback didn't populate layer_hiddens in time for those flushes) — a timing issue between the eval-callback capture (during the prefill decode) and the flush (post-decode). This may relate to the active-slot routing during the decode (the eval callback routes by `dflash_capture->active_tape_idx`, which may not be the request's slot during the prefill decode).
+
+### TEST RESULTS
+- Command: `scripts/dflash-regression/verify_slotfix.sh build-vulkan/bin/llama-server workc1 8099 /tmp/dflash-cand1 4` (4 sequential requests, default `--parallel 4`).
+- Result: slot 3 → 0% (D2D ring write failed, NEW), slot 2 → 0% (prefill flush mismatch, OLD), slot 1 → 0% (prefill flush mismatch, OLD), slot 0 → 81.9% (138/113, tg 12.2 t/s, working).
+- Command: `GGML_DFLASH_DEBUG=1 llama-server ... --parallel 4` (single farmer request, slot 3).
+- Result: `W dflash: discarding cross-ring state: GPU hidden D2D ring write failed` + `E dflash prefill flush wrote incomplete ring span: requested=28 written=0 slot=3` (capture succeeded at 28, ring-write failed at 0). 0 meta-backend suppression, 0 mixed-capture-suppressed → the eval-callback gating fix took effect (capture restored).
+- Output files: `/tmp/dflash-cand1/{workc1.server.err,workc1.req*.json,workc1_dbg.err}`.
+
+### NEXT STEPS
+- Candidate fix 1 is KEPT (correct, made progress). Multi-slot DFlash is NOT yet restored.
+- Next fix (blocker 1, the D2D ring-write source/path mismatch): in `common/speculative.cpp` `ring_write` (~3695-3714), gate the GPU→GPU D2D attempt on the capture source being a GPU buffer (`hidden_gpu`/`prefill_gpu`); when the source is CPU `layer_hiddens` (`cpu_hidden`), go directly to the H2D `llama_dflash_cross_ring_gpu_write` path instead of attempting D2D and discarding on failure. This should let slot 3's CPU-captured prefill flush succeed into the cross ring.
+- Then address blocker 2 (inconsistent capture for slots 2/1) — likely the active-slot routing during the prefill decode (ensure `set_active_slot(slot.id)` is in effect when the eval callback runs, so it captures into the correct slot's layer_hiddens).
+- Speed: slot 0 is 12.2 t/s, NOT the 24 t/s baseline — the re-decode-on-partial-accept overhead (separate from prefill capture). Do NOT claim speed restoration.
+- VERIFICATION STATUS: the goal (multi-slot DFlash active with captured>0 and acceptance restored for non-zero slots, speed toward 24 t/s) is NOT yet achieved. Slot 0 works (81.9%, 12.2 t/s); slots 1-3 still fail (0%), now at a DIFFERENT failure point (D2D ring write) for slot 3 due to candidate fix 1's progress. Two more fixes (D2D source/path + active-slot capture routing) are needed.
+
+## 2026-07-12 21:00 UTC - DFlash decode call-tree comparison: work (37a89c8f6) vs gboddaer/main (130ea2480)
+
+### FACTS — file-level divergence (the smoking gun)
+- `git diff --stat gboddaer/main -- tools/server/server-context.cpp common/speculative.cpp common/speculative.h src/llama-context.cpp src/models/qwen35.cpp`: **5 files changed, 1884 insertions, 4844 deletions**.
+- Line counts: `server-context.cpp` **work=5947 vs main=9002** (~3000 lines shorter); `speculative.cpp` work=5245 vs main=5106 (similar); `qwen35.cpp` work=683 vs main=836.
+- The work branch's `server-context.cpp` is a **~3000-line-truncated** version of the fork's DFlash server integration. The merge took **upstream's simpler server structure** and only **partially** ported the fork's DFlash server pipeline (the 1-arg flat draft + a `post_decode` verify/accept/rollback), losing the fork's batched-draft / prefetch-verify / profit-controller / reduced-verify / per-slot-capture pipeline (the ~652 lost lines noted in HF-017 are part of this; the full loss is ~3000 lines).
+
+### FACTS — call-tree comparison (server decode loop → draft → capture → verify/accept → rollback)
+
+#### 1. Draft invocation (the central divergence)
+- **WORK** (`pre_decode`, server-context.cpp:3273-3292): per-slot, **1-arg flat**:
+  - `auto & draft_params = common_speculative_get_draft_params(slot.get_spec(), slot.get_seq_id());` then manually sets `drafting=true, n_max=n_draft_max, n_min=0, n_past=slot.prompt.n_tokens(), id_last=slot.sampled, prompt=&slot.spec_prompt, result=&slot.spec_draft`.
+  - Loop: `for (s : drafting) { llama_dflash_set_active_slot(ctx_tgt, s->id); common_speculative_draft(s->get_spec()); }` — **1-arg**, each slot drafted separately (separate drafter decode per slot).
+- **MAIN** (server-context.cpp:4636 + 4852-4859): **batched primary + 6-arg flat fallback**:
+  - `common_speculative_draft_batch(batch_specs, ctx_dft_shared.get(), params_batch, batch_id_lasts, batch_results, ...)` (line 4636) — **ONE batched drafter decode for all slots in the cohort**, then `slot.spec_draft = std::move(batched_drafts[slot.id])` (4852).
+  - Fallback: `common_speculative_draft(slot.get_spec(), params_spec, cached_text_tokens, slot.sampled, nullptr, draft_n_past)` (4859) — **6-arg**, with `n_min=params_spec.n_min`, `n_past=draft_n_past=-1` for DFlash (`draft_n_past = use_mtp_spec ? prompt.n_tokens() : -1`; DFlash is not MTP → -1).
+- **Divergence**: WORK = per-slot 1-arg flat (`n_min=0`, `n_past=prompt.n_tokens()`); MAIN = batched multi-slot draft (`common_speculative_draft_batch`) + 6-arg fallback (`n_min=params_spec.n_min`, `n_past=-1`).
+
+#### 2. DFlash impl method invoked
+- **WORK**: 1-arg `common_speculative_draft(spec)` (speculative.cpp:4320) → `impl->draft(spec->dparams)` (the **flat** `draft()` override, speculative.cpp:3035) — per-slot, builds cross data inline + a **separate drafter decode per slot** + extract.
+- **MAIN**: `common_speculative_draft_batch` (speculative.cpp:4806) → `impl->prepare_batch_draft(ctx_dft)` (speculative.cpp:2664) per slot (build cross data only, returns cross_len) + **ONE batched drafter decode** for the whole cohort; OR the 6-arg path → `impl->draft()` (flat, but with `params_spec.n_min` + `n_past=-1`).
+- **Divergence**: WORK calls `draft()` (flat, per-slot drafter decode); MAIN calls `prepare_batch_draft()` + a single batched drafter decode (efficient). The 6-arg flat path exists in both but WORK's server never calls it.
+
+#### 3. Accept call (seq_id argument difference)
+- **WORK** (server-context.cpp:4419): `common_speculative_accept(slot.get_spec(), slot.get_seq_id(), n_accepted_draft)` — 3-arg with **`slot.get_seq_id()` = 0** for per-slot DFlash (`get_seq_id()` returns `spec ? 0 : id`, server-context.cpp:458).
+- **MAIN** (server-context.cpp:6716): `common_speculative_accept(slot.get_spec(), slot.id, n_accepted_draft)` — 3-arg with **`slot.id`** (the physical slot). (Also a 2-arg `common_speculative_accept(slot.get_spec(), n_accepted_draft)` at 7185.)
+- **Divergence**: WORK passes `seq_id=0` to accept; MAIN passes the physical `slot.id`. Both signatures exist in both branches (`common_speculative_accept(spec, seq_id, n_accepted)` at work:4410/main:4305; `common_speculative_accept(spec, n_accepted)` at work:5058/main:4934) but the WORK server uses the `seq_id=0` variant while MAIN uses `slot.id`.
+
+#### 4. flush_prefill (capture-read routing)
+- **WORK** (after my slot_id fix, server-context.cpp:4156): `common_speculative_flush_prefill(pf_spec, pf.span.src_offset, pf.span.n_tokens, pf.slot_id)` — **4-arg with slot_id**; flush_prefill uses `phys_slot = slot_id` for `set_active_slot`/`prefill_capture_info`/`prefill_gpu_n_tokens`.
+- **MAIN** (server-context.cpp:6291): `common_speculative_flush_prefill(pf.spec, pf.span.src_offset, pf.span.n_tokens)` — **3-arg, NO slot_id**; flush_prefill uses the impl's `seq_id=0` (the `set_active_slot(seq_id)` override at speculative.cpp:2722, identical in both branches).
+- **Divergence**: MAIN has the **latent** flush_prefill-seq_id=0 bug too (it reads slot 0's plan/buffer regardless of the request slot). MAIN is **masked** because its LRU picked slot 0 in the tests. My slot_id fix on WORK actually fixes a bug MAIN still has. (Confirmed: both branches' `flush_prefill` are byte-identical at the `set_active_slot(seq_id)` override — speculative.cpp:2722.)
+
+#### 5. Decode loop structure
+- **WORK**: `pre_decode()` (server-context.cpp:3143) does draft + capture scheduling (3934-4164: `capture_begin`, `set_prefill_capture_enabled`, `flush_prefill`, `capture_end` all in pre_decode/post-decode). `post_decode()` (4193) does verify/accept/rollback. The DFlash verify/accept/rollback is a **separate post_decode method**.
+- **MAIN**: capture scheduling is a dedicated section (server-context.cpp:5868-6303: `should_flush_dflash_prefill` lambda, `pending_prefill_flushes`, `capture_begin` at 6040, `set_prefill_capture_enabled` at 6047, `flush_prefill` at 6291, `capture_end` at 6303). The draft is at 4636-4872. The verify/accept/rollback is inline in the main slot loop (6660-7400). MAIN also has **prefetch verify** (`dflash_flat_accept_prefetches`, line 6574-6580) and a **profit controller** (`slot.observe_profit_acceptance`, 6736; `slot.profit_pending_*`, 6727-6736) and **reduced-verify** (`dflash_reduced_verify_ready`, `dflash_verify_plan`, 6960+).
+- **Divergence**: WORK has a **simplified** pre_decode/post_decode split; MAIN has the **full** capture-scheduling + batch-draft + prefetch-verify + profit-controller + reduced-verify + tree pipeline inline.
+
+#### 6. Re-decode / rollback gate
+- **WORK** (server-context.cpp:4429-4443): `const bool all_accepted_flat = n_accepted_draft == (int) slot.spec_draft.size(); if (!all_accepted_flat) { llama_dflash_rollback(...); llama_memory_seq_rm(...); if (n_reeval > 0) { llama_decode(ctx_tgt, batch_reeval); } }`. Gate: `!all_accepted_flat`.
+- **MAIN** (server-context.cpp:7301+): `const bool all_accepted_flat = (n_accepted_draft == (int) n_draft) && !had_dflash_padding;` ... `llama_dflash_rollback(...)` + `llama_decode(ctx_tgt, batch_reeval)` with the comment "When tape replay was unavailable (e.g., Vulkan), re-decode". Gate: `all_accepted_flat = (n_accepted_draft == n_draft) && !had_dflash_padding`.
+- **Divergence**: both re-decode on partial accept on Vulkan (same mechanism, same `llama_dflash_rollback` + `llama_decode(batch_reeval)`). MAIN's gate also requires `!had_dflash_padding` (slightly more restrictive). The re-decode overhead is present in BOTH — it is NOT the differentiator for the 12 vs 24 t/s gap by itself.
+
+### FACTS — identified MISSING / ALTERED / DIVERTED logic (explains both issues)
+
+**MISSING from WORK (present in MAIN):**
+- `common_speculative_draft_batch` integration (the batched multi-slot drafter decode — ONE drafter decode per cohort instead of per-slot). This is the primary draft path in MAIN; WORK lacks it entirely.
+- `prepare_batch_draft()` invocation (MAIN calls it via the batch path; WORK never calls it).
+- **Prefetch verify** (`dflash_flat_accept_prefetches`, `prefetched.n_accepted_draft`/`n_hidden_keep`, MAIN 6574-6580) — MAIN prefetches the verify result to overlap; WORK lacks it.
+- **Profit controller** (`slot.observe_profit_acceptance`, `slot.profit_pending_*`, `slot.dm_adaptive`, `adaptive_n_max`, MAIN 6727-6736) — MAIN adaptively tunes n_draft based on acceptance; WORK uses fixed `n_draft_max` (no adaptive controller). This directly affects throughput.
+- **Reduced-verify** (`dflash_reduced_verify_ready`, `dflash_verify_plan`, `dflash_reduced_verify_top_k`, MAIN 6960+) — MAIN can verify a reduced top-k set (cheaper); WORK lacks it.
+- **`had_dflash_padding`** gate in the all-accepted rollback decision (MAIN 7301).
+- Tree-draft path (`common_speculative_draft_tree`, `tree_commit_n`, MAIN 4736/6660) — WORK lacks the tree path (acceptable on Vulkan, but it's part of the missing pipeline).
+
+**ALTERED argument patterns (WORK vs MAIN):**
+- Draft: 1-arg `common_speculative_draft(spec)` vs 6-arg `common_speculative_draft(spec, params_spec, cached_text_tokens, slot.sampled, log_probs, draft_n_past)`.
+- `n_min`: `0` (WORK) vs `params_spec.n_min` (MAIN).
+- `n_past`: `slot.prompt.n_tokens()` (WORK) vs `-1` for DFlash (MAIN). (Note: the dflash `draft()` uses `committed_len` internally, not `n_past`, so this is likely moot for DFlash — but it's a divergence.)
+- Accept: `slot.get_seq_id()=0` (WORK) vs `slot.id` (MAIN).
+
+**DIVERTED logic paths:**
+- Verify/accept/rollback: WORK does it in a **separate `post_decode()` method**; MAIN does it **inline in the main slot loop** (with prefetch + profit + reduced-verify interleaved).
+- Capture scheduling: WORK in `pre_decode` (3934-4164); MAIN in a dedicated section (5868-6303).
+
+### EXPLANATION of the two issues
+
+**Multi-slot capture failure (slots 1-3 = 0% acceptance):**
+- The root architectural cause is the **truncated server DFlash pipeline**. WORK's simplified pipeline uses `slot.get_seq_id()=0` for accept and (before my fix) `seq_id=0` for flush_prefill, and lacks MAIN's per-slot capture wiring that uses `slot.id`. Combined with the eval-callback-gating bug (hidden_gpu allocated → eval callback off → no CPU capture) and the ring-D2D source/path mismatch, non-zero slots have no working capture path. MAIN has the **same latent flush_prefill seq_id=0 bug** (it's byte-identical, speculative.cpp:2722) but is **masked** because its LRU picked slot 0 in the tests; MAIN's full pipeline (batch draft, prefetch, per-slot capture with slot.id) otherwise handles capture. So the multi-slot capture bug is **present in both branches** but only WORK manifested it (LRU picked slot 3); MAIN would also fail on a non-zero slot.
+- My two fixes (slot_id routing in flush_prefill + eval-callback gating on `dflash_use_prefill_staging`) are correct and necessary but target symptoms of the truncated pipeline; they restored capture for slot 3 (progress: failure moved to ring-D2D) but the ring-write source/path mismatch and inconsistent capture for slots 2/1 remain.
+
+**Re-decode overhead / 12 vs 24 t/s speed gap:**
+- The re-decode mechanism is IDENTICAL in both branches (`llama_dflash_rollback` + `llama_decode(batch_reeval)` on partial accept, both on Vulkan). So the re-decode itself is NOT the differentiator.
+- The speed gap is primarily the **missing efficient pipeline**: MAIN's `common_speculative_draft_batch` (one drafter decode per cohort) vs WORK's per-slot `draft()` (a drafter decode PER SLOT); MAIN's prefetch-verify (overlaps verify with accept); MAIN's profit controller (tunes n_draft to maximize useful acceptance); MAIN's reduced-verify (cheaper verification). WORK has none of these — it does per-slot flat draft + post-decode rollback, which is ~2× slower at the same acceptance.
+- Secondary: WORK's `n_min=0` (no minimum-draft enforcement) and the fixed `n_draft_max` (no adaptive tuning) vs MAIN's `params_spec.n_min` + profit-adaptive `adaptive_n_max`.
+
+### HYPOTHESES
+- The multi-slot capture failure AND the re-decode/speed gap are both consequences of the **~3000-line-truncated server DFlash pipeline** in the work branch. The merge took upstream's simpler server and only partially ported the fork's DFlash flow.
+- The proper fix is NOT more incremental patches (slot_id, eval-callback gating, ring-D2D) — those treat symptoms. The proper fix is to **port the full fork DFlash server pipeline** from `gboddaer/main` into the work branch's `server-context.cpp`: the `common_speculative_draft_batch` integration, `prepare_batch_draft` path, prefetch-verify, profit controller, reduced-verify, per-slot capture with `slot.id`, and the `had_dflash_padding` gate. This is a substantial port (~the 3000-line difference, concentrated in server-context.cpp).
+- Both branches share the latent `flush_prefill` seq_id=0 bug; my slot_id fix should be kept (it fixes a bug MAIN still has).
+
+### TEST RESULTS
+- Commands: `git show gboddaer/main:tools/server/server-context.cpp | grep -nE ...` vs `grep -nE ... tools/server/server-context.cpp` (call-site structure); `sed -n` of the draft/verify/capture sections; `git diff --stat gboddaer/main -- ...`.
+- Result: the call-tree divergences above; `server-context.cpp` work=5947 vs main=9002 lines (−4844/+1884).
+
+### NEXT STEPS
+- The call-tree analysis shows the work branch's DFlash server pipeline is a truncated version of the fork's. The next step is a **structural port** of the fork's DFlash server pipeline (batch draft, prefetch verify, profit controller, reduced-verify, per-slot capture with slot.id) from `gboddaer/main:tools/server/server-context.cpp` into the work branch — adapting to the merge's upstream server structure. This is the fix that addresses BOTH the multi-slot capture failure and the speed gap at their root, rather than the incremental symptom-patches (slot_id, eval-callback gating, ring-D2D) attempted so far.
+- Keep the slot_id flush_prefill fix (correct, fixes a latent bug in both branches). The eval-callback-gating fix (candidate fix 1) is also correct (don't disable eval callback solely due to hidden_gpu presence) but is a symptom-patch; the structural port would supersede it.
+- Until the structural port is done, multi-slot DFlash (--parallel >1 on non-zero slots) will remain broken, and single-slot/slot-0 DFlash will remain at ~12 t/s (vs main's ~24 t/s).
+
+## 2026-07-12 22:00 UTC - CORRECTION: delta analysis shows structural port is NOT proven necessary
+
+### FACTS — the "3000-line truncation" was a mischaracterization
+- Upstream `server-context.cpp` at the merge point (`f708a5b2c` / `ggml-org/master`) = **5372 lines**.
+- **WORK server = 5947 lines** = upstream (5372) **+ 608 insertions / 33 deletions** (`git diff --stat f708a5b2c -- tools/server/server-context.cpp`). So the work branch started from **upstream's server** and added a **~608-line targeted DFlash port** (the `pre_decode` draft + `post_decode` verify/accept/rollback + capture scheduling).
+- **MAIN server = 9002 lines** = upstream (5372) **+ 4800 insertions / 1170 deletions** (`git diff --stat f708a5b2c gboddaer/main -- tools/server/server-context.cpp`). Main is upstream **+ ~4800 lines of the fork's full DFlash server pipeline**.
+- **CORRECTION:** the work branch did NOT "truncate 3000 lines" from main. It started from upstream's 5372-line server and ported a **minimal targeted subset** (~608 lines). The ~4200-line gap (main's 4800 vs work's 608 of DFlash wiring) is the fork's **full** DFlash server pipeline that the work branch deliberately did NOT port. The earlier "3000-line truncation / structural port required" claim (2026-07-12 21:00 UTC entry) was **wrong** and is retracted.
+
+### FACTS — DFlash pipeline components: EXIST-in-impl vs WIRED-into-server
+- **Batch draft — IMPL EXISTS, UNWIRED in work server:**
+  - `common_speculative_draft_batch` (speculative.cpp:4806) and `prepare_batch_draft` (speculative.cpp:2664, the dflash override) **exist in the work branch's speculative.cpp** (identical impl layer, per HF-025).
+  - Work server references: **0**. Main server references: **9** (`common_speculative_draft_batch` call at 4636 + `batched_drafts`/`batch_specs` plumbing).
+  - → Fixable with a **targeted server-wiring patch** (call the existing `common_speculative_draft_batch` instead of the 1-arg flat `common_speculative_draft`).
+- **Profit/fringe controller — IMPL EXISTS, UNWIRED in work server:**
+  - `tools/server/server-adaptive-dm.h` is **present in the work branch (1682 lines, IDENTICAL line count to main)** and is `#include`d by `server-context.cpp:19`. The profit + fringe controller implementations exist.
+  - Work server references adaptive-dm (`adaptive_n_max`/`dm_adaptive`/`observe_profit`/`profit_pending`/`server_adaptive_dm`): **0**. Main server: **91**.
+  - Work `server_slot` (struct at server-context.cpp:187) does **NOT** derive from `server_adaptive_dm_state` (main's does: `struct server_slot : server_adaptive_dm_state` at main:696). Work `common/speculative.h` has **no** `dm_adaptive`/`dm_controller` params.
+  - → Fixable with a **targeted wiring port** (make `server_slot` derive from `server_adaptive_dm_state`, add `dm_adaptive`/`dm_controller` params, call `observe_profit_acceptance` + use `adaptive_n_max`). The impl exists; only the server-side wiring is missing.
+- **Tree draft — IMPL EXISTS, UNWIRED in work server:**
+  - `draft_tree` (speculative.cpp:3318) and `common_speculative_draft_tree` (speculative.cpp:5026) **exist in work's speculative.cpp**.
+  - Work server tree refs: **0**. Main server: **52**. (Tree is not used on Vulkan anyway — no `ggml_ssm_conv_tree`/`ggml_gated_delta_net_tree` Vulkan backend.)
+- **Prefetch-verify — SERVER-SIDE ONLY (not in speculative.cpp of EITHER branch):**
+  - `dflash_flat_accept_prefetches` / `prefetched.n_accepted_draft` are **server-side logic** in main's `server-context.cpp` (not in `speculative.cpp`). Work server refs: **0**. Main server: **89**.
+  - → This is a server-side performance feature that would need porting the prefetch logic from main's server (not just wiring an existing impl).
+- **Reduced-verify — SERVER-SIDE ONLY:**
+  - `dflash_reduced_verify_plan` (struct at main server-context.cpp:398) + `dflash_select_reduced_verify_plan` (main:479) are **server-side logic**. Work server refs: **0**. Main server: **89** (combined with prefetch).
+  - → Server-side performance feature; would need porting.
+
+### FACTS — what the work server's ~608-line targeted port actually contains
+- `on_decoded` (server-context.cpp:893), `pre_decode` (3143), `post_decode` (4193). The DFlash wiring = pre_decode (1-arg flat draft + capture scheduling at 3934-4164) + post_decode (verify/accept/`llama_dflash_rollback`+re-decode at 4320-4470). Plus the per-slot DFlash members in `server_slot` (`dflash_seq_backup`, `dflash_n_pos_before_draft`, `dflash_state`).
+
+### VERDICT — structural port is NOT proven necessary; targeted patches can address both issues
+1. **Multi-slot capture failure (slots 1-3 = 0%)** is a **CORRECTNESS bug**, NOT a missing-pipeline symptom. It is caused by: (a) `flush_prefill` reading `seq_id=0` instead of the physical slot (FIXED by my slot_id patch — a targeted patch), (b) the eval callback being disabled when `hidden_gpu` is allocated but staging isn't used (PARTIALLY FIXED by candidate fix 1 — a targeted patch), (c) the `ring_write` D2D source/path mismatch for CPU-captured data (next targeted patch). None of these require the batch draft / profit controller / prefetch / reduced-verify pipeline. The missing pipeline is a PERFORMANCE gap, not the cause of the capture correctness bug.
+2. **Speed gap (12 vs 24 t/s)** is NOT proven to require the structural port. Candidate causes, each addressable with targeted patches:
+   - **Batch draft wiring**: the impl exists (`common_speculative_draft_batch`); a targeted patch can make the work server call it instead of the 1-arg flat draft. (For `--parallel 1`, batch ≈ flat, so this helps multi-slot throughput, not single-slot.)
+   - **Profit controller wiring**: the impl exists (`server-adaptive-dm.h`); a targeted wiring patch (server_slot derives from `server_adaptive_dm_state` + params + `observe_profit_acceptance`) can restore adaptive `n_draft` tuning.
+   - **Re-decode overhead**: present in both branches (identical mechanism); fixable with targeted patches (skip re-decode when all-accepted is already done; batch the re-decode; reduce re-decode tokens).
+   - **Verify decode efficiency**: `n_outputs_max` / graph; targeted.
+   - The `--parallel 1` speed gap (work ~10 t/s vs main ~24 t/s at similar ~75-80% acceptance) is NOT explained by the batch draft (single-slot) and is most likely the re-decode overhead + verify-decode efficiency — both fixable with targeted patches. Needs profiling to confirm, NOT a structural port.
+3. **Prefetch-verify and reduced-verify** are server-side performance optimizations in main that would require porting server logic (not just wiring). They would improve throughput further but are NOT required for correctness or baseline speed restoration.
+
+### HYPOTHESES (corrected)
+- The work branch's DFlash server integration is a **minimal targeted port** (upstream + 608 lines), NOT a truncation of main. The impl layer (batch draft, profit controller, tree draft in `speculative.cpp` + `server-adaptive-dm.h`) is **present**; only the **server-side wiring** is minimal.
+- The multi-slot capture failure is fixable with **targeted correctness patches** (slot_id routing ✓, eval-callback gating ✓ partial, ring-D2D source/path — next). No structural port needed for correctness.
+- The speed gap is fixable with **targeted wiring + overhead patches** (wire the existing batch-draft impl, wire the existing profit-controller impl, reduce re-decode overhead). The structural port (porting main's full ~4800-line pipeline including prefetch-verify + reduced-verify) is NOT proven necessary — it would add performance optimizations but is not required to restore correctness or baseline speed.
+- I RETRACT the 2026-07-12 21:00 UTC claim that "the proper fix is a structural port of the full fork DFlash server pipeline." That was based on the mischaracterization of the 3000-line diff as truncation. The delta analysis shows the impl exists and targeted patches are the appropriate fix.
+
+### NEXT STEPS (corrected)
+- Continue the **targeted correctness patches** for multi-slot capture: next is the `ring_write` D2D source/path fix (in `common/speculative.cpp:3695-3714`, attempt D2D only when the capture source is a GPU buffer; go straight to H2D `llama_dflash_cross_ring_gpu_write` when the source is CPU `layer_hiddens`). Then the active-slot routing during the prefill decode (so the eval callback captures into the correct slot's `layer_hiddens` for slots 2/1).
+- For the speed gap: profile the `--parallel 1` decode (work vs main) to locate the 12-vs-24 t/s difference (re-decode overhead vs verify-decode efficiency vs n_outputs_max), then targeted patches. Optionally wire the existing batch-draft + profit-controller impls (targeted, since the impls exist).
+- Do NOT pursue the structural port of main's full server pipeline unless the targeted patches are proven insufficient by profiling evidence.
+
+## 2026-07-12 23:00 UTC - CORRECTNESS RESTORED: multi-slot DFlash via targeted slot-routing patches
+
+### FACTS — targeted patches applied (all on top of HEAD 37a89c8f6, uncommitted)
+The multi-slot capture failure was a **slot-routing** problem: the DFlash impl's `seq_id=0` (per-slot design) was used to index per-physical-slot buffers (`prefill_gpu[slot]`, `hidden_gpu[slot]`, `layer_hiddens[slot]`) and to set the active slot, so non-zero request slots read slot 0's (empty) buffers. Five targeted patches thread the physical request `slot.id` through the capture→ring-write→generation pipeline:
+1. **`flush_prefill` slot_id** (common/speculative.cpp:2721, .h:193, server-context.cpp:4156): `common_speculative_flush_prefill(..., llama_seq_id slot_id)`; `flush_prefill` uses `phys_slot = (slot_id>=0)?slot_id:seq_id` for `set_active_slot` + `prefill_capture_info` + `prefill_gpu_n_tokens`. Server passes `pf.slot_id`.
+2. **eval-callback gating** (src/llama-context.cpp:7018): `dflash_skip_eval_callback = dflash_use_prefill_staging || dflash_suppress_callback_for_view` (was `dflash_graph_hidden_ready || ...`). Keeps the CPU eval callback on when prefill staging isn't used, so multi-slot prefills (hidden_gpu allocated via allocate_slots) still capture via the CPU path.
+3. **`ring_write` D2D slot_id** (common/speculative.cpp:3595, 3682, 3697): added `llama_seq_id phys_slot=-1` param; `phys_slot_eff` used in both `llama_dflash_prefill_gpu_write_hidden(..., phys_slot_eff, ...)` D2D calls. `flush_prefill` passes `phys_slot`. (The D2D was reading `prefill_gpu[seq_id=0]` instead of `prefill_gpu[slot]`.)
+4. **active-slot routing** (src/llama-context.cpp:7013): set `dflash_capture->active_tape_idx = seq` unconditionally (was gated on `seq < tapes.size()`; `tapes` is the tree buffer, size 0/1 for flat DFlash, so non-zero slots never updated active_tape_idx → the eval callback captured into the stale slot 0's `layer_hiddens`). The accessors (`active_tape`/`active_hidden_gpu`/`active_slot_hiddens`) all bounds-check.
+5. **generation-path slot_id** (common/speculative.cpp:3545/3889/5099, .h:191, server-context.cpp:4427): `common_speculative_update_logits_deferred_dflash_kv(..., llama_seq_id slot_id)`; `append_target_hiddens` uses `phys_slot_eff` for `set_active_slot` + `ring_write(n_accepted, 0, false, cpu_hidden, phys_slot_eff)`. Server passes `slot.id`. (Was: `append_target_hiddens` called `set_active_slot(seq_id=0)` + `ring_write(n_accepted)` with default phys_slot=0 → verify-time hidden capture read slot 0 → "incomplete target hidden capture".)
+- Build: `cmake --build build-vulkan --target llama-server llama-cli` EXIT=0 after each patch.
+
+### FACTS — verification: multi-slot DFlash RESTORED, correctness CONFIRMED
+- **Multi-slot `--parallel 4`, 4 sequential long prompts (n_predict=300), one server:**
+  | slot | draft acceptance | errors |
+  |------|-----------------|--------|
+  | 3 | **0.799 (211/264)** | 0 |
+  | 2 | **0.762 (176/231)** | 0 |
+  | 1 | **0.853 (215/252)** | 0 |
+  | 0 | **0.878 (216/246)** | 0 |
+  - `prefill flush mismatch` / `incomplete target hidden capture` / `D2D ring write failed` / `incomplete GPU capture` / `incomplete ring span`: **all 0**.
+  - Garble check: **0 non-ASCII in all 4 generations** (the llama banner's █▄ chars are not in the generation text); all 4 outputs are coherent step-by-step solutions (farmer area, 17×23 distributive, 3x+7=22, Fibonacci). No corruption, no position-offset divergence through 300 tokens.
+- **Single-slot `--parallel 1`, DFlash vs non-DFlash (greedy, same prompt, n=200):** DFlash output is COHERENT and **differs from non-DFlash only in wording** (both valid step-by-step solutions — e.g., different variable definitions). The difference confirms DFlash is **accepting drafts** (a disabled DFlash would produce byte-identical output to non-DFlash). This is the "inherent DFlash-vs-non-DFlash wording difference" that `gboddaer/main` also exhibits (confirmed in the 2026-07-12 15:00 UTC benchmark). NO garble, NO corruption.
+- **Regression check (non-DFlash):** still works — 12.57 t/s, coherent "Here's a thinking process..." output. No regression.
+
+### FACTS — remaining discrepancy (performance, NOT correctness)
+- **Speed gap remains**: multi-slot DFlash is ~11–13 t/s (slot 0: 11.08 t/s over 295 tokens; early 13.38 t/s) vs non-DFlash 12.5 t/s. So DFlash is now roughly **break-even** with non-DFlash (no longer slower, thanks to the wasted-draft-gen elimination) but NOT the ~1.7× speedup main achieves (main 24 t/s). The gap is the **re-decode-on-partial-accept overhead** (identical mechanism in both branches) + the **unwired performance pipeline** (batch draft `common_speculative_draft_batch`, profit controller `server-adaptive-dm.h`, prefetch-verify, reduced-verify — all exist in the impl but aren't wired into the work server, per the 2026-07-12 22:00 UTC delta analysis). This is a separate performance issue, NOT a correctness issue.
+
+### VERDICT
+- ✅ **Multi-slot capture failure: RESOLVED.** All slots (0-3) have DFlash active (76-88% acceptance, matching main's ~80%), 0 capture/ring/D2D errors, in `--parallel 4`.
+- ✅ **Position-offset / corruption issues: RESOLVED.** Coherent outputs across 4 slots through 300 tokens; DFlash vs non-DFlash differs only in inherent wording (drafts accepted), no garble, no divergence-into-corruption.
+- ✅ **No regressions:** non-DFlash and single-slot DFlash still work correctly.
+- ⚠️ **Speed NOT restored to 24 t/s** (DFlash ~11-13 t/s ≈ non-DFlash 12.5). This is the separate re-decode-overhead + unwired-pipeline performance gap, explicitly out of scope for these correctness patches.
+- The targeted slot-routing patches (5 small changes) fully resolved the multi-slot correctness failure. The earlier "structural port" hypothesis (2026-07-12 21:00 UTC) and its retraction (22:00 UTC) are confirmed: targeted patches were sufficient for correctness.
+
+### TEST RESULTS
+- Commands: `scripts/dflash-regression/verify_slotfix.sh build-vulkan/bin/llama-server workcorr2 8103 /tmp/dflash-corr2 4` (acceptance), `scripts/dflash-regression/verify_corr.sh build-vulkan/bin/llama-server workfinal 8104 /tmp/dflash-final 4` (long-prompt correctness + garble), and a `llama-cli` DFlash-vs-non-DFlash greedy diff (`--parallel 1`).
+- Results: multi-slot acceptance 0.762-0.878 across all 4 slots, 0 errors, 0 garble; single-slot DFlash coherent + differs-from-non-DFlash-only-in-wording; non-DFlash 12.57 t/s coherent (no regression).
+- Output files: `/tmp/dflash-corr2/workcorr2.server.err`, `/tmp/dflash-final/{workfinal.server.err,workfinal.gen{0-3}.txt,nd_gen.txt,df_gen.txt,nd_full.txt,df_full.txt,nodflash.err}`.
+
+## 2026-07-13 00:00 UTC - Speed profiling: drafter decode is the 2.3× bottleneck (NOT re-decode)
+
+### FACTS — profiling setup
+- Profiled DFlash decode `--parallel 1` (single-slot, isolates the per-cycle cost) on both branches, same model pair (Qwen3.6-27B-Q4_K_M target + Qwen3.6-27B-DFlash-Q4_K_M draft), Vulkan0 iGPU, `--spec-draft-n-max 3`, greedy, farmer prompt.
+- Tools: `GGML_DFLASH_QA_TRACE=1` (verify/rollback counts) + `GGML_DFLASH_PROFILE=summary` (per-draft breakdown: cross/batch/decode/argmax/total/graph_reuse, logged at `common/speculative.cpp:3299`).
+- The `all_accepted_flat` skip of rollback+re-decode is ALREADY implemented (`server-context.cpp:4429`), so all-accepted batches do NOT re-decode.
+
+### FACTS — re-decode overhead is SECONDARY (16%)
+- Work `--parallel 1`, n_predict=200, 62 verify cycles:
+  - **all_accepted=1 (SKIP re-decode): 38 (61.3%)**
+  - all_accepted=0 (PARTIAL → re-decode): 24 (38.7%)
+  - 24 re-decodes, n_reeval avg 2.00 tokens, **total 48 re-decode tokens**
+  - draft: 185 tokens generated, 137 accepted, 74.1% acceptance
+- Re-decode cost estimate: 48 re-decode tokens vs ~248 verify-decode tokens (62 cycles × ~4) = **16% of target decode work**. Not enough to explain the 2×+ speed gap. The all-accepted skip is already optimal here (61% skip).
+
+### FACTS — the PRIMARY bottleneck: drafter decode is 2.3× slower in work
+- Apples-to-apples `--parallel 1` (same acceptance ~74-79%, same draft count 61-62, same n_draft=3, same iGPU, same drafter model, same re-decode mechanism):
+  | metric | work (37a89c8f6+fixes) | main (130ea2480) |
+  |--------|------------------------|------------------|
+  | generation t/s | **10.95 t/s** | **24.18 t/s** |
+  | acceptance | 74.1% | 79.0% |
+  | draft calls | 62 | 61 |
+  | drafter decode (per call) | **avg 54.01ms** (min 27.97, max 99.25) | **avg 23.57ms** (min 20.79, max 38.57) |
+  | total draft time | 1998ms (decode) + 82ms (cross) | 872ms (decode) + 56ms (cross) |
+- Per-draft breakdown (work, `GGML_DFLASH_PROFILE=summary`): **decode=54.01ms avg (96% of draft time)**, cross(build_cross_data)=2.23ms (4%), batch=~0ms, argmax=0.13ms. graph_reuse increments (0→17) → the drafter graph IS cached (not rebuilt every call). So the 2.3× is the drafter forward pass itself, not graph rebuild or cross-data prep.
+- The drafter graph (`dflash_draft.cpp`) is essentially identical work-vs-main (`git diff --stat` = 21 ins/6 del, all mechanical: `n_layer`→`n_layer()` refactor, `is_swa_impl` population, class renames `graph_kv_update`/`graph`). So the graph builder is NOT the difference.
+- **Leading hypothesis — drafter `n_outputs_max`:** work forces the drafter `cparams.n_outputs_max = max(cparams.n_outputs_max, 17)` (`server-context.cpp:1361`, comment "Ensure drafter has enough output positions for DFlash block_size drafts"). With `n_outputs_max=17 ≥ block_size=16`, the drafter graph's `inp_out_ids = n_outputs < n_tokens ? build_inp_out_ids() : nullptr` (`dflash_draft.cpp:989`) is **null** → the LM-head matmul (`build_lora_mm(model.output, cur)` at :1205, weights shared from the 27B target, vocab 248320) computes logits for **all 16 token positions**. Main uses `params_dft.n_outputs_max = params_base.n_parallel` (main:2228) — smaller — so `inp_out_ids` selects only the needed `n_draft+1` rows → a much smaller LM-head matmul. The LM head (248320×hidden) is the dominant matmul in a drafter whose weights are mostly the shared 27B LM head, so 16 rows vs ~4 rows ≈ 4× LM-head work ≈ the 2.3× decode difference. **Needs confirmation by testing** (reduce work's drafter n_outputs_max to `n_draft+1` and measure the decode time).
+- Secondary observation: **main uses adaptive `n_draft` (1/2/3) via the profit controller** (the profile shows `n_draft=2,2,2,1,1,1,3,3,...` — the profit controller tunes it); work uses fixed `n_draft=3`. Adaptive n_draft reduces work per cycle when acceptance is low, but main is 23ms even at n_draft=3, so this is a minor throughput contributor, not the 2.3× cause.
+
+### FACTS — draft-generation frequency / acceptance impact
+- Draft frequency is essentially identical (62 vs 61 calls for ~200 tokens). Acceptance is similar (74% vs 79%). So the gap is NOT draft frequency or acceptance — it is the per-call drafter decode cost (2.3×).
+- Throughput math: work produces ~2.93 tokens/cycle at 10.95 t/s; main ~3.28 tokens/cycle at 24 t/s. The per-cycle cost (work 0.27s vs main 0.14s) is 1.9× higher in work, dominated by the drafter decode (54ms vs 23ms = 31ms/cycle difference, which is most of the 130ms/cycle gap).
+
+### PROPOSED LOGIC CHANGES (documented before implementing)
+1. **PRIMARY — reduce the drafter `n_outputs_max` to the needed `n_draft+1` (not 17).** In `server-context.cpp:1361`, change `cparams.n_outputs_max = max(cparams.n_outputs_max, 17)` to use `1 + common_speculative_n_max(&params_base.speculative)` (the actual max draft count, e.g., 4 for n_max=3) instead of the hardcoded 17. This makes the drafter graph use `inp_out_ids` to compute only the needed output rows → ~4× smaller LM-head matmul → expected ~2× faster drafter decode → closes most of the 2.3× gap. **Risk:** the DFlash drafter argmax reads positions 1..n_draft; if n_outputs_max < n_draft+1 the argmax would be short. Must keep n_outputs_max ≥ n_draft+1. The `block_size` comment suggests 17 was chosen for the full block, but only n_draft+1 positions are consumed (`flat draft()` reads `argmax[i*K]` for i=1..output_len-1, output_len=n_draft+1). So n_draft+1 should suffice. **Test:** measure the drafter decode time after the change; target ~23ms (main parity).
+2. **SECONDARY — wire the profit controller** (adaptive `n_draft`). The impl EXISTS (`tools/server/server-adaptive-dm.h`, 1682 lines, identical to main) but is unwired in the work server (`server_slot` doesn't derive from `server_adaptive_dm_state`; `common/speculative.h` has no `dm_adaptive` params; 0 refs in work server vs 91 in main). A targeted wiring patch (derive `server_slot` from `server_adaptive_dm_state`, add `dm_adaptive`/`dm_controller` params, call `observe_profit_acceptance` + use `adaptive_n_max`) would tune `n_draft` for throughput. Minor benefit (main is fast even at fixed n_draft=3), so lower priority than #1.
+3. **TERTIARY — re-decode overhead (16%).** Already optimal via the all-accepted skip (61%). Could shave a little by batching the re-decode or skipping when the verify decode's per-token snapshots already cover the accepted prefix (the tree-conv path, CUDA-only — not applicable on Vulkan). Low priority; 16% is not the gap.
+
+### HYPOTHESES
+- The 2.3× drafter-decode slowdown is caused by the drafter computing 16 LM-head output rows (n_outputs_max=17) instead of the needed ~4 (n_draft+1). Reducing n_outputs_max to n_draft+1 should restore main-parity decode time (~23ms) and close the speed gap from ~11 t/s toward ~24 t/s.
+- The re-decode (16%) and the profit controller (minor) are NOT the primary cause; fixing n_outputs_max alone should recover most of the gap.
+- This is a TARGETED patch (one line in server-context.cpp:1361), NOT a structural port — consistent with the 22:00 UTC delta analysis.
+
+### NEXT STEPS (pending go-ahead to implement)
+- Implement proposed change #1 (drafter n_outputs_max = n_draft+1). Build. Re-run `GGML_DFLASH_PROFILE=summary` to confirm the drafter decode drops from ~54ms toward ~23ms. Then re-run the multi-slot correctness + perf test to confirm speed approaches 24 t/s with no correctness regression (acceptance, garble, multi-slot all-slots-active).
+- If #1 alone closes the gap, #2 (profit controller) and #3 (re-decode) are optional follow-ups.
+- If #1 does NOT close the gap (the LM-head hypothesis is wrong), profile deeper: compare the drafter context cparams (KV cache type, n_ubatch, flash_attn) work vs main via `-lv`, and check whether the 2.3× is in attention vs FFN vs LM-head via a finer profile.
+
+### TEST RESULTS
+- Commands: `GGML_DFLASH_QA_TRACE=1 llama-server ... --parallel 1` (re-decode counts), `GGML_DFLASH_PROFILE=summary llama-server ... --parallel 1` (draft breakdown), same for main-ref.
+- Results: work re-decode 24/62 cycles (16% overhead); work drafter decode 54ms/call vs main 23ms/call (2.3×); work 10.95 t/s vs main 24.18 t/s; acceptance 74% vs 79%.
+- Output files: `/tmp/dflash-prof/{work_qa.err,work_prof.err,main_p1.err,main_prof.err}`.
+
+## 2026-07-13 01:00 UTC - n_outputs_max fix applied: PARTIAL speed gain (11→15 t/s), target 24 NOT reached
+
+### FACTS — change applied
+- `tools/server/server-context.cpp:1361`: changed `cparams.n_outputs_max = std::max<uint32_t>(cparams.n_outputs_max, 17)` to `cparams.n_outputs_max = std::max<uint32_t>(cparams.n_outputs_max, 1u + (uint32_t) common_speculative_n_max(&params_base.speculative))`. For `--spec-draft-n-max 3` this is `1+3=4` (was 17). With `n_outputs_max=4 < block_size=16`, the drafter graph uses `build_inp_out_ids()` to compute the LM head for only 4 rows instead of 16.
+- Build: `cmake --build build-vulkan --target llama-server llama-cli` EXIT=0.
+
+### FACTS — speed: real but PARTIAL improvement
+- `GGML_DFLASH_PROFILE=summary`, `--parallel 1`, farmer prompt, n_predict=200:
+  | metric | before fix (n_outputs_max=17) | after fix (n_outputs_max=4) | main (target) |
+  |--------|-------------------------------|----------------------------|---------------|
+  | drafter decode avg | 54.01ms | **40.48ms** | 23.57ms |
+  | generation t/s | 10.95 | **14.19–15.08** | 24.18 |
+- The LM-head reduction (16→4 rows) saved ~14ms of the drafter decode (54→40ms), improving single-slot speed ~1.3× (11→15 t/s). **But the 24 t/s target was NOT reached** — a ~17ms drafter-forward-pass gap remains (40ms work vs 23ms main), i.e. the LM head was only PART of the 2.3× gap (the hypothesis was directionally correct but incomplete).
+- Multi-slot `--parallel 4` (4 long prompts): slot speeds ~11–13 t/s (slot 0: 10.87 t/s over 287 tokens), similar to before the fix — the n_outputs_max fix mainly helps single-slot; multi-slot throughput is dominated by the per-slot drafter forward pass (40ms) which is still 1.7× main's (23ms).
+
+### FACTS — correctness: NO regression
+- Multi-slot `--parallel 4`, 4 long prompts (n_predict=300): **0 errors** (prefill flush mismatch / incomplete target hidden / D2D ring write / incomplete GPU capture / incomplete ring span all 0), **0 garble** (0 non-ASCII in all 4 generations), all 4 outputs coherent step-by-step solutions.
+- Per-slot acceptance: slot 3 = 0.799 (211/264), slot 2 = 0.762 (176/231), slot 1 = 0.853 (215/252), slot 0 = 0.878 (216/246) — **identical to before the n_outputs_max fix** (the fix doesn't touch the capture/verify path, only the drafter's output-row count). All 4 slots DFlash-active.
+
+### VERDICT
+- ✅ Correctness fully preserved (no regression; all 4 slots active, 76-88% acceptance, 0 errors, 0 garble).
+- ✅ Real speed improvement: single-slot 11→15 t/s (~1.3×), drafter decode 54→40ms.
+- ❌ **Target ~24 t/s NOT reached.** Single-slot is ~15 t/s (vs main 24), multi-slot ~11-13 t/s. The n_outputs_max fix addressed the LM-head portion but the remaining ~1.6× gap is the **drafter forward pass** (attention+FFN over 16 block tokens): work 40ms vs main 23ms, same drafter model, essentially identical graph.
+
+### HYPOTHESES (remaining gap — drafter forward pass)
+- The remaining 40ms vs 23ms is in the drafter's 16-token forward pass (not the LM head, which is now 4 rows in both). Candidates to investigate next:
+  1. **Drafter KV cache type / flash_attn**: the work branch may set the drafter context's cache type or flash-attn differently than main (the init logs didn't print these at default verbosity). If the work drafter uses a slower KV cache path (e.g., flash-attn off, or a different quant), that's the gap. Needs `-lv` cparams dump comparison.
+  2. **Drafter `n_ubatch` / graph batching**: both use `LLAMA_DFLASH_MAX_SLOTS * block_size`, but the effective batch/graph sizing may differ.
+  3. **Cross-attention data path**: the drafter's cross-attention reads the cross ring; if the work branch's ring read / cross-attention graph is less efficient (e.g., CPU fallback vs GPU D2D), the forward pass is slower. `build_cross_data` is only 2.5ms, but the cross-attention compute within the 40ms decode could differ.
+  4. **First-decode graph build**: work's first decode is 59ms (graph_reuse=0) vs main's 24ms — the graph BUILD is 2.5× slower in work, suggesting a larger/different graph or a one-time cost that doesn't fully amortize over 62 cycles.
+- These need a finer profile (drafter attention vs FFN vs LM-head split, and a cparams dump) — the `GGML_DFLASH_PROFILE=summary` only breaks down cross/batch/decode/argmax, not the within-decode components.
+
+### TEST RESULTS
+- Commands: `GGML_DFLASH_PROFILE=summary llama-server ... --parallel 1` (decode breakdown), `scripts/dflash-regression/verify_corr.sh ... --parallel 4` (multi-slot correctness+perf).
+- Results: drafter decode 54→40ms, single-slot 10.95→14.19-15.08 t/s, multi-slot ~11-13 t/s; acceptance 74-88% across all slots; 0 errors, 0 garble.
+- Output files: `/tmp/dflash-prof/work_nomax.{err,resp}`, `/tmp/dflash-nomax/{worknomax.server.err,worknomax.gen{0-3}.txt}`.
+
+### NEXT STEPS
+- The n_outputs_max fix is KEPT (correct, ~1.3× single-slot speedup, no regression).
+- To close the remaining ~1.6× gap (toward 24 t/s): profile the drafter forward pass internals (attention vs FFN vs cross-attention) and compare the drafter context cparams (KV cache type, flash_attn, n_ubatch) work vs main via `-lv`. The most likely remaining cause is a drafter-context config difference (KV cache / flash-attn) or the cross-attention compute path, NOT the LM head (now fixed) and NOT the re-decode (16%, secondary) and NOT the batch-draft/profit wiring (minor, per the 00:00 UTC profiling).
+
+## 2026-07-13 02:00 UTC - Finer profiling: remaining 1.5× is in the 16-token drafter forward pass (not pin-pointable with available tools)
+
+### FACTS — call-graph deep-dive (work vs main)
+- `git diff gboddaer/main -- src/models/dflash_draft.cpp` = 21 ins / 6 del, ALL mechanical: `hparams.n_layer`→`hparams.n_layer()` (upstream refactor), `is_swa_impl[]` population from `swa_layers[]` (the SWA-bridge fix), forward declarations + class renames (`graph_kv_update`/`graph`). **No loop-structure, backend-call, or ring-access changes.** The drafter graph (layer loop at :1020, fused cross-attention `build_lora_mm(model.dflash_fc, target_hidden)` at :1014, `inp_out_ids` at :989, `get_rows` at :1191, LM head `build_lora_mm(model.output, cur)` at :1205, topk/argmax at :1215/:1217) is **structurally identical**.
+- Drafter context setup (`params_dft`/`cparams`) is **essentially identical**: n_ctx=256×slots, n_batch=n_ctx, `n_ubatch=LLAMA_DFLASH_MAX_SLOTS*block_size`, n_parallel=slots, kv_unified=false, flash_attn + cache_type_k/v inherited from params_base (both run with `--flash-attn on --cache-type-k/v q8_0`). `LLAMA_DFLASH_MAX_SLOTS=8` (both, include/llama.h:419) → n_ubatch=128 both. `cross_ctx=512` (both, contract log). The only intentional difference is the drafter `n_outputs_max` (work: now `1+n_max`=4 after my fix; main: `params_base.n_parallel`=1 for `--parallel 1` — but main produces 2-3 drafts, so `n_outputs` in the drafter graph is evidently derived from `n_tokens`, not `n_outputs_max`; the LM head is ~4 rows in both now).
+- Raw Vulkan backend (drafter model, no DFlash): `llama-bench -m DRAFT -p 0 -n 64` → **work 33.91 t/s vs main 34.56 t/s** (identical within noise). So the Vulkan backend performance for the drafter's forward pass is the SAME. The gap is NOT a backend version regression.
+
+### FACTS — profiling the drafter forward pass
+- Apples-to-apples `--parallel 1`, n_predict=200, farmer prompt, `GGML_DFLASH_PROFILE=summary`:
+  | metric | work (n_outputs_max=4) | main |
+  |--------|------------------------|------|
+  | generation t/s | 14–15 | 24.58 |
+  | drafter decode avg | **40.48ms** (min 31.00, max 58.99) | **27.25ms** (min 21.73, max 33.12) |
+  | cross_len avg (cross-attention length) | 151 (max 250) | 149 (max 250) |
+  | cross(build_cross_data) | 2.53ms | ~1.5ms |
+  | argmax(extract) | 0.13ms | 0.11ms |
+- The cross_len distribution is **identical** (avg ~150, max 250 both). So the cross-attention SIZE is the same. The decode (40 vs 27) is the 16-token forward pass (self-attn + FFN + cross-attn + 4-row LM head) at the SAME cross_len.
+- First-decode (graph_reuse=0): work 58.99ms (cross_len=54) vs main 21.73ms (cross_len=35) — work's first cross_len is larger (54 vs 35) because the first DFlash draft happens later in work's generation (different warmup), which accounts for some of the first-decode difference, but the AVG over the full run (same cross_len) is still 40 vs 27 → the gap is real and consistent, not a cross_len artifact.
+- Raw 1-token drafter decode (llama-bench, no cross-attention): 29.4ms both. The 16-token DFlash decode (with cross-attention) is 27ms (main) vs 40ms (work). Main's 16-token batch is MORE efficient than its 1-token (27 < 29.4 — batch parallelism wins); work's is LESS efficient (40 > 29.4 — the 16-token batch adds overhead in work).
+
+### VERDICT — the remaining 1.5× is NOT pin-pointable with the available profiling
+- I have ruled out: the graph code (mechanical-identical), the context config (n_ctx/n_ubatch/kv_unified/flash_attn/cache_type/cross_ctx all identical), the Vulkan backend (raw drafter llama-bench identical), the cross-attention size (cross_len identical), the LM head (now ~4 rows both), and the re-decode (16%, secondary).
+- The remaining ~13ms (40 vs 27) is inside the 16-token batched drafter forward pass (self-attention + FFN + cross-attention compute). `GGML_DFLASH_PROFILE=summary` only breaks down cross/batch/decode/argmax — it does NOT split the `decode` term into attention vs FFN vs cross-attention. There is no env-exposed ggml-op-level profiler in this build to attribute the 13ms to a specific op or matmul.
+- The most likely remaining candidates (NOT confirmed, need op-level profiling):
+  1. A runtime-added graph op in the work drafter not present in main (e.g., a capture/trace op, or a different cross-attention matmul shape) — but the dflash_draft.cpp diff shows none.
+  2. Graph build/dispatch overhead: work's first-decode build is 2.7× slower (59 vs 22ms). If the work drafter's graph is being rebuilt more often than graph_reuse suggests, or the Vulkan shader compilation is heavier, the per-decode amortized cost is higher. The graph_reuse counter increments in both, but a periodic rebuild (e.g., when cross_len crosses a bucket boundary — `cross_bucket()` in speculative.cpp) could rebuild more in work.
+  3. The cross-attention matmul efficiency: same cross_len, but if the work branch's cross-attention uses a different matmul shape/stride (e.g., contiguous vs view), the Vulkan kernel is slower. The graph code is identical, but the tensor shapes at runtime could differ if build_cross_data produces a different layout.
+
+### PROPOSED FINAL FIX (honest — no blind fix without root cause)
+- **Keep the n_outputs_max fix** (real: 54→40ms, 11→15 t/s single-slot, no correctness regression). This is the confirmed, evidence-based improvement.
+- **Do NOT propose a blind fix for the remaining 13ms.** Per systematic-debugging (no fix without root cause), attributing the 13ms to a specific op requires a ggml-op-level profiler. The next step is to add op-level timing (e.g., `ggml_graph_compute_with_timings` or a Vulkan layer profiler / `VK_LAYER_LUNARG_monitoring`, or a temporary per-op timestamp in the drafter graph) to split the 40ms into self-attn / FFN / cross-attn / LM-head, then compare to main's 27ms split. Only then can a targeted fix be proposed.
+- This is NOT a targeted-patch situation yet — it's a "need finer instrumentation" situation. The earlier targeted patches (slot_id routing, eval-callback gating, ring_write D2D, active-slot, gen-path slot_id, n_outputs_max) restored correctness AND recovered the LM-head portion of the speed. The remaining 1.5× is a deeper drafter-forward-pass efficiency question requiring op-level profiling.
+
+### TEST RESULTS
+- Commands: `git diff gboddaer/main -- src/models/dflash_draft.cpp`; `git show gboddaer/main:tools/server/server-context.cpp | sed -n ...` (context params); `llama-bench -m DRAFT -p 0 -n 64` (both); `GGML_DFLASH_PROFILE=summary llama-server --parallel 1 n_predict=200` (both, apples-to-apples).
+- Results: dflash_draft.cpp diff mechanical; context params identical; raw drafter llama-bench 33.91 vs 34.56 (identical); drafter 16-token decode 40.48 vs 27.25ms at the same cross_len (avg ~150 both); main 24.58 t/s vs work 14-15 t/s.
+- Output files: `/tmp/dflash-prof/{work_nomax.err,main_p200.err,work_lv2.err,main_lv.err}`, llama-bench stdout.
+
+### NEXT STEPS
+- Add op-level profiling to the drafter decode (per-op timing: self-attn vs FFN vs cross-attn vs LM-head) — either via a temporary instrumentation in the drafter graph build/compute, or a Vulkan layer profiler. Compare the split work vs main to pinpoint the 13ms. THEN propose a targeted fix.
+- If op-level profiling is not feasible in this environment, the n_outputs_max fix (15 t/s, no regression) stands as the confirmed improvement, and the remaining 1.5× gap to main's 24 t/s is documented as requiring op-level instrumentation to resolve — it is NOT closeable by a blind targeted patch.

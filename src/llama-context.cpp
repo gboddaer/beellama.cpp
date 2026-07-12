@@ -7009,14 +7009,33 @@ int llama_context::decode(const llama_batch & batch_inp) {
                     // track active slot for single-seq (used by active_tape() in eval callback)
                     if (ubatch.n_seqs_unq == 1) {
                         const llama_seq_id seq = ubatch.seq_id_unq[0];
-                        if (seq >= 0 && seq < (int) dflash_capture->tapes.size()) {
+                        // Set the active slot unconditionally (the active_tape()/active_hidden_gpu()/
+                        // active_slot_hiddens() accessors all bounds-check against their own
+                        // vectors). Previously this was gated on seq < tapes.size(), but
+                        // `tapes` is the tree-verify buffer (size 0/1 for flat DFlash), so
+                        // for multi-slot non-zero slots active_tape_idx was never updated and
+                        // the eval callback captured into the stale slot's layer_hiddens.
+                        if (seq >= 0) {
                             dflash_capture->active_tape_idx = seq;
                         }
                     }
                     }
 
+                    // Only skip the CPU eval callback when the prefill is actually being
+                    // captured by the GPU prefill-staging path (dflash_use_prefill_staging).
+                    // When staging is not used (short prefill spans, or the prefill plan isn't
+                    // active at decode time), keep the eval callback on so the CPU
+                    // layer_hiddens capture feeds flush_prefill's CPU branch. Previously this
+                    // was gated on dflash_graph_hidden_ready (hidden_gpu presence), which
+                    // disabled the eval callback in multi-slot mode (hidden_gpu allocated via
+                    // allocate_slots) even when the prefill wasn't using staging — leaving
+                    // no capture path at all (eval callback OFF AND staging OFF -> captured=0
+                    // -> prefill flush mismatch -> DFlash disabled). Keeping the eval callback
+                    // on during generation too is harmless (hidden_gpu still captures for the
+                    // ring; layer_hiddens is simply unused then) at the cost of some CPU
+                    // callback overhead.
                     dflash_skip_eval_callback =
-                        dflash_graph_hidden_ready || dflash_suppress_callback_for_view;
+                        dflash_use_prefill_staging || dflash_suppress_callback_for_view;
 
                     const bool dflash_meta_backend_active =
                         dflash_context_has_meta_backend(backends) ||
