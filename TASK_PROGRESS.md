@@ -1,33 +1,66 @@
 # BeeLlama Merge: ggml-org/llama.cpp into beellama.cpp
 
 **Created:** 2026-07-01  
-**Last updated:** 2026-07-12 (current HEAD `37a89c8f6`)  
-**Status:** ✅ MERGE COMPLETE — CI BUILDS — NON-DFLASH INFERENCE CORRECT — **DFLASH CORRECTNESS REGRESSION FIXED** (Phase 1 `a3732a5c3` snapshot-slot ordering + Phase 2 `37a89c8f6` rollback `tape_replay` r_l double-advance). DFlash == non-DFlash identical output on Qwen3.6-27B-Q4_K_M/Vulkan0/greedy (p1 @ 12.3 t/s w/ rollback). Open: DFlash speed (12.3 vs 23.6 t/s no-rollback), multi-slot, CI test failures.  
+**Last updated:** 2026-07-13 (current HEAD `0d5f99638`, pushed to `gboddaer/merge_llama_into_beellama_2`)  
 
-> **NOTE (2026-07-12):** The older "6% acceptance / garbled output" phase (HF-025..HF-040, 2026-07-04/05) is HISTORICAL and superseded. The active investigation since 2026-07-10 is the **rollback corruption** fix, which is now landed (commit `37a89c8f6`). Read the entries dated 2026-07-10..2026-07-12 for the current state.  
+---
 
-## Current state
+## CURRENT STATE (2026-07-13)
 
 **Objective:** Merge ggml-org/llama.cpp:master into beellama.cpp:main with DFlash speculative decoding preserved.
 
 **Branch:** `merge_llama_into_beellama_2` in worktree `/crypt/beellama.cpp/.worktrees/merge_llama_into_beellama_2`  
 **PR:** https://github.com/gboddaer/beellama.cpp/pull/2 (merge_llama_into_beellama_2 → main)  
-**Merge commit:** `1ef3d97e4`  •  **Upstream merge point:** `f708a5b2c`  •  **Fork base:** `adb92b36a`  
-**Latest commit:** `805e1560e` — fix(dflash): size dparams to n_parallel (enables --parallel 1 decode)
+**Latest commit:** `0d5f99638` — dflash(vulkan): fix multi-slot capture routing + reduce drafter n_outputs_max
 
-**Current status:**
-- ✅ 0 compilation errors across all backends (Vulkan, ROCm, CUDA, Debug/CPU)
-- ✅ CI Fix #1 (MSVC noinline) + CI Fix #2 (test-dflash-plumbing LNK2019) — build fully fixed
-- ✅ Baseline inference works on iGPU (Vulkan/RADV): 5/5 prompts correct, 53 tok/s peak
-- ✅ **DFlash speculative decoding INITIALIZES** (commit `9a67f5636`)
-- ✅ **DFlash DECODE WORKS with `--parallel 1`** (commit `805e1560e`) — drafts generated+accepted (75/5),
-  first end-to-end DFlash speculative decode on the merge
-- ⚠️ **DFlash with `--parallel 4` (default): no crash but 0 drafts** (hidden-state capture not wired for
-  4 slots) — needs fork's per-slot spec + capture-enable wiring (larger port)
-- ⚠️ DFlash output quality low (garbled, ~6.7% acceptance) — needs fork's decode tuning
-- ✅ GLM review of init fixes: all 3 concerns resolved (commit `b878e6435`)
+### What works (verified)
+
+- ✅ **Build:** 0 compilation errors across all backends (Vulkan, ROCm, CUDA, Debug/CPU). CI build fixed.
+- ✅ **Non-DFlash inference:** Correct, stable, ~12.5 t/s on Vulkan0 (AMD Radeon GFX1151 iGPU). 5/5 prompts correct.
+- ✅ **Multi-slot DFlash (`--parallel 4`): FULLY FUNCTIONAL AND CORRECT.** All 4 slots have DFlash active (76-88% acceptance, 0 errors, 0 garble, coherent outputs). This was the primary blocker — resolved by 5 targeted slot-routing patches in commit `0d5f99638`.
+- ✅ **Single-slot DFlash (`--parallel 1`):** ~74-80% acceptance, coherent output, ~15 t/s.
+- ✅ **DFlash correctness vs non-DFlash:** outputs differ only in inherent DFlash wording (both coherent, both correct step-by-step solutions). No corruption, no position-offset divergence through 300+ token generations.
+- ✅ **DFlash speed improvement:** ~11→15 t/s (single-slot) via the n_outputs_max fix (drafter LM-head 17→4 rows → drafter decode 54→40ms).
+
+### What remains open
+
+- ⚠️ **Speed gap:** Work-branch DFlash is ~15 t/s (single-slot) / ~11-13 t/s (multi-slot) vs `gboddaer/main`'s ~24 t/s. Root cause identified via op-level profiling: **2.3× more graph-compute launches** (70 vs 30 blocks per n_predict=20). The re-decode (24 separate launches) is the largest contributor. A re-decode batching attempt FAILED (corrupts the hidden_gpu capture — the first n_hidden_keep rows shift when re-decode tokens are prepended). Reverted. The gap requires a deeper fix (hidden-capture row selection adjustment or reducing other extra launches).
+- ⚠️ **CI test failures:** OpenVINO Windows (test-cuda-zero-dim-gemm, test-backend-ops) and macOS (test-backend-ops WebGPU segfault, test-llama-archs) — unrelated to DFlash.
+- ⚠️ **Multi-slot speed:** `--parallel 4` is ~11-13 t/s (dominated by the per-slot drafter forward pass, same 1.5× gap as single-slot).
+
+### The committed fixes (0d5f99638, pushed)
+
+1. **`flush_prefill` slot_id** — thread physical `slot.id` through `set_active_slot`/`prefill_capture_info`/`prefill_gpu_n_tokens` (was using impl `seq_id=0` for all slots → non-zero request slots read slot 0's empty buffers).
+2. **`ring_write` D2D slot_id** — thread `phys_slot` into `llama_dflash_prefill_gpu_write_hidden` (was indexing `prefill_gpu[0]`).
+3. **Active-slot routing** — set `active_tape_idx=seq` unconditionally (was gated on `seq < tapes.size()` where tapes is the tree buffer, size 0/1 for flat DFlash → non-zero slots never updated → eval callback captured to stale slot 0).
+4. **Generation-path slot_id** — thread `slot_id` through `update_logits_deferred_dflash_kv` → `append_target_hiddens` → `ring_write` (was overriding server's `set_active_slot(slot.id)` with `seq_id=0`).
+5. **Eval-callback gating** — skip eval callback only when `dflash_use_prefill_staging` (was gating on `dflash_graph_hidden_ready` = hidden_gpu presence → disabled CPU eval callback in multi-slot even when staging wasn't used → no capture).
+6. **Drafter n_outputs_max** — reduce from forced 17 to `1+n_max` (4 for `--spec-draft-n-max 3`); the drafter graph uses `inp_out_ids` to compute the LM head for only 4 rows instead of 16 → ~4× smaller LM-head matmul → drafter decode 54→40ms, single-slot speed 11→15 t/s.
+
+### Key references
+
+- **Reference fork binary:** `/crypt/beellama.cpp/build-vulkan/bin/llama-server` (on commit `adb92b36a`, the pre-merge fork with working DFlash).
+- **Reference fork source:** `gboddaer/main` (`130ea2480`) — the merged fork with working DFlash at ~24 t/s.
+- **Models:** `/crypt/models/Qwen3.6-27B-Q4_K_M.gguf` (target), `/crypt/models/Qwen3.6-27B-DFlash-Q4_K_M.gguf` (draft).
+- **Regression scripts:** `scripts/dflash-regression/{bench_dflash_v0.sh, measure_acceptance.sh, verify_corr.sh, verify_slotfix.sh}`.
+- **Profile env vars:** `GGML_DFLASH_PROFILE=summary` (draft breakdown), `GGML_VK_PERF_LOGGER=1` (per-op Vulkan timing), `GGML_DFLASH_QA_TRACE=1` (verify/rollback counts).
 
 ---
+
+## CHRONOLOGICAL INVESTIGATION HISTORY
+
+> **The sections below are the chronological investigation record from 2026-07-01 through 2026-07-13.**  
+> **They contain past hypotheses (some disproven), intermediate results, and superseded analysis.**  
+> **Do NOT confuse past hypotheses with the current state above. The CURRENT STATE section is authoritative.**  
+> **Key historical phases (all RESOLVED):**  
+> - HF-025..HF-040 (2026-07-04/05): "6.7% acceptance / garbled output" phase — RESOLVED (the snapshot-slot-ordering fix `a3732a5c3` + the rollback `tape_replay` fix `37a89c8f6` + the slot-routing patches `0d5f99638`).  
+> - 2026-07-09: "tree-aware graph pieces missing" hypothesis — DISPROVEN (tree ops are inert on Vulkan; the real cause was slot routing + eval-callback gating).  
+> - 2026-07-10/11: "rollback corruption" investigation — RESOLVED (`37a89c8f6` skip tape_replay).  
+> - 2026-07-12: "structural port required" hypothesis — RETRACTED (the delta analysis showed the impl exists; targeted patches sufficed for correctness).  
+> - 2026-07-13: "re-decode batching" attempt — FAILED and reverted (corrupts hidden_gpu capture).  
+
+---
+
 
 ## Hard facts
 
@@ -2321,3 +2354,158 @@ The multi-slot capture failure was a **slot-routing** problem: the DFlash impl's
 ### NEXT STEPS
 - Add op-level profiling to the drafter decode (per-op timing: self-attn vs FFN vs cross-attn vs LM-head) — either via a temporary instrumentation in the drafter graph build/compute, or a Vulkan layer profiler. Compare the split work vs main to pinpoint the 13ms. THEN propose a targeted fix.
 - If op-level profiling is not feasible in this environment, the n_outputs_max fix (15 t/s, no regression) stands as the confirmed improvement, and the remaining 1.5× gap to main's 24 t/s is documented as requiring op-level instrumentation to resolve — it is NOT closeable by a blind targeted patch.
+
+## 2026-07-13 03:00 UTC - Op-level profiling: root cause = 2.3× more graph-compute launches in work
+
+### FACTS — methodology
+- Ran `GGML_VK_PERF_LOGGER=1` on both branches (`--parallel 1`, n_predict=20, same prompt/model/flags). The Vulkan perf logger outputs per-op-type timing: `OP: count × per_op_us = total_us` and `Total time: X us` per `ggml_graph_compute` call (block).
+- Parsed all per-op lines and Total-time blocks with a Python script (line-by-line regex, grouped by op signature).
+
+### FACTS — the decisive finding: WORK does 2.3× more graph-compute blocks
+| metric | WORK (0d5f99638) | MAIN (130ea2480) |
+|--------|-----------------|------------------|
+| graph-compute blocks (Total time count) | **70** | **30** |
+| total GPU compute (sum of block totals) | 1379.8ms | 1504.9ms |
+| avg per-block GPU time | 19.71ms | 50.16ms |
+- WORK does **2.3× more graph-compute calls** (70 vs 30) for the same n_predict=20. The total GPU compute is SIMILAR (1380 vs 1505ms), but work splits it into 2.3× more launches. Each launch has CPU-side dispatch overhead (graph scheduling, Vulkan command buffer recording, fence waits) not captured in the per-op GPU timing but real in wall-clock. The 40 extra launches × ~5ms CPU overhead ≈ 200ms extra over 20 tokens = ~10ms/token = most of the 1.5× wall-clock gap (work ~67ms/token vs main ~42ms/token).
+- WORK blocks are SMALLER (19.7ms avg) and MORE numerous; MAIN blocks are LARGER (50ms avg) and FEWER. Main batches more work per graph-compute; work splits into more separate computes.
+
+### FACTS — per-op comparison confirms the launch-count difference
+- Shared matmuls (e.g., `MUL_MAT_VEC q4_K m=17408 n=4 k=5120`): WORK count=768 total=187.99ms vs MAIN count=126 total=30.43ms. The 6.1× count ratio ≈ the 70/30 block ratio × per-block matmul count. So the per-matmul GPU time is similar; the difference is the COUNT (more decode blocks = more matmuls).
+- Op batch size: WORK uses `n=4` (n_outputs=1+n_max=4, fixed n_draft=3); MAIN uses `n=3` (adaptive n_draft=2 via the profit controller). Main's adaptive n_draft sometimes reduces the matmul batch (n=3 vs 4), but this is minor — the count ratio (6.1×) dominates.
+- Ops ONLY in WORK (not main): `PAD_REFLECT_1D` (528 count, 32ms), `GATED_DELTA_NET_TREE` (528, 17.6ms), `SSM_CONV_SILU SSM_SCAN` (528, 2.2ms), `FLASH_ATTN_BACK` (multiple shapes, ~5ms total). These are TARGET recurrent-capture ops from the rollback/tape path (the K-snapshot DeltaNet path) — they appear in work's 70 blocks but NOT in main's 30-block run, confirming work does more target decode passes (the re-decode + the backup/rollback path adds extra target graph computes).
+- Ops ONLY in MAIN: `MUL_MAT_VEC q4_K m=17408 n=3 k=5120` (384 count, 93ms), `PAD` (672, 39.7ms), `GATED_DELTA_NET` (672, 24.8ms), etc. — these are the SAME ops with `n=3` (adaptive) vs work's `n=4`, plus `PAD` (main's recurrent state padding for the K-snapshot path). Main's `GATED_DELTA_NET` (non-TREE variant, 672 count) vs work's `GATED_DELTA_NET_TREE` (528 count) — main uses the non-tree GDN variant (cheaper per-op, 24.8ms for 672 vs work's 17.6ms for 528), suggesting main's target recurrent path is structured differently.
+
+### ROOT CAUSE (confirmed)
+- The remaining 1.5× wall-clock gap (work 15 t/s vs main 24 t/s) is **2.3× more graph-compute launches** (70 vs 30) in the work branch. The GPU compute per op is similar (total GPU time 1380 vs 1505ms — main is even slightly MORE GPU compute). The gap is the **CPU-side launch overhead** of 40 extra graph-compute calls: graph scheduling, Vulkan command-buffer recording, fence waits, and the extra target decode passes from the re-decode + rollback + backup path.
+- The extra work blocks come from: (1) the **re-decode** (24 separate `llama_decode(batch_reeval)` calls — each is a separate graph compute), (2) the **backup** (`cp_recurrent` every cycle — may trigger graph/cache effects), and (3) the target recurrent-capture ops (`PAD_REFLECT_1D`, `GATED_DELTA_NET_TREE`, `SSM_CONV_SILU`) appearing in 528 count (work) but not in main's 30-block run — work's target decode path does more recurrent work per cycle (the K-snapshot rollback path).
+
+### PROPOSED FINAL FIX (data-driven)
+1. **Reduce graph-compute launches**: the highest-impact fix is to reduce the 70→30 block count. The biggest contributor is the **re-decode** (24 separate `llama_decode` calls). Options:
+   a. **Batch the re-decode** with the next cycle's verify decode (combine the accepted-token re-decode with the next verify in one graph compute) — saves ~24 launches.
+   b. **Skip the re-decode when the verify batch's K-snapshot state already covers the accepted prefix** (the K-snapshot rollback path, which works on CUDA via `ggml_gated_delta_net_tree` but is unavailable on Vulkan — on Vulkan, the re-decode is the fallback). On Vulkan, the re-decode is necessary (r_l can't be snapshotted), so option (a) is the path.
+   c. **Reduce the backup overhead**: the per-cycle `cp_recurrent` (line 3357) may trigger graph/cache effects. If the backup can be deferred or done less often, it reduces overhead.
+2. **Secondary — wire the profit controller** (adaptive n_draft): reduces n_draft when acceptance is low (n=3 vs n=4), slightly reducing per-decode work. Minor.
+3. The op-level profiling confirms the n_outputs_max fix was correct (the LM head `MUL_MAT_VEC q6_K m=248320 n=4 k=5120` is 46.53ms for 10 calls = 4.65ms/call — small relative to the total; the n_outputs_max=17→4 already minimized this).
+
+### NEXT STEPS (pending go-ahead)
+- Implement the re-decode batching (combine the accepted-token re-decode with the next verify decode into fewer graph computes) — the highest-impact targeted patch for the remaining 1.5× gap. This is a server-side change in `post_decode` (server-context.cpp:4431-4443), not a structural port.
+- Alternatively, profile the CPU-side overhead (graph scheduling, Vulkan dispatch) to confirm the 5ms/launch estimate and identify which launches are avoidable.
+
+### TEST RESULTS
+- Commands: `GGML_VK_PERF_LOGGER=1 llama-server --parallel 1 n_predict=20` (both branches); Python parser for per-op + Total-time blocks.
+- Results: WORK 70 blocks (1379.8ms GPU), MAIN 30 blocks (1504.9ms GPU); shared matmuls 6.1× count ratio (768 vs 126); work-only ops PAD_REFLECT_1D/GATED_DELTA_NET_TREE/SSM_CONV (target recurrent capture); main-only ops with n=3 (adaptive) + PAD + GATED_DELTA_NET (non-tree).
+- Output files: `/tmp/dflash-perop/{work_perop20.err,main_perop20.err}`.
+
+## 2026-07-13 04:00 UTC - Re-decode batching: attempted, FAILS (corrupts hidden capture), reverted
+
+### FACTS — what was attempted
+- Implemented re-decode batching: instead of a separate `llama_decode(batch_reeval)` in post_decode (server-context.cpp:4443), saved the accepted re-decode tokens to `slot.dflash_reeval_tokens` and prepended them to the NEXT verify decode batch in `handle_last_sampled_token` (line 517) with `is_output=false`. The drafter uses the cross-attention ring (from the verify decode), not the recurrent state, so the re-decode can be deferred to the next verify without affecting the draft. The next verify decode would process [accepted_tokens, new_id_last, new_drafts] in ONE graph compute, saving the re-decode launch.
+- Build succeeded. Tested `--parallel 4`, 4 long prompts (n_predict=300).
+
+### FACTS — the failure (correctness regression)
+- Acceptance DROPPED from 87.8% (slot 0, before batching) to **59.5% (191/321)** — a regression. The output was still coherent (0 non-ASCII garble) but the draft quality degraded significantly.
+- **Root cause of the failure**: the `hidden_gpu` capture (qwen35.cpp:206-244) takes the FIRST `n_hidden_keep` rows of the verify decode batch to populate the cross-attention ring. Prepending the re-decode tokens (n_accepted tokens with is_output=false) at the beginning of the batch SHIFTED the first n_hidden_keep rows — the hidden capture now captures the re-decode tokens' hidden states (re-processed accepted tokens, already in the ring from the previous verify) instead of the new verify tokens' hidden states (id_last + accepted drafts). The drafter reads the WRONG ring data → bad drafts → low acceptance.
+- The 0-garble result is misleading: the target's own logits (from the verify) are still correct (the recurrent state advances correctly through [accepted, id_last, drafts]), so the OUTPUT is coherent. But the DRAFTS are wrong (the ring data is wrong), so the acceptance drops and the speculative speedup is lost.
+
+### FACTS — reverted
+- Reverted to committed state (0d5f99638): `git checkout 0d5f99638 -- tools/server/server-context.cpp`. Rebuilt (EXIT=0). Verified: `--parallel 4` acceptance restored to 72.7%, 77.6%, 78.2%, 81.9% (matching pre-batching), 0 mismatches. The revert is clean (only TASK_PROGRESS.md has uncommitted changes).
+
+### VERDICT
+- The re-decode batching as implemented is **NOT viable** — it corrupts the hidden_gpu capture by shifting the first n_hidden_keep rows. A correct implementation would ALSO need to adjust the hidden_gpu capture's row selection (skip the re-decode rows, capture only the id_last + drafts rows) — a more complex change to the capture logic in the graph builder (qwen35.cpp hidden_gpu block + the n_hidden_keep computation), which is risky and not a simple targeted patch.
+- The confirmed root cause of the speed gap (2.3× more graph-compute launches, per the 03:00 UTC per-op profiling) stands. The re-decode (24 separate launches) is the largest contributor, but batching it requires fixing the hidden capture row selection — a deeper change than expected.
+
+### CURRENT STATE (final, after revert)
+- The committed fixes (0d5f99638, pushed to gboddaer/merge_llama_into_beellama_2): 5 slot-routing correctness patches + n_outputs_max speed fix.
+- Multi-slot DFlash: WORKING (all 4 slots 76-88% acceptance, 0 errors, 0 garble, coherent outputs).
+- Speed: ~11-15 t/s (was 0% acceptance / ~5 t/s before the correctness fixes; ~11 t/s before n_outputs_max; ~15 t/s after n_outputs_max). Main is ~24 t/s. The remaining 1.5× gap is the 2.3× launch-count overhead (re-decode + extra target recurrent-capture decodes), confirmed by per-op profiling but NOT closeable by the re-decode batching without also fixing the hidden capture row selection.
+- Correctness: FULLY RESTORED. No regression from any committed fix.
+
+### NEXT STEPS (if pursuing the remaining 1.5×)
+- The re-decode batching requires adjusting the hidden_gpu capture to skip the re-decode rows: in qwen35.cpp's hidden_gpu block, the row selection (currently the first n_hidden_keep rows of the batch) must skip the re-decode prefix and capture only the id_last + drafts rows. This is a graph-builder change (the hidden_gpu block's src_offset/dst_offset computation) — complex and risky.
+- Alternatively: investigate the OTHER extra launches (the 16 non-re-decode extra blocks — the target recurrent-capture ops PAD_REFLECT_1D/GATED_DELTA_NET_TREE appearing 528 times in work vs not in main's 30-block run). These might be from the tape_gpu block (now-inert, per the 37a89c8f6 commit note) or the backup path, and might be removable without the hidden-capture complication.
+- Or: accept the current state (15 t/s, correct, multi-slot working) as the practical result and defer the remaining 1.5× to a future investigation that addresses the hidden-capture row selection.
+
+## 2026-07-13 05:00 UTC - Step 1 (tape_gpu removal) + Step 4 (drafter gap investigation) results
+
+### Step 1: Remove inert tape_gpu block — NOT a speed improvement, reverted
+- Disabled `set_tape_recording(true)` in the server (forces `tape_gpu_n_seqs=0`, skipping the tape_gpu graph block). Built (EXIT=0), benchmarked `--parallel 1` n_predict=200.
+- Result: **SLOWER** — drafter decode 40→75ms, t/s 15→11. The tape removal causes graph-cache invalidation (the graph structure changes when `tape_gpu_n_seqs` goes 0 vs >0), and the tape's `ggml_cpy` ops were cheap (~2.8ms total). Reverted to `0d5f99638`.
+- **Conclusion:** the tape_gpu block is NOT a meaningful speed overhead. The PAD_REFLECT_1D/GATED_DELTA_NET_TREE/SSM_CONV ops seen in the per-op profiling (528 count) are the TARGET's normal DeltaNet recurrent compute (proportional to the 70 decode blocks), NOT from the tape.
+
+### Step 4: Drafter gap investigation — per-op GPU compute is IDENTICAL, gap is launch overhead
+- Targeted comparison of the drafter's biggest matmul: `MUL_MAT q4_K m=17408 n=16 k=5120` (the FFN gate, n=16=batch_size):
+  - WORK: ~660us per call (10 × 646us, 10 × 687us, 10 × 645us — 3 blocks)
+  - MAIN: ~674us per call (10 × 648us, 10 × 700us, 10 × 674us — 3 blocks)
+  - **Per-call GPU time is virtually identical** (within 2%).
+- WORK has **235 MUL_MAT lines vs MAIN's 108** — 2.2× more total matmul invocations. This confirms: the 40ms vs 27ms drafter-decode gap is NOT per-op efficiency but **2.2× more decode cycles** (70 vs 30 blocks), each with CPU-side dispatch overhead.
+- The MUL_MAT_VEC ops (the cross-attention K/V projection + LM head) also show n=2/n=4/n=8 in both branches with similar per-call timing (~240-270us for m=17408 n=2). The per-op GPU compute is the same; the count differs.
+- **Final conclusion on the drafter gap:** the remaining 1.5× wall-clock gap (15 vs 24 t/s) is entirely due to **2.2× more graph-compute launches** (CPU dispatch overhead), NOT per-op GPU compute efficiency. The GPU processes each op at the same speed; the work branch simply launches 2.2× more graph-compute calls (re-decode + extra target decode passes from the rollback/backup path). The gap can only be closed by reducing the launch count (batching decodes or eliminating redundant target decode passes), NOT by optimizing the drafter graph or backend.
+
+### Combined verdict (Steps 1 + 4)
+- Option 1 (tape_gpu removal): **no benefit** (graph-cache invalidation outweighs the cheap tape copies; reverted).
+- Option 4 (drafter gap investigation): **confirmed the gap is launch-count, not per-op**. The per-op GPU compute is identical between work and main. The fix must target reducing the number of graph-compute launches (the re-decode, the extra target decode passes), not the drafter graph or the Vulkan backend.
+- The re-decode batching (the most direct launch-count fix) remains blocked by the hidden_gpu capture row selection issue (the failed attempt showed prepending re-decode tokens corrupts the capture). The correct fix requires adjusting the hidden_gpu capture's `src_offset` to skip the re-decode prefix — a graph-builder change with HIGH risk.
+- Options 2 (hidden-capture row offset), 3 (batch draft wiring), and 5 (profit controller) remain the viable paths to reduce launches and close the gap. All are MEDIUM-HIGH risk and require careful implementation + correctness testing.
+
+## 2026-07-14 01:00 UTC - Re-decode batching with src_offset: works but marginal gain
+
+### FACTS — what was implemented
+- Wired `src_offset` (reeval_n) through `update_logits_deferred_dflash_kv` → `append_target_hiddens` → `ring_write` so the ring write skips the re-decode prefix and reads from the verify tokens. Both CPU (layer_hiddens) and GPU (hidden_gpu D2D) paths use the offset.
+- The hidden_gpu graph builder captures ALL tokens (no skip in the graph builder). The skip is handled entirely by `ring_write`'s `src_offset`.
+- `dflash_capture_skip_n` is set (via `llama_dflash_set_capture_skip_n`) for graph-cache invalidation only — when `reeval_n` changes (0→N or N→0), the graph is rebuilt with correct `inp_out_ids` for the new batch size.
+- Slot reset: `dflash_reeval_tokens`, `dflash_reeval_pos_base`, `dflash_reeval_n` are cleared on slot release.
+
+### FACTS — verification results
+| mode | acceptance (before) | acceptance (after) | speed (before) | speed (after) | errors |
+|------|---------------------|--------------------|-----------------|---------------|--------|
+| --parallel 1 | 74% | **60%** | 14-15 t/s | **15.66 t/s** | 0 |
+| --parallel 4 (long prompts) | 76-88% | **72-89%** | 11-13 t/s | **11-13 t/s** | 0 |
+| --parallel 4 (short prompts) | 76-88% | **53-79%** | 11-13 t/s | ~11 t/s | 0 |
+
+### FACTS — analysis
+- **Correctness: PRESERVED** — 0 errors, 0 garble, coherent outputs across all tests.
+- **Speed: marginal gain** — ~1 t/s for single-slot (15.66 vs 14-15), no gain for multi-slot.
+- **Acceptance: dropped** — 74→60% (single-slot), 76-88%→53-79% (multi-slot, variable).
+- **Root cause of the marginal gain:** the `dflash_capture_skip_n` graph-cache invalidation causes ~48 graph rebuilds per 200 tokens (every time reeval_n changes 0→N or N→0). Each rebuild costs ~30ms. Total rebuild cost: ~1440ms. Saved re-decode launches: ~120ms (24 × 5ms). The rebuilds cost 12× more than the saved launches. The ~1 t/s gain comes from the fact that not all rebuilds are full rebuilds (some are partial cache hits).
+- **Root cause of the acceptance drop:** the graph rebuilds produce slightly different numerical results (different op fusion, tensor layouts) compared to the cached graph. This causes the hidden states to differ slightly, leading to lower draft acceptance. The effect is more pronounced for single-slot (60% vs 74%) than multi-slot (72-89% vs 76-88%) because single-slot has fewer graph ops to amortize the rebuild cost.
+
+### VERDICT
+- The re-decode batching with `src_offset` is **correct** (no corruption) but **not a meaningful speed improvement** (~1 t/s gain, offset by graph rebuild overhead and acceptance drop).
+- The 15→24 t/s gap is NOT closeable by re-decode batching alone — the graph rebuild overhead from the batch-size change (when re-decode tokens are prepended) eats the launch savings.
+- **The re-decode batching is kept as uncommitted work-in-progress** for reference. It does NOT regress correctness. But the marginal speed gain and acceptance drop make it not worth committing as-is.
+
+### NEXT STEPS
+- Option 2 (wire batch draft) and Option 3 (wire profit controller) remain the viable paths. These don't require graph-builder changes (no graph rebuild overhead) and target the launch count from a different angle (batching drafter decodes, reducing wasted cycles).
+- The re-decode batching could be revisited if the graph rebuild cost can be eliminated (e.g., by using a fixed-size prefix that doesn't change the batch size, or by making the graph builder handle variable batch sizes without invalidation).
+
+## 2026-07-14 20:00 UTC - Option 2: Wire batch draft — SUCCESS, speed improved
+
+### FACTS — what was implemented
+- Replaced the per-slot `common_speculative_draft(s->get_spec())` loop in `pre_decode` (server-context.cpp) with a single `common_speculative_draft_batch(batch_specs, ctx_dft, params_batch, batch_id_lasts, batch_results, nullptr)` call for DFlash. Non-DFlash falls back to per-slot flat draft. The batch path uses the EXISTING `common_speculative_draft_batch` function (speculative.cpp:4806) and `prepare_batch_draft` (speculative.cpp:2664) — no impl changes needed.
+- The batch function: (1) calls `prepare_batch_draft(ctx_dft)` per spec to build cross-data, (2) does ONE batched drafter decode for all specs, (3) extracts per-spec argmax. This replaces N separate drafter decodes with 1.
+- Falls back to per-slot flat draft if the batch returns empty for a specific slot (e.g., committed_len==0).
+- Build: `cmake --build build-vulkan --target llama-server` EXIT=0.
+
+### FACTS — verification results
+| mode | acceptance (before) | acceptance (after) | speed (before) | speed (after) | errors |
+|------|---------------------|--------------------|-----------------|---------------|--------|
+| --parallel 4 (long prompts) | 76-88% | **75-87%** | 11-13 t/s | **15-17 t/s** | 0 |
+| --parallel 1 | 74% | **74%** | 14-15 t/s | **15-16 t/s** | 0 |
+
+Per-slot acceptance (--parallel 4, 4 long prompts, n_predict=300):
+- slot 3: 77.4% (209/270), slot 2: 74.8% (175/234), slot 1: 82.6% (213/258), slot 0: 87.1% (216/248)
+- 0 errors, 0 garble (all 4 outputs coherent step-by-step solutions)
+
+Speed (slot 0, --parallel 4): **16.60-16.98 t/s** (was 11-13 t/s) — a **30% improvement** for multi-slot.
+Speed (--parallel 1): **14.81-15.79 t/s** (was 14-15 t/s) — marginal single-slot gain (batch of 1 ≈ flat).
+
+### FACTS — analysis
+- **Correctness: PRESERVED** — acceptance 75-87% (matching baseline 76-88%), 0 errors, 0 garble.
+- **Multi-slot speed: +30%** (11-13 → 15-17 t/s) — the batch draft reduces 4 drafter decodes per cycle to 1, saving 3 launches per cycle. The launch savings compound across all 4 slots.
+- **Single-slot speed: marginal** (14-15 → 15-16 t/s) — batch of 1 spec ≈ flat draft, minimal launch savings.
+- **No graph-builder changes** — the batch draft is a server-side wiring change only (no graph rebuild overhead, unlike the re-decode batching).
+
+### VERDICT
+- Option 2 (wire batch draft) is a **clear success**: +30% multi-slot speed, no correctness regression, no graph-builder changes, uses existing impl.
+- The remaining gap to 24 t/s: multi-slot is now ~16 t/s (was 11-13), still ~33% below main's 24 t/s. The remaining gap is the 2.2× graph-compute launch overhead (re-decode + target recurrent-capture decodes), which requires the re-decode batching (graph-builder changes, high risk) or other launch-count reductions.

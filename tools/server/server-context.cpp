@@ -3295,8 +3295,60 @@ private:
                     llama_dflash_set_active_slot(ctx_tgt, s->id);
                 }
             }
-            for (server_slot * s : drafting) {
-                common_speculative_draft(s->get_spec());
+
+            // Use the batched draft path for DFlash: one drafter decode for all
+            // slots in the cohort instead of N separate per-slot decodes.
+            // Falls back to per-slot flat draft if batch fails or for non-DFlash.
+            const bool use_batch_draft =
+                params_base.speculative.has_type(COMMON_SPECULATIVE_TYPE_DFLASH) &&
+                drafting.size() > 0 &&
+                ctx_dft != nullptr;
+
+            if (use_batch_draft) {
+                std::vector<common_speculative *> batch_specs;
+                std::vector<llama_token>          batch_id_lasts;
+                std::vector<llama_tokens>        batch_results;
+                batch_specs.reserve(drafting.size());
+                batch_id_lasts.reserve(drafting.size());
+
+                for (server_slot * s : drafting) {
+                    batch_specs.push_back(s->get_spec());
+                    batch_id_lasts.push_back(s->sampled);
+                    // Clear spec_draft so the batch result can fill it.
+                    s->spec_draft.clear();
+                }
+
+                common_params_speculative params_batch = params_base.speculative;
+                // Use the minimum n_max across all drafting slots so no slot
+                // gets more drafts than its budget allows.
+                int batch_n_max = INT_MAX;
+                for (server_slot * s : drafting) {
+                    batch_n_max = std::min(batch_n_max, s->get_n_draft_max());
+                }
+                if (batch_n_max != INT_MAX) {
+                    params_batch.n_max = std::min(params_batch.n_max, batch_n_max);
+                }
+
+                common_speculative_draft_batch(
+                    batch_specs, ctx_dft.get(), params_batch,
+                    batch_id_lasts, batch_results, nullptr);
+
+                // Assign batched results back to each slot.
+                for (size_t i = 0; i < drafting.size(); i++) {
+                    if (i < batch_results.size() && !batch_results[i].empty()) {
+                        drafting[i]->spec_draft = std::move(batch_results[i]);
+                    } else {
+                    // Batch returned empty for this slot — fall back to flat draft.
+                        // This handles cases where prepare_batch_draft failed for
+                        // this specific slot (e.g., committed_len == 0).
+                        common_speculative_draft(drafting[i]->get_spec());
+                    }
+                }
+            } else {
+                // Non-DFlash or no drafter context: per-slot flat draft.
+                for (server_slot * s : drafting) {
+                    common_speculative_draft(s->get_spec());
+                }
             }
         }
 
