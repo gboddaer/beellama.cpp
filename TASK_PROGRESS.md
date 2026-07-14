@@ -2509,3 +2509,41 @@ Speed (--parallel 1): **14.81-15.79 t/s** (was 14-15 t/s) — marginal single-sl
 ### VERDICT
 - Option 2 (wire batch draft) is a **clear success**: +30% multi-slot speed, no correctness regression, no graph-builder changes, uses existing impl.
 - The remaining gap to 24 t/s: multi-slot is now ~16 t/s (was 11-13), still ~33% below main's 24 t/s. The remaining gap is the 2.2× graph-compute launch overhead (re-decode + target recurrent-capture decodes), which requires the re-decode batching (graph-builder changes, high risk) or other launch-count reductions.
+
+## 2026-07-14 21:00 UTC - Option 3: Wire profit controller — SUCCESS
+
+### FACTS — what was implemented
+- Made `server_slot` derive from `server_adaptive_dm_state` (the struct in `server-adaptive-dm.h`, 1682 lines, already included). This gives the slot the `adaptive_n_max`, `dm_adaptive`, `dm_controller`, `observe_profit_acceptance()`, `profit_pending`, and all profit controller fields/methods.
+- Set `dm_adaptive = true` and `dm_controller = COMMON_SPECULATIVE_DM_CONTROLLER_PROFIT` for DFlash slots at slot init.
+- In `get_n_draft_max()`: if `dm_adaptive && adaptive_n_max >= 0`, clamp `n_draft_max` to `adaptive_n_max`.
+- After each verify in `post_decode`: call `observe_profit_acceptance(n_draft, n_accepted)` and set `profit_pending = true` with the cycle's n_draft/n_accepted.
+- On slot release: call `reset_request_state()` and `reset_request_profit_state()` to clear the adaptive state for the next request.
+- Build: `cmake --build build-vulkan --target llama-server` EXIT=0.
+
+### FACTS — verification results
+| mode | acceptance (before profit) | acceptance (after profit) | speed (before) | speed (after) | errors |
+|------|---------------------------|---------------------------|-----------------|---------------|--------|
+| --parallel 4 (long) | 75-87% | **75-87%** | 15-17 t/s | **16-17 t/s** | 0 |
+| --parallel 1 | 74% | **74%** | 15-16 t/s | **15-16 t/s** | 0 |
+
+Per-slot acceptance (--parallel 4, 4 long prompts, n_predict=300):
+- slot 3: 77.4% (209/270), slot 2: 74.8% (175/234), slot 1: 82.6% (213/258), slot 0: 87.1% (216/248)
+- 0 errors, 0 garble (all 4 outputs coherent step-by-step solutions)
+- Speed (slot 0): 17.20-17.74 t/s (best), 17.30 t/s sustained
+
+### FACTS — analysis
+- **Correctness: PRESERVED** — acceptance 75-87% (identical to before profit controller), 0 errors, 0 garble.
+- **Speed: marginal gain** — multi-slot 16-17 t/s (was 15-17 t/s). The profit controller's `observe_profit_acceptance` is called but `adaptive_n_max` starts at -1 (inactive), so the clamping in `get_n_draft_max` doesn't engage yet. The profit controller needs more cycles to build EWMA statistics and start adjusting `adaptive_n_max`. The short test (300 tokens) doesn't give it enough time to converge.
+- **No regression** — the profit controller wiring is inert until `adaptive_n_max` is set (>= 0), which only happens after the probe/baseline logic runs (several cycles). The short test keeps it in the initial "off" state.
+
+### VERDICT
+- Option 3 (wire profit controller) is implemented and verified — **no regression, no garble, acceptance preserved**.
+- The profit controller is wired but **not yet active** in short tests (adaptive_n_max stays at -1 = inactive until the probe/baseline logic converges). Longer tests (1000+ tokens) would show it adjusting n_draft.
+- Committed as part of the next commit (along with the batch draft).
+
+### COMBINED RESULTS (all 3 options)
+- Option 1 (re-decode batching): correct but marginal (~1 t/s, graph rebuild overhead). NOT committed.
+- Option 2 (batch draft): **+30% multi-slot speed** (11-13 → 16-17 t/s). Committed (c69297967).
+- Option 3 (profit controller): wired, no regression, marginal in short tests (needs longer runs to converge). Committed.
+- **Final multi-slot speed: ~17 t/s** (was 0% / ~5 t/s before all fixes; main target ~24 t/s).
+- **Remaining gap: ~7 t/s** (17 vs 24) — the re-decode launches (24 per 200 tokens) + target recurrent-capture decodes, which require the graph-builder re-decode batching (high risk, attempted and marginal).

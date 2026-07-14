@@ -184,7 +184,7 @@ struct server_batch {
     }
 };
 
-struct server_slot {
+struct server_slot : server_adaptive_dm_state {
     int id;
 
     llama_context * ctx_tgt = nullptr;
@@ -357,6 +357,10 @@ struct server_slot {
         n_draft_verif_steps = 0;
         n_accepted_per_pos.clear();
 
+        // Reset adaptive draft-max state for the next request.
+        reset_request_state();
+        reset_request_profit_state();
+
         task_prev = std::move(task);
         task.reset();
 
@@ -497,6 +501,11 @@ struct server_slot {
             n_draft_max = std::min(n_draft_max, configured_n_max);
         }
 
+        // Adaptive draft-max (profit controller): if dm_adaptive is enabled and
+        // adaptive_n_max has been set (>= 0), clamp n_draft_max to it.
+        if (dm_adaptive && adaptive_n_max >= 0) {
+            n_draft_max = std::min(n_draft_max, (int) adaptive_n_max);
+        }
         return n_draft_max;
     }
 
@@ -1594,6 +1603,11 @@ private:
             // TEMPORARY TEST: use shared spec for single-slot DFlash to check if
             // per-slot spec creation causes the quality regression.
             const bool slot_dflash = is_dflash && i < dflash_slots_cap;
+            // Enable the adaptive draft-max (profit) controller for DFlash slots.
+            // The controller (server_adaptive_dm_state) adjusts n_draft based on
+            // acceptance rate to avoid wasting decode cycles on rejected drafts.
+            slot.dm_adaptive   = slot_dflash;
+            slot.dm_controller = COMMON_SPECULATIVE_DM_CONTROLLER_PROFIT;
             if (slot_dflash) {
                 try {
                     slot.spec.reset(common_speculative_init(
@@ -4529,6 +4543,19 @@ private:
             // update how many tokens out of those tested were accepted
             slot.n_draft_accepted += ids.size() - 1;
             slot.n_draft_verif_steps += 1;
+
+            // Adaptive draft-max (profit controller): observe acceptance and set
+            // profit_pending for the controller to evaluate on the next cycle.
+            if (slot.dm_adaptive) {
+                slot.observe_profit_acceptance((int) n_draft, (int) ids.size() - 1);
+                slot.profit_pending = true;
+                if (slot.profit_pending_requested_n_max <= 0) {
+                    slot.profit_pending_requested_n_max = (int32_t) n_draft;
+                }
+                slot.profit_pending_n_draft = (int32_t) n_draft;
+                slot.profit_pending_n_accepted = (int32_t) ids.size() - 1;
+                slot.profit_pending_tree = false;
+            }
 
             if (slot.n_accepted_per_pos.empty()) {
                 slot.n_accepted_per_pos.resize(common_speculative_n_max(&params_base.speculative), 0);
