@@ -3417,18 +3417,21 @@ private:
         // update the batch with the sampled/drafted tokens
         iterate(generating, [&](server_slot & slot) {
             if (slot.can_speculate() && !slot.spec_draft.empty() &&
-                    params_base.speculative.has_type(COMMON_SPECULATIVE_TYPE_DFLASH) &&
-                    std::getenv("GGML_DFLASH_FORCE_TAPE_SYNC")) {
-                llama_tape_replay_sync(ctx_tgt);
-            }
-            if (slot.can_speculate() && !slot.spec_draft.empty() &&
                     params_base.speculative.has_type(COMMON_SPECULATIVE_TYPE_DFLASH)) {
+                // Tape replay sync ensures recurrent state is visible before backup.
+                // The fork does this unconditionally; the merge gated it behind
+                // GGML_DFLASH_FORCE_TAPE_SYNC which missed the sync on Vulkan.
+                llama_tape_replay_sync(ctx_tgt);
                 slot.dflash_seq_backup = slot.id + (llama_seq_id) slots.size();
                 slot.dflash_n_pos_before_draft = slot.prompt.tokens.pos_next();
                 llama_context_recurrent_expand(ctx_tgt, (uint32_t) slot.dflash_seq_backup + 1);
                 auto * mem = llama_get_memory(ctx_tgt);
                 llama_memory_seq_rm(mem, slot.dflash_seq_backup, -1, -1);
-                llama_memory_seq_cp_recurrent(mem, slot.id, slot.dflash_seq_backup, -1, -1);
+                // Use ordered recurrent copy first (may avoid full copy on Vulkan).
+                // Falls back to full copy if ordered fails.
+                if (!llama_dflash_memory_seq_cp_recurrent_ordered(ctx_tgt, slot.id, slot.dflash_seq_backup, -1, -1)) {
+                    llama_memory_seq_cp_recurrent(mem, slot.id, slot.dflash_seq_backup, -1, -1);
+                }
             }
             slot.handle_last_sampled_token(batch);
         });
@@ -4500,18 +4503,27 @@ private:
                 common_speculative_update_logits_deferred_dflash_kv(slot.get_spec(), ctx_tgt, batch_tokens, n_hidden_keep, slot.id);
                 if (params_base.speculative.has_type(COMMON_SPECULATIVE_TYPE_DFLASH) && slot.dflash_seq_backup >= 0) {
                     const bool all_accepted_flat = n_accepted_draft == (int) slot.spec_draft.size();
+                    llama_clear_tree_parent_ids(ctx_tgt);
                     if (!all_accepted_flat) {
                         const int n_reeval = llama_dflash_rollback(ctx_tgt, slot.id, slot.dflash_seq_backup,
                             slot.dflash_n_pos_before_draft, n_hidden_keep);
-                        {
-                            auto * mem_fix = llama_get_memory(ctx_tgt);
-                            llama_memory_seq_rm(mem_fix, slot.id, slot.dflash_n_pos_before_draft, -1);
+                        // Note: llama_dflash_rollback() already handles memory cleanup
+                        // of the rolled-back positions. Do NOT add a redundant
+                        // llama_memory_seq_rm() here — it was causing an extra
+                        // memory operation per cycle and potential state corruption.
+                        // Only sync tape replay for multi-slot safety
+                        if ((int) slots.size() > 1) {
+                            llama_tape_replay_sync(ctx_tgt);
                         }
                         if (n_reeval > 0) {
                             llama_batch batch_reeval = llama_batch_init(n_reeval, 0, 1);
                             for (int j = 0; j < n_reeval; ++j) {
-                                llama_token tok = (j == 0) ? slot.sampled : accepted[j - 1];
-                                common_batch_add(batch_reeval, tok, slot.dflash_n_pos_before_draft + j, { slot.id }, false);
+                                const llama_pos pos = slot.dflash_n_pos_before_draft + j;
+                                // Use prompt tokens (already pushed during batch build)
+                                // rather than reconstructing from accepted[] — this
+                                // matches the fork's approach and is more robust.
+                                const llama_token tok = (j == 0) ? slot.sampled : accepted[j - 1];
+                                common_batch_add(batch_reeval, tok, pos, { slot.id }, false);
                             }
                             const int ret_reeval = llama_decode(ctx_tgt, batch_reeval);
                             llama_batch_free(batch_reeval);
@@ -4525,8 +4537,10 @@ private:
                                 slot.id, slot.dflash_seq_backup, (int) slot.dflash_n_pos_before_draft, n_hidden_keep, n_reeval);
                         }
                     } else {
+                        // All-accepted fast path: just free backup seq and cleanup
                         auto * mem = llama_get_memory(ctx_tgt);
                         llama_memory_seq_rm(mem, slot.dflash_seq_backup, -1, -1);
+                        llama_memory_seq_rm(mem, slot.id, slot.prompt.tokens.pos_next(), -1);
                     }
                     slot.dflash_seq_backup = -1;
                 }

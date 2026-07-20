@@ -2547,3 +2547,42 @@ Per-slot acceptance (--parallel 4, 4 long prompts, n_predict=300):
 - Option 3 (profit controller): wired, no regression, marginal in short tests (needs longer runs to converge). Committed.
 - **Final multi-slot speed: ~17 t/s** (was 0% / ~5 t/s before all fixes; main target ~24 t/s).
 - **Remaining gap: ~7 t/s** (17 vs 24) — the re-decode launches (24 per 200 tokens) + target recurrent-capture decodes, which require the graph-builder re-decode batching (high risk, attempted and marginal).
+
+## 2026-07-16 21:00 UTC - Work branch (8fa01c8de) DFlash + MTP tests + main comparison
+
+### Setup
+- Work binary: `merge_llama_into_beellama_2/build-vulkan/bin/llama-server` (version 10557, commit 8fa01c8de = HEAD)
+- Main binary: `build-vulkan/bin/llama-server` (version 10117, commit adb92b36a = gboddaer/main)
+- Device: Vulkan0 (AMD Radeon GFX1151 iGPU, 96GB VRAM), greedy (temp 0, seed 7), n_predict 256, `-np 1`, q8_0 K/V
+- DFlash work: `--spec-type dflash --spec-draft-model <draft> --spec-draft-n-max 4` (NO `--spec-branch-budget` / `--spec-dflash-cross-ctx` — removed by upstream merge)
+- DFlash main: adds `--spec-branch-budget 0 --spec-dflash-cross-ctx 512`
+
+### Results comparison
+
+| Model | Mode | Main (adb92b36a) | Work (8fa01c8de) | Status |
+|-------|------|-----------------|-----------------|--------|
+| Qwen3.6-27B | base | 12.57 t/s | 12.47 t/s | ✓ parity |
+| Qwen3.6-27B | DFlash | 23.90 t/s (57%) | 10.29 t/s (58%) | ✗ **-57%** |
+| Qwen3.6-27B | MTP | 26.21 t/s (55%) | **FAIL** (decode err) | ✗ regression |
+| Gemma4-31B | base | 11.92 t/s | **CRASH** (loader assert) | ✗ regression |
+| Gemma4-31B | DFlash | 25.74 t/s (53%) | **CRASH** (loader assert) | ✗ regression |
+| Gemma4-31B | MTP | FAIL (no NextN) | **CRASH** (loader assert) | ✗ regression |
+| Qwen3-Coder-Next | base | 53.88 t/s | 54.34 t/s | ✓ parity |
+| Qwen3-Coder-Next | DFlash | 42.80 t/s (52%) | 5.55 t/s (72%) | ✗ **-87%** |
+| Qwen3-Coder-Next | MTP | FAIL (no NextN) | **FAIL** (decode err) | ✗ regression |
+
+### Key findings
+
+1. **Base (non-spec) parity preserved**: Qwen3.6 (12.47 vs 12.57) and Qwen3-Coder-Next (54.34 vs 53.88) base speeds match main. The upstream merge didn't regress non-speculative decode.
+2. **Gemma4 completely broken on work branch**: model loader crashes with `GGML_ASSERT((std::is_same<T, int32_t>::value) || (std::is_same<T, uint32_t>::value)) failed` at `llama-model-loader.cpp:361`. Cannot load ANY Gemma4 model (base/DFlash/MTP all fail). This is an upstream-merge regression in the model loader.
+3. **DFlash severe regression on Qwen3.6**: 10.29 t/s vs main's 23.90 (-57%). Acceptance is similar (58% vs 57%), so drafts are correct, but the verify/re-decode graph-compute launch overhead (2.2× launches, documented in earlier profiling) kills throughput. Output is coherent (diverges from base @259, same as main — tie-breaking).
+4. **DFlash catastrophic regression on Qwen3-Coder-Next**: 5.55 t/s vs main's 42.80 (-87%). Acceptance 72% (higher than main's 52%, drafts correct) but throughput destroyed by re-decode overhead. Output coherent (curly-quote tie-break @4).
+5. **MTP broken on work branch**: Both Qwen3.6 and Qwen3-Coder-Next fail MTP with `llama_decode(ctx_dft) failed rc=-1 (pos=0)` / "failed to initialize batch". The MTP draft context is created but the draft decode fails. On main, Qwen3.6 MTP worked at 26.21 t/s — so the upstream merge broke MTP draft decode.
+6. **Missing DFlash flags**: `--spec-branch-budget` and `--spec-dflash-cross-ctx` don't exist on the work branch (lost in upstream merge). DFlash runs with default cross-ctx (no explicit setting).
+
+### Verdict — work branch (8fa01c8de) vs main (adb92b36a)
+- **Base decode**: ✓ parity (Qwen3.6, Qwen3-Coder-Next).
+- **Gemma4**: ✗ broken (loader crash) — needs fix in model loader.
+- **DFlash**: ✗ severe throughput regression (-57% Qwen3.6, -87% Qwen3-Coder-Next) — correct drafts but re-decode launch overhead. Correctness preserved (coherent output, no garble).
+- **MTP**: ✗ broken (draft decode fails) — needs fix in MTP draft decode path.
+- **DFlash flags**: `--spec-branch-budget` / `--spec-dflash-cross-ctx` lost in upstream merge — need to restore.
