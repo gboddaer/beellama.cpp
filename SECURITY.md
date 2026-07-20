@@ -84,6 +84,8 @@ To protect sensitive data from potential leaks or unauthorized access, it is cru
 
 If you can't run your models in a secure and isolated environment or if it must be exposed to an untrusted network, make sure to take the following security precautions:
 * Do not expose the RPC backend, [rpc-server](tools/rpc), or [llama-server](tools/server) to an untrusted network without an isolation and access-control layer. The inherited upstream discussion at https://github.com/ggml-org/llama.cpp/pull/13061 is relevant background.
+
+* Do not use the RPC backend, [ggml-rpc-server](https://github.com/ggml-org/llama.cpp/tree/master/tools/rpc) and [llama-server](https://github.com/ggml-org/llama.cpp/tree/master/tools/server) functionality (see https://github.com/ggml-org/llama.cpp/pull/13061).
 * Confirm the hash of any downloaded artifact (e.g. pre-trained model weights) matches a known-good value.
 * Encrypt your data if sending it over the network.
 

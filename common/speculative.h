@@ -158,7 +158,8 @@ llama_context * common_speculative_create_ctx_dft(const common_params_speculativ
 common_speculative * common_speculative_init(
         common_params_speculative & params,
         llama_context             * ctx_tgt,
-        llama_context             * ctx_dft_shared = nullptr);
+        llama_context             * ctx_dft_shared = nullptr,
+        uint32_t                    n_seq         = 1);
 
 // fork: single-seq overloads
 void common_speculative_begin(common_speculative * spec, const llama_tokens & prompt);
@@ -187,9 +188,9 @@ void common_speculative_draft_batch(
 
 // fork: logit/state management
 void   common_speculative_update_logits(common_speculative * spec, llama_context * ctx, const llama_tokens & batch_tokens, int n_accepted);
-void   common_speculative_update_logits_deferred_dflash_kv(common_speculative * spec, llama_context * ctx, const llama_tokens & batch_tokens, int n_accepted);
+void   common_speculative_update_logits_deferred_dflash_kv(common_speculative * spec, llama_context * ctx, const llama_tokens & batch_tokens, int n_accepted, llama_seq_id slot_id = -1);
 void   common_speculative_update_logits_by_indices(common_speculative * spec, llama_context * ctx, const std::vector<int> & capture_indices);
-int    common_speculative_flush_prefill(common_speculative * spec, int src_offset = 0, int n_tokens = 0);
+int    common_speculative_flush_prefill(common_speculative * spec, int src_offset = 0, int n_tokens = 0, llama_seq_id slot_id = -1);
 void   common_speculative_set_prefill_capture_enabled(common_speculative * spec, bool enabled);
 void   common_speculative_discard_dflash_state(common_speculative * spec, const char * reason);
 void   common_speculative_note_prefill_suffix_scheduled(common_speculative * spec);
@@ -212,3 +213,7 @@ common_speculative_tree common_speculative_draft_tree(
 // fork: draft length params
 int32_t common_speculative_n_max(const common_speculative * spec, const common_params_speculative & params);
 int32_t common_speculative_n_min(const common_speculative * spec, const common_params_speculative & params);
+
+// State management stubs (to be implemented)
+void common_speculative_get_state(common_speculative * spec, uint32_t seq_id, std::vector<uint8_t> & state);
+void common_speculative_set_state(common_speculative * spec, uint32_t seq_id, const std::vector<uint8_t> & state);

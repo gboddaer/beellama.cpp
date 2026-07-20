@@ -5,6 +5,7 @@
 #include <fstream>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <iterator>
 #include <string>
 #include <vector>
@@ -83,9 +84,25 @@ int main(int argc, char ** argv) {
 
     ggml_backend_load_all();
 
-    ggml_backend_dev_t dev = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_GPU);
+    // This test verifies the cuBLAS-family (CUDA/ROCm/MUSA) zero-dimension guard
+    // in ggml-cuda.cu. It must only run on the ggml-cuda backend; selecting any
+    // other GPU backend (e.g. OpenVINO GPU, Metal, WebGPU, Vulkan) would run the
+    // CUDA-specific zero-column mul_mat check against the wrong backend and
+    // spuriously fail. The ggml-cuda backend names its devices "CUDA<n>" /
+    // "ROCm<n>" / "MUSA<n>" (see GGML_CUDA_NAME in ggml-cuda.h), so match those.
+    ggml_backend_dev_t dev = nullptr;
+    for (size_t i = 0; i < ggml_backend_dev_count(); i++) {
+        ggml_backend_dev_t cur = ggml_backend_dev_get(i);
+        const char * name = ggml_backend_dev_name(cur);
+        if (name && (strncmp(name, "CUDA", 4) == 0 ||
+                     strncmp(name, "ROCm", 4) == 0 ||
+                     strncmp(name, "MUSA", 4) == 0)) {
+            dev = cur;
+            break;
+        }
+    }
     if (!dev) {
-        fprintf(stderr, "no GPU backend available, skipping\n");
+        fprintf(stderr, "no CUDA/ROCm/MUSA backend available, skipping\n");
         return 0;
     }
 

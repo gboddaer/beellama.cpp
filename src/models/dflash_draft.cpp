@@ -10,6 +10,13 @@
 #include <cstring>
 #include <vector>
 
+// Forward declarations for graph classes defined later in this file
+struct graph_kv_update;
+struct graph;
+
+// Helper functions used by both graph classes
+static int64_t dflash_max_cross_ctx();
+
 void llama_model_dflash_draft::load_arch_hparams(llama_model_loader & ml) {
     auto & hparams = this->hparams;
 
@@ -42,7 +49,15 @@ void llama_model_dflash_draft::load_arch_hparams(llama_model_loader & ml) {
     ml.get_key(LLM_KV_ATTENTION_SLIDING_WINDOW, hparams.n_swa, false);
     if (hparams.n_swa > 0) {
         hparams.swa_type = LLAMA_SWA_TYPE_STANDARD;
-        ml.get_key_or_arr(LLM_KV_ATTENTION_SLIDING_WINDOW_PATTERN, hparams.swa_layers, hparams.n_layer, false);
+        ml.get_key_or_arr(LLM_KV_ATTENTION_SLIDING_WINDOW_PATTERN, hparams.swa_layers, hparams.n_layer(), false);
+        // Populate is_swa_impl from the explicit per-layer pattern so that
+        // is_swa_any() returns true and create_memory() does not trip
+        // GGML_ASSERT(hparams.is_swa_any()) at llama-model.cpp.  Other SWA
+        // models do this via set_swa_pattern(n_period); DFlash uses an explicit
+        // per-layer boolean array instead, so mirror it directly.
+        for (uint32_t il = 0; il < hparams.n_layer(); ++il) {
+            hparams.is_swa_impl[il] = hparams.swa_layers[il] != 0;
+        }
     }
 }
 
@@ -64,7 +79,7 @@ void llama_model_dflash_draft::load_arch_tensors(llama_model_loader & ml) {
     dflash_fc          = create_tensor(tn(dflash_fc_tensor,          "weight"), {(int64_t) hparams.dflash_n_target_features, n_embd}, 0);
     dflash_hidden_norm = create_tensor(tn(dflash_hidden_norm_tensor, "weight"), {n_embd}, 0);
 
-    for (int i = 0; i < (int) hparams.n_layer; ++i) {
+    for (int i = 0; i < (int) hparams.n_layer(); ++i) {
         auto & layer = layers[i];
 
         layer.attn_norm      = create_tensor(tn(LLM_TENSOR_ATTN_NORM,      "weight", i), {n_embd}, 0);
@@ -104,9 +119,9 @@ void llama_model_dflash_draft::load_arch_tensors(llama_model_loader & ml) {
 
 std::unique_ptr<llm_graph_context> llama_model_dflash_draft::build_arch_graph(const llm_graph_params & params) const {
     if (params.gtype == LLM_GRAPH_TYPE_DFLASH_KV_UPDATE) {
-        return std::make_unique<llm_build_dflash_kv_update>(*this, params);
+        return std::make_unique<graph_kv_update>(*this, params);
     }
-    return std::make_unique<llm_build_dflash_draft>(*this, params);
+    return std::make_unique<graph>(*this, params);
 }
 
 // Max cross-attention context for DFlash drafter (caps VRAM growth).
@@ -897,7 +912,7 @@ void llm_graph_input_dflash::set_input(const llama_ubatch * ubatch) {
     }
 }
 
-llm_build_dflash_draft::llm_build_dflash_draft(
+graph::graph(
         const llama_model & model, const llm_graph_params & params) :
     llm_graph_context(params) {
 
@@ -1205,7 +1220,7 @@ llm_build_dflash_draft::llm_build_dflash_draft(
     ggml_build_forward_expand(gf, res->t_logits_argmax);
 }
 
-llm_build_dflash_kv_update::llm_build_dflash_kv_update(
+graph_kv_update::graph_kv_update(
         const llama_model & model, const llm_graph_params & params) :
     llm_graph_context(params) {
 

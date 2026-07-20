@@ -15,6 +15,7 @@ class llama_kv_cache_iswa : public llama_memory_i {
 public:
     llama_kv_cache_iswa(
             const llama_model & model,
+            const llama_hparams & hparams,
                     ggml_type   type_k,
                     ggml_type   type_v,
                          bool   v_trans,
@@ -27,6 +28,25 @@ public:
                      uint32_t   n_pad,
         const layer_filter_cb & filter,
         const  layer_reuse_cb & reuse);
+
+    // Fork-compatible constructor (with mem_other and share)
+    llama_kv_cache_iswa(
+            const llama_model & model,
+            const llama_hparams & hparams,
+                    ggml_type   type_k,
+                    ggml_type   type_v,
+                         bool   v_trans,
+                         bool   offload,
+                         bool   swa_full,
+                         bool   unified,
+                     uint32_t   kv_size,
+                     uint32_t   n_seq_max,
+                     uint32_t   n_ubatch,
+                     uint32_t   n_pad,
+            llama_memory_i * mem_other,
+        const layer_filter_cb & filter,
+        const  layer_reuse_cb & reuse,
+        layer_share_cb share = nullptr);
 
     ~llama_kv_cache_iswa() = default;
 

@@ -379,13 +379,13 @@ struct common_speculative_impl {
             common_speculative_tree         & /*tree*/) {}
 
     virtual void update_logits(llama_context * /*ctx*/, const llama_tokens & /*batch_tokens*/, int /*n_accepted*/) {}
-    virtual void update_logits_deferred_dflash_kv(llama_context * ctx, const llama_tokens & batch_tokens, int n_accepted) {
+    virtual void update_logits_deferred_dflash_kv(llama_context * ctx, const llama_tokens & batch_tokens, int n_accepted, llama_seq_id /*slot_id*/ = -1) {
         update_logits(ctx, batch_tokens, n_accepted);
     }
 
     virtual void update_logits_by_indices(llama_context * /*ctx*/, const std::vector<int> & /*capture_indices*/) {}
 
-    virtual int flush_prefill(int /*src_offset*/ = 0, int /*n_tokens*/ = 0) { return 0; }
+    virtual int flush_prefill(int /*src_offset*/ = 0, int /*n_tokens*/ = 0, llama_seq_id /*slot_id*/ = -1) { return 0; }
 
     virtual int prepare_batch_draft(llama_context * /*ctx_dft_ext*/) { return -1; }
 
@@ -2718,8 +2718,14 @@ struct common_speculative_impl_dflash : public common_speculative_impl {
         return true;
     }
 
-    int flush_prefill(int src_offset = 0, int n_tokens = 0) override {
-        llama_dflash_set_active_slot(ctx_tgt, seq_id);
+    int flush_prefill(int src_offset = 0, int n_tokens = 0, llama_seq_id slot_id = -1) override {
+        // The prefill plan/buffer are indexed by the PHYSICAL request slot (the server's
+        // slot.id), not this per-slot spec's internal seq_id (which is 0 by design: each
+        // slot has its own spec with n_seq=1). Use the caller-provided slot_id so a
+        // multi-slot server routes flush_prefill to the slot that scheduled the capture.
+        // Falls back to seq_id when no slot_id is provided (backward compat).
+        const llama_seq_id phys_slot = (slot_id >= 0) ? slot_id : seq_id;
+        llama_dflash_set_active_slot(ctx_tgt, phys_slot);
 
         prefill_flush_called = true;
         prefill_flush_requested += n_tokens;
@@ -2751,18 +2757,18 @@ struct common_speculative_impl_dflash : public common_speculative_impl {
 
             int32_t planned = 0;
             int32_t written = 0;
-            if (llama_dflash_prefill_capture_info(ctx_tgt, seq_id, &planned, &written)) {
+            if (llama_dflash_prefill_capture_info(ctx_tgt, phys_slot, &planned, &written)) {
                 captured = written;
             } else {
-                captured = llama_dflash_prefill_gpu_n_tokens(ctx_tgt, seq_id);
+                captured = llama_dflash_prefill_gpu_n_tokens(ctx_tgt, phys_slot);
             }
 
             // GPU staging is window-relative.
             offset = 0;
 
             if (n_tokens > 0 && captured < n_tokens) {
-                LOG_ERR("dflash prefill flush incomplete GPU capture: captured=%lld requested=%d seq=%d; refusing partial ring write\n",
-                        (long long) captured, n_tokens, seq_id);
+                LOG_ERR("dflash prefill flush incomplete GPU capture: captured=%lld requested=%d slot=%d; refusing partial ring write\n",
+                        (long long) captured, n_tokens, (int) phys_slot);
                 return 0;
             }
         } else {
@@ -2786,8 +2792,8 @@ struct common_speculative_impl_dflash : public common_speculative_impl {
 
             if (common_dflash_should_refuse_large_prefill_fallback_for_test(
                         n_tokens, (int) captured, use_prefill_gpu, gpu_ring_handle != nullptr)) {
-                LOG_ERR("dflash prefill flush expected GPU staging for large suffix span but only partial fallback capture is available: captured=%lld requested=%d seq=%d; refusing partial ring write\n",
-                        (long long) captured, n_tokens, seq_id);
+                LOG_ERR("dflash prefill flush expected GPU staging for large suffix span but only partial fallback capture is available: captured=%lld requested=%d slot=%d; refusing partial ring write\n",
+                        (long long) captured, n_tokens, (int) phys_slot);
                 return 0;
             }
 
@@ -2796,8 +2802,8 @@ struct common_speculative_impl_dflash : public common_speculative_impl {
             } else if (gpu_ring_handle) {
                 source = dflash_capture_source::verify_gpu_hidden;
             } else {
-                LOG_ERR("dflash prefill flush has GPU hidden capture but no GPU ring and no CPU hidden data: requested=%d seq=%d\n",
-                        n_tokens, seq_id);
+                LOG_ERR("dflash prefill flush has GPU hidden capture but no GPU ring and no CPU hidden data: requested=%d slot=%d\n",
+                        n_tokens, (int) phys_slot);
                 return 0;
             }
 
@@ -2855,10 +2861,10 @@ struct common_speculative_impl_dflash : public common_speculative_impl {
         }
 
         const bool force_cpu_ring_for_flush = source == dflash_capture_source::cpu_hidden;
-        const int actual_written = ring_write(to_write, offset, force_cpu_ring_for_flush, source);
+        const int actual_written = ring_write(to_write, offset, force_cpu_ring_for_flush, source, phys_slot);
         if (actual_written != to_write) {
-            LOG_ERR("dflash prefill flush wrote incomplete ring span: requested=%d written=%d seq=%d; discarding DFlash state\n",
-                    to_write, actual_written, seq_id);
+            LOG_ERR("dflash prefill flush wrote incomplete ring span: requested=%d written=%d slot=%d; discarding DFlash state\n",
+                    to_write, actual_written, (int) phys_slot);
             discard_cross_ring("incomplete prefill flush");
             return 0;
         }
@@ -3061,15 +3067,62 @@ struct common_speculative_impl_dflash : public common_speculative_impl {
 
             const int64_t t0 = ggml_time_us();
 
+            // KV cache state logging for merge-vs-fork comparison
+            static const bool enable_kv_trace = [] {
+                const char * env = std::getenv("GGML_DFLASH_KV_TRACE");
+                return env && std::atoi(env) != 0;
+            }();
+            if (enable_kv_trace) {
+                auto * mem_dft_pre = llama_get_memory(ctx_dft);
+                llama_pos pos_max_pre = llama_memory_seq_pos_max(mem_dft_pre, seq_id);
+                llama_pos pos_min_pre = llama_memory_seq_pos_min(mem_dft_pre, seq_id);
+                LOG_INF("[DFLASH_KV_TRACE] seq=%d BEFORE draft: committed_len=%d ring_filled=%d dft pos_min=%d pos_max=%d\n",
+                    seq_id, committed_len, ring_filled, (int)pos_min_pre, (int)pos_max_pre);
+            }
+
             flush_deferred_drafter_kv_cache("flat draft");
             llama_memory_seq_rm(llama_get_memory(ctx_dft), seq_id, committed_len, -1);
             common_dflash_align_drafter_seq_or_clear(ctx_dft, seq_id, committed_len, "flat draft");
+
+            if (enable_kv_trace) {
+                auto * mem_dft_post = llama_get_memory(ctx_dft);
+                llama_pos pos_max_post = llama_memory_seq_pos_max(mem_dft_post, seq_id);
+                llama_pos pos_min_post = llama_memory_seq_pos_min(mem_dft_post, seq_id);
+                LOG_INF("[DFLASH_KV_TRACE] seq=%d AFTER  rm+align: committed_len=%d dft pos_min=%d pos_max=%d\n",
+                    seq_id, committed_len, (int)pos_min_post, (int)pos_max_post);
+            }
 
             int cross_len = build_cross_data(ctx_dft);
             if (common_dflash_rx_diag_enabled()) {
                 LOG_INF("DFLASH_RX draft: seq=%d after_build_cross_data cross_len=%d committed_len=%d ring_filled=%d cpu_ring_valid=%d gpu_ring=%d\n",
                     seq_id, cross_len, committed_len, ring_filled,
                     cpu_ring_valid ? 1 : 0, gpu_ring_handle ? 1 : 0);
+            }
+            // DFlash ring data dump for merge-vs-fork comparison
+            static const bool enable_ring_dump = [] {
+                const char * env = std::getenv("GGML_DFLASH_RING_DUMP");
+                return env && std::atoi(env) != 0;
+            }();
+            if (enable_ring_dump && cross_len > 0) {
+                const int dump_n = std::min(8, cross_len);
+                LOG_INF("[DFLASH_RING_DUMP] seq=%d cross_len=%d committed_len=%d ring_filled=%d n_layers=%zu ring_write_pos=%d\n",
+                    seq_id, cross_len, committed_len, ring_filled, capture_layers.size(), ring_write_pos);
+                for (size_t li = 0; li < capture_layers.size(); li++) {
+                    const int32_t layer_id = capture_layers[li];
+                    if (layer_id >= (int) ring_buf.size()) continue;
+                    LOG_INF("[DFLASH_RING_DUMP] layer[%zu]=%d first_8=[", li, layer_id);
+                    for (int i = 0; i < dump_n; i++) {
+                        if (i) LOG_INF(",");
+                        LOG_INF("%+.4f", ring_buf[layer_id][i]);
+                    }
+                    LOG_INF("] ring_write_pos_8=[");
+                    const int wp = ring_write_pos % RING_SIZE;
+                    for (int i = 0; i < 8; i++) {
+                        if (i) LOG_INF(",");
+                        LOG_INF("%+.4f", ring_buf[layer_id][(wp + i) % RING_SIZE]);
+                    }
+                    LOG_INF("]\n");
+                }
             }
             if (cross_len <= 0) {
                 if (common_dflash_rx_diag_enabled()) {
@@ -3107,6 +3160,14 @@ struct common_speculative_impl_dflash : public common_speculative_impl {
                 continue;
             }
 
+            if (enable_kv_trace) {
+                auto * mem_dft_post_decode = llama_get_memory(ctx_dft);
+                llama_pos pos_max_decode = llama_memory_seq_pos_max(mem_dft_post_decode, seq_id);
+                llama_pos pos_min_decode = llama_memory_seq_pos_min(mem_dft_post_decode, seq_id);
+                LOG_INF("[DFLASH_KV_TRACE] seq=%d AFTER  decode: committed_len=%d batch_len=%d dft pos_min=%d pos_max=%d\n",
+                    seq_id, committed_len, batch_len, (int)pos_min_decode, (int)pos_max_decode);
+            }
+
             const int64_t t3 = ggml_time_us();
 
             // read argmax tokens for positions 1..batch_len-1 (skip position 0 = staged_first)
@@ -3115,6 +3176,33 @@ struct common_speculative_impl_dflash : public common_speculative_impl {
                 float * argmax_probs = llama_get_logits_argmax_probs(ctx_dft);
                 const int K_flat = llama_get_logits_argmax_k(ctx_dft);
                 const int argmax_rows = llama_get_logits_argmax_n(ctx_dft);
+
+                // DFlash draft token trace for merge-vs-fork comparison
+                static const bool enable_token_trace = [] {
+                    const char * env = std::getenv("GGML_DFLASH_TOKEN_TRACE");
+                    return env && std::atoi(env) != 0;
+                }();
+                static const bool enable_qa_trace = [] {
+                    const char * env = std::getenv("GGML_DFLASH_QA_TRACE");
+                    return env && std::atoi(env) != 0;
+                }();
+                if (enable_qa_trace) {
+                    fprintf(stderr, "[DFLASH_QA] draft_output seq=%d committed=%d output_len=%d argmax=%p rows=%d K=%d probs=%p\n",
+                        (int) seq_id, committed_len, output_len, (void *) argmax, argmax_rows, K_flat, (void *) argmax_probs);
+                }
+
+                if (enable_token_trace && argmax && K_flat > 0) {
+                    std::string ids = "[";
+                    int trace_n = std::min(8, output_len - 1);
+                    for (int i = 1; i <= trace_n; ++i) {
+                        if (i > 1) ids += ",";
+                        ids += std::to_string(argmax[i * K_flat]);
+                    }
+                    ids += "]";
+                    LOG_INF("[DFLASH_TOKEN_TRACE] seq=%d committed=%d id_last=%d output_len=%d K=%d first_draft_ids=%s\n",
+                        (int) seq_id, committed_len, (int) id_last, output_len, K_flat, ids.c_str());
+                }
+
                 if (argmax) {
                     const int n_vocab = llama_vocab_n_tokens(llama_model_get_vocab(model_dft));
                     if (!common_dflash_argmax_shape_valid(__func__, argmax_rows, output_len, K_flat)) {
@@ -3149,6 +3237,10 @@ struct common_speculative_impl_dflash : public common_speculative_impl {
 
                     // GPU argmax path - only top-k ids/probs are transferred.
                     for (int i = 1; i < output_len && (int) result.size() < n_draft; ++i) {
+                        if (enable_qa_trace && i <= 4) {
+                            fprintf(stderr, "[DFLASH_QA] draft_output row=%d token=%d logp=%f\n",
+                                i, argmax[i * K_flat], argmax_probs ? argmax_probs[i * K_flat] : 0.0f);
+                        }
                         const auto params = dp;
                         if (argmax_probs && p_min > 0.0f && (int) result.size() >= params.n_min) {
                             float log_prob = argmax_probs[i * K_flat];
@@ -3178,6 +3270,10 @@ struct common_speculative_impl_dflash : public common_speculative_impl {
                     }
                 } else {
                     // fallback: CPU argmax over full vocab
+                    if (enable_qa_trace) {
+                        fprintf(stderr, "[DFLASH_QA] draft_output fallback_cpu_argmax seq=%d committed=%d output_len=%d\n",
+                            (int) seq_id, committed_len, output_len);
+                    }
                     const int n_vocab_dft = llama_vocab_n_tokens(llama_model_get_vocab(model_dft));
                     for (int i = 1; i < output_len && (int) result.size() < n_draft; ++i) {
                         float * logits = llama_get_logits_ith(ctx_dft, i);
@@ -3446,10 +3542,10 @@ struct common_speculative_impl_dflash : public common_speculative_impl {
         append_target_hiddens(n_accepted, false);
     }
 
-    void update_logits_deferred_dflash_kv(llama_context * ctx, const llama_tokens & batch_tokens, int n_accepted) override {
+    void update_logits_deferred_dflash_kv(llama_context * ctx, const llama_tokens & batch_tokens, int n_accepted, llama_seq_id slot_id = -1) override {
         GGML_UNUSED(ctx);
         GGML_UNUSED(batch_tokens);
-        append_target_hiddens(n_accepted, true);
+        append_target_hiddens(n_accepted, true, slot_id);
     }
 
     // tree variant: write specific capture-buffer indices to the ring
@@ -3497,9 +3593,17 @@ private:
     // write n_tokens from the capture buffer into the ring, starting at
     // src_offset in the capture buffer. wraps circularly in the ring.
     int ring_write(int n_tokens, int src_offset = 0, bool force_cpu_ring = false,
-                   dflash_capture_source source = dflash_capture_source::cpu_hidden) {
+                   dflash_capture_source source = dflash_capture_source::cpu_hidden,
+                   llama_seq_id phys_slot = -1) {
         if (n_tokens <= 0) return 0;
         ring_write_discarded = false;
+
+        // The prefill_gpu D2D write indexes prefill_gpu[slot]; use the physical request
+        // slot (passed from flush_prefill) so multi-slot servers read the slot that
+        // scheduled the capture. Falls back to seq_id when no phys_slot is provided
+        // (other ring_write callers — generation ring write — use the active slot via
+        // cross_ring_gpu_write_hidden, which has no slot param).
+        const llama_seq_id phys_slot_eff = (phys_slot >= 0) ? phys_slot : seq_id;
 
         const bool use_prefill_gpu = source == dflash_capture_source::prefill_gpu_hidden;
         const bool source_has_cpu_hidden = source == dflash_capture_source::cpu_hidden;
@@ -3583,7 +3687,7 @@ private:
                     if (!data) {
                         if (use_prefill_gpu) {
                             used_d2d = llama_dflash_prefill_gpu_write_hidden(
-                                gpu_ring_handle, ctx_tgt, seq_id, layer, plan.ring_pos,
+                                gpu_ring_handle, ctx_tgt, phys_slot_eff, layer, plan.ring_pos,
                                 src_offset + plan.src_token_offset, plan.n_tokens, embd);
                             if (!used_d2d) {
                                 used_d2d = llama_dflash_cross_ring_gpu_write_hidden(
@@ -3596,7 +3700,7 @@ private:
                                 src_offset + plan.src_token_offset, plan.n_tokens, embd);
                             if (!used_d2d) {
                                 used_d2d = llama_dflash_prefill_gpu_write_hidden(
-                                    gpu_ring_handle, ctx_tgt, seq_id, layer, plan.ring_pos,
+                                    gpu_ring_handle, ctx_tgt, phys_slot_eff, layer, plan.ring_pos,
                                     src_offset + plan.src_token_offset, plan.n_tokens, embd);
                             }
                         }
@@ -3782,12 +3886,16 @@ private:
     }
 
     // called after each verification decode — append only the accepted tokens' hidden states
-    void append_target_hiddens(int n_accepted, bool defer_drafter_kv_cache = false) {
+    void append_target_hiddens(int n_accepted, bool defer_drafter_kv_cache = false, llama_seq_id phys_slot = -1) {
         if (!common_dflash_target_capture_ready_or_skip(ctx_tgt)) {
             return;
         }
 
-        llama_dflash_set_active_slot(ctx_tgt, seq_id);
+        // Use the physical request slot (passed from the server via
+        // update_logits_deferred_dflash_kv) so multi-slot servers read the slot that
+        // captured during the verify decode. Falls back to seq_id when not provided.
+        const llama_seq_id phys_slot_eff = (phys_slot >= 0) ? phys_slot : seq_id;
+        llama_dflash_set_active_slot(ctx_tgt, phys_slot_eff);
 
         int32_t n_slots = llama_get_n_layer_hiddens(ctx_tgt);
         if (n_slots == 0) {
@@ -3824,7 +3932,7 @@ private:
         const int committed_before = committed_len;
         const int write_pos_before = ring_write_pos;
 
-        const int actual_written = ring_write(n_accepted);
+        const int actual_written = ring_write(n_accepted, 0, false, dflash_capture_source::cpu_hidden, phys_slot_eff);
         if (common_dflash_rx_diag_enabled()) {
             LOG_INF("DFLASH_RX append: seq=%d requested=%d actual_written=%d ring_filled_before=%d ring_filled_after=%d committed_before=%d write_pos_before=%d write_pos_after=%d discarded=%d defer_kv=%d\n",
                 seq_id, n_accepted, actual_written,
@@ -4244,7 +4352,16 @@ void common_speculative_draft(common_speculative * spec) {
         }
     }
 
+    static const bool enable_qa_trace = [] {
+        const char * env = std::getenv("GGML_DFLASH_QA_TRACE");
+        return env && std::atoi(env) != 0;
+    }();
+
     for (auto & impl : spec->impls) {
+        if (enable_qa_trace) {
+            fprintf(stderr, "[DFLASH_QA] common_speculative_draft impl=%s n_seq=%zu\n",
+                common_speculative_type_to_str(impl->type).c_str(), spec->dparams.size());
+        }
         {
             common_time_meas tm(impl->t_draft_us, !impl->gen_perf);
             impl->draft(dparams);
@@ -4489,7 +4606,8 @@ llama_context * common_speculative_create_ctx_dft(const common_params_speculativ
 common_speculative * common_speculative_init(
         common_params_speculative & params,
         llama_context             * ctx_tgt,
-        llama_context             * ctx_dft_shared) {
+        llama_context             * ctx_dft_shared,
+        uint32_t                    n_seq_in) {
     const bool owns_ctx_dft = (ctx_dft_shared == nullptr);
     llama_context * ctx_dft = ctx_dft_shared;
     if (ctx_dft == nullptr && params.model_dft) {
@@ -4517,7 +4635,7 @@ common_speculative * common_speculative_init(
         }
     }
 
-    const uint32_t n_seq = 1;
+    const uint32_t n_seq = n_seq_in > 0 ? n_seq_in : 1;
     std::vector<std::unique_ptr<common_speculative_impl>> impls = {};
 
     for (const common_speculative_config & config : configs) {
@@ -4822,6 +4940,15 @@ void common_speculative_draft_batch(
     const int K_flat       = llama_get_logits_argmax_k(ctx_dft);
     const int argmax_rows  = llama_get_logits_argmax_n(ctx_dft);
 
+    static const bool enable_qa_trace = [] {
+        const char * env = std::getenv("GGML_DFLASH_QA_TRACE");
+        return env && std::atoi(env) != 0;
+    }();
+    if (enable_qa_trace) {
+        fprintf(stderr, "[DFLASH_QA] batch_draft n_ready=%d batch_len=%d output_len=%d argmax=%p rows=%d K=%d probs=%p\n",
+            n_ready, batch_len, output_len, (void *) argmax, argmax_rows, K_flat, (void *) argmax_probs);
+    }
+
     for (int r = 0; r < n_ready; r++) {
         auto & rs     = ready[r];
         auto & result = result_per_spec[rs.spec_idx];
@@ -4839,6 +4966,10 @@ void common_speculative_draft_batch(
             }
 
             for (int i = 1; i < output_len && (int) result.size() < n_draft; i++) {
+                if (enable_qa_trace && i <= 4) {
+                    fprintf(stderr, "[DFLASH_QA] batch_draft row=%d token=%d logp=%f\n",
+                        offset + i, argmax[(offset + i) * K_flat], argmax_probs ? argmax_probs[(offset + i) * K_flat] : 0.0f);
+                }
                 if (argmax_probs && params.p_min > 0.0f && (int) result.size() >= params.n_min) {
                     float log_prob = argmax_probs[(offset + i) * K_flat];
                     if (log_prob < logf(params.p_min)) {
@@ -4863,12 +4994,17 @@ void common_speculative_draft_batch(
                     log_probs->push_back(argmax_probs[(offset + i) * K_flat]);
                 }
             }
-        } else {            const int n_vocab = llama_vocab_n_tokens(llama_model_get_vocab(model_dft));
+        } else {
+            if (enable_qa_trace) {
+                fprintf(stderr, "[DFLASH_QA] batch_draft fallback_cpu_argmax ready_index=%d output_len=%d\n", r, output_len);
+            }
+            const int n_vocab = llama_vocab_n_tokens(llama_model_get_vocab(model_dft));
             for (int i = 1; i < output_len && (int) result.size() < n_draft; i++) {
                 float * logits = llama_get_logits_ith(ctx_dft, offset + i);
                 if (!logits) {
                     break;
-                }                llama_token best = (llama_token)(std::max_element(logits, logits + n_vocab) - logits);
+                }
+                llama_token best = (llama_token)(std::max_element(logits, logits + n_vocab) - logits);
                 result.push_back(best);
                 if (log_probs) {
                     log_probs->push_back(0.0f);
@@ -4964,12 +5100,12 @@ void common_speculative_update_logits(common_speculative * spec, llama_context *
     }
 }
 
-void common_speculative_update_logits_deferred_dflash_kv(common_speculative * spec, llama_context * ctx, const llama_tokens & batch_tokens, int n_accepted) {
+void common_speculative_update_logits_deferred_dflash_kv(common_speculative * spec, llama_context * ctx, const llama_tokens & batch_tokens, int n_accepted, llama_seq_id slot_id) {
     if (spec == nullptr) {
         return;
     }
     for (auto & impl : spec->impls) {
-        impl->update_logits_deferred_dflash_kv(ctx, batch_tokens, n_accepted);
+        impl->update_logits_deferred_dflash_kv(ctx, batch_tokens, n_accepted, slot_id);
         if (impl->type == COMMON_SPECULATIVE_TYPE_COPYSPEC) {
             static_cast<common_speculative_impl_copyspec *>(impl.get())->update_logits(ctx, batch_tokens, n_accepted);
         } else if (impl->type == COMMON_SPECULATIVE_TYPE_RECYCLE) {
@@ -5001,13 +5137,13 @@ void common_speculative_rollback_dft(common_speculative * spec, llama_seq_id seq
     }
 }
 
-int common_speculative_flush_prefill(common_speculative * spec, int src_offset, int n_tokens) {
+int common_speculative_flush_prefill(common_speculative * spec, int src_offset, int n_tokens, llama_seq_id slot_id) {
     if (spec == nullptr) {
         return 0;
     }
     int total_written = 0;
     for (auto & impl : spec->impls) {
-        total_written += impl->flush_prefill(src_offset, n_tokens);
+        total_written += impl->flush_prefill(src_offset, n_tokens, slot_id);
     }
     return total_written;
 }
@@ -5103,4 +5239,19 @@ int32_t common_speculative_n_min(const common_speculative * spec, const common_p
         return 0;
     }
     return params.n_min;
+}
+
+// State management stubs
+void common_speculative_get_state(common_speculative * spec, uint32_t seq_id, std::vector<uint8_t> & state) {
+    // TODO: implement state serialization
+    (void)spec;
+    (void)seq_id;
+    state.clear();
+}
+
+void common_speculative_set_state(common_speculative * spec, uint32_t seq_id, const std::vector<uint8_t> & state) {
+    // TODO: implement state deserialization
+    (void)spec;
+    (void)seq_id;
+    (void)state;
 }
