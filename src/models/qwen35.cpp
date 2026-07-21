@@ -308,7 +308,27 @@ llama_model_qwen35::graph::graph(const llama_model & model, const llm_graph_para
     cb(cur, "result_output", -1);
     res->t_logits = cur;
 
-    ggml_build_forward_expand(gf, cur);
+    // DFlash compact verifier-only mode (ported from fork adb92b36a:324-339).
+    // When DFlash is verifying with reduced consumer active, skip building the
+    // full logits tensor — only compute a top-k argmax. This avoids a large
+    // matmul + build_forward_expand every decode cycle when the eval callback
+    // is disabled and the graph runs as a batch.
+    const bool dflash_compact_verifier_only =
+        cparams.dflash_reduced_consumer_active && cparams.dflash_verify_logits;
+
+    if (cparams.dflash_verify_logits) {
+        const int topk = std::max(1, std::min(cparams.dflash_verify_topk, 64));
+        if (topk > 1) {
+            res->t_logits_argmax = ggml_topk_ext(ctx0, cur, topk, 0.0f, 0);
+        } else {
+            res->t_logits_argmax = ggml_argmax_ext(ctx0, cur, 0.0f, 0);
+        }
+        ggml_build_forward_expand(gf, res->t_logits_argmax);
+    }
+
+    if (!dflash_compact_verifier_only) {
+        ggml_build_forward_expand(gf, cur);
+    }
 }
 
 std::pair<ggml_tensor *, ggml_tensor *> llama_model_qwen35::graph::build_qkvz(

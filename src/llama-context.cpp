@@ -2100,15 +2100,23 @@ void llama_context::set_tape_recording(bool enable) {
 
     // expose to graph builder via cparams — populate all tape pointers so graph
     // reservation accounts for worst-case per-seq copy ops.
+    //
+    // NOTE: When called per-decode (not during sched_reserve), we must NOT
+    // clobber tape_gpu_n_seqs/tape_gpu_seqs — the decode path manages those
+    // based on actual per-sequence usage. Overwriting them here with the
+    // worst-case n_tapes causes seqs_changed=true every decode, preventing
+    // graph reuse. Only populate if not already set; decode manages the rest.
     if (enable && !dflash_capture->tapes.empty()) {
-        const int n_tapes = (int) dflash_capture->tapes.size();
-        cparams.tape_gpu = dflash_capture->tapes[0].get();
-        cparams.tape_gpu_n_seqs = n_tapes;
-        for (int s = 0; s < n_tapes && s < (int) LLAMA_DFLASH_MAX_SLOTS; ++s) {
-            cparams.tape_gpu_seqs[s] = dflash_capture->tapes[s].get();
-        }
-        for (int s = n_tapes; s < (int) LLAMA_DFLASH_MAX_SLOTS; ++s) {
-            cparams.tape_gpu_seqs[s] = nullptr;
+        if (cparams.tape_gpu == nullptr) {
+            const int n_tapes = (int) dflash_capture->tapes.size();
+            cparams.tape_gpu = dflash_capture->tapes[0].get();
+            cparams.tape_gpu_n_seqs = n_tapes;
+            for (int s = 0; s < n_tapes && s < (int) LLAMA_DFLASH_MAX_SLOTS; ++s) {
+                cparams.tape_gpu_seqs[s] = dflash_capture->tapes[s].get();
+            }
+            for (int s = n_tapes; s < (int) LLAMA_DFLASH_MAX_SLOTS; ++s) {
+                cparams.tape_gpu_seqs[s] = nullptr;
+            }
         }
     } else {
         cparams.tape_gpu = nullptr;
@@ -5940,10 +5948,10 @@ bool llama_context::resize_recurrent_memory(uint32_t new_n_seq_max, bool expand)
         return true;
     }
 
-    synchronize();
-
+    const uint32_t old_size = recr->size;
     const bool ok = expand ? recr->expand(new_n_seq_max) : recr->shrink(new_n_seq_max);
-    if (ok) {
+    if (ok && recr->size != old_size) {
+        synchronize();
         sched_need_reserve = true;
         if (gf_res_prev) {
             gf_res_prev->reset();

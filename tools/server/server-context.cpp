@@ -201,6 +201,7 @@ struct server_slot : server_adaptive_dm_state {
     llama_tokens spec_draft;
     llama_tokens spec_prompt;
     std::vector<int32_t> spec_i_batch;
+    std::vector<int32_t> spec_pad_i_batch; // DFlash verify padding tokens (graph cache reuse)
     common_prompt_checkpoint spec_ckpt;
     llama_seq_id dflash_seq_backup = -1;
     llama_pos dflash_n_pos_before_draft = 0;
@@ -345,6 +346,7 @@ struct server_slot : server_adaptive_dm_state {
         if (can_speculate()) {
             spec_draft.clear();
             spec_i_batch.clear();
+            spec_pad_i_batch.clear();
             spec_ckpt.clear();
         }
         generated_tokens.clear();
@@ -536,6 +538,26 @@ struct server_slot : server_adaptive_dm_state {
             add_ok &= batch.add(id, sampled, pos0++, true);
             for (auto token : spec_draft) {
                 add_ok &= batch.add(this->id, token, pos0++, true);
+            }
+
+            // DFlash verify padding: pad the batch to a fixed size (n_draft_max + 1)
+            // so every verify ubatch has the same n_tokens. This allows the graph
+            // to be reused across decode cycles (can_reuse checks n_tokens equality).
+            // Without padding, varying draft acceptance rates change n_tokens every
+            // cycle, causing 0 graph reuses and full graph rebuilds each decode.
+            // Ported from fork adb92b36a:4964-4990 (GGML_DFLASH_VERIFY_PAD).
+            if (task && task->params.speculative.has_type(COMMON_SPECULATIVE_TYPE_DFLASH)) {
+                const int n_draft_max = get_n_draft_max();
+                const int target_batch_size = 1 + n_draft_max; // sampled + max drafts
+                const int current_batch_size = 1 + (int) spec_draft.size();
+                const int pad_count = std::max(0, target_batch_size - current_batch_size);
+                for (int i = 0; i < pad_count; ++i) {
+                    spec_pad_i_batch.push_back(batch.size());
+                    add_ok &= batch.add(this->id, sampled, pos0 + i, true);
+                }
+                if (pad_count > 0) {
+                    SLT_DBG(*this, "dflash verify pad: pad_count=%d target=%d current=%d\n", pad_count, target_batch_size, current_batch_size);
+                }
             }
         }
 
@@ -4140,7 +4162,10 @@ private:
             && std::any_of(slots.begin(), slots.end(), [](const server_slot & s) { return !s.spec_draft.empty(); });
         if (dflash_tape_active) { llama_set_tape_recording(ctx_tgt, true); }
         const int ret = llama_decode(ctx_tgt, batch_view);
-        if (dflash_tape_active) { llama_set_tape_recording(ctx_tgt, false); }
+        // NOTE: do NOT call set_tape_recording(false) here — it clobbers
+        // tape_gpu_n_seqs to 0, causing the next decode's seqs_changed=true
+        // and preventing graph reuse. Tape recording stays enabled across
+        // decodes; the decode path manages tape_gpu_n_seqs per-ubatch.
         metrics.on_decoded(slots);
 
         if (ret != 0) {
@@ -4424,6 +4449,7 @@ private:
                 GGML_ASSERT(slot.spec_i_batch.size() == n_draft + 1);
                 auto accepted = common_sampler_sample_and_accept_n(slot.smpl.get(), slot.ctx_tgt, slot.spec_i_batch, slot.spec_draft);
                 slot.spec_i_batch.clear();
+                slot.spec_pad_i_batch.clear();
 
                 GGML_ASSERT(accepted.size() >= 1);
 
@@ -4516,17 +4542,37 @@ private:
                             llama_tape_replay_sync(ctx_tgt);
                         }
                         if (n_reeval > 0) {
-                            llama_batch batch_reeval = llama_batch_init(n_reeval, 0, 1);
+                            // Pad the reeval batch to the same size as the verify batch
+                            // (n_draft_max + 1) so the graph can be reused across decode
+                            // cycles. Without padding, reeval batches have varying sizes
+                            // (1..n_draft_max) which prevents graph reuse.
+                            const int n_draft_max = slot.get_n_draft_max();
+                            const int target_batch_size = 1 + n_draft_max;
+                            const int pad_count = std::max(0, target_batch_size - n_reeval);
+                            llama_batch batch_reeval = llama_batch_init(target_batch_size, 0, 1);
                             for (int j = 0; j < n_reeval; ++j) {
                                 const llama_pos pos = slot.dflash_n_pos_before_draft + j;
                                 // Use prompt tokens (already pushed during batch build)
                                 // rather than reconstructing from accepted[] — this
                                 // matches the fork's approach and is more robust.
                                 const llama_token tok = (j == 0) ? slot.sampled : accepted[j - 1];
-                                common_batch_add(batch_reeval, tok, pos, { slot.id }, false);
+                                common_batch_add(batch_reeval, tok, pos, { slot.id }, true);
+                            }
+                            // Add padding tokens at positions beyond the actual tokens.
+                            // These are dummy tokens with output=true that only serve to
+                            // make the batch size match the verify batch for graph reuse.
+                            // Their KV entries are removed after decode.
+                            const llama_pos pad_pos_start = slot.dflash_n_pos_before_draft + n_reeval;
+                            for (int i = 0; i < pad_count; ++i) {
+                                common_batch_add(batch_reeval, slot.sampled, pad_pos_start + i, { slot.id }, true);
                             }
                             const int ret_reeval = llama_decode(ctx_tgt, batch_reeval);
                             llama_batch_free(batch_reeval);
+                            // Remove KV entries created by padding tokens
+                            if (pad_count > 0) {
+                                auto * mem = llama_get_memory(ctx_tgt);
+                                llama_memory_seq_rm(mem, slot.id, pad_pos_start, -1);
+                            }
                             if (std::getenv("GGML_DFLASH_QA_TRACE")) {
                                 fprintf(stderr, "[DFLASH_QA] rollback_reeval slot=%d n_reeval=%d ret=%d\n",
                                     slot.id, n_reeval, ret_reeval);
