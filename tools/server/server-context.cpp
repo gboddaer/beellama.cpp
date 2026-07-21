@@ -4161,6 +4161,16 @@ private:
         const bool dflash_tape_active = params_base.speculative.has_type(COMMON_SPECULATIVE_TYPE_DFLASH)
             && std::any_of(slots.begin(), slots.end(), [](const server_slot & s) { return !s.spec_draft.empty(); });
         if (dflash_tape_active) { llama_set_tape_recording(ctx_tgt, true); }
+
+        // DFlash compact verifier: activate reduced verify so the graph builder
+        // skips full logits and only computes argmax. Combined with the eval
+        // callback skip (dflash_graph_hidden_ready in llama-context.cpp), this
+        // allows the graph to run as a batch without node-by-node execution.
+        if (dflash_tape_active) {
+            llama_set_dflash_verify_logits(ctx_tgt, true, 1);
+
+        }
+
         const int ret = llama_decode(ctx_tgt, batch_view);
         // NOTE: do NOT call set_tape_recording(false) here — it clobbers
         // tape_gpu_n_seqs to 0, causing the next decode's seqs_changed=true

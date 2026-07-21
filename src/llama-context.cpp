@@ -7043,7 +7043,8 @@ int llama_context::decode(const llama_batch & batch_inp) {
                     // ring; layer_hiddens is simply unused then) at the cost of some CPU
                     // callback overhead.
                     dflash_skip_eval_callback =
-                        dflash_use_prefill_staging || dflash_suppress_callback_for_view;
+                        dflash_use_prefill_staging || dflash_suppress_callback_for_view ||
+                        dflash_graph_hidden_ready;
 
                     const bool dflash_meta_backend_active =
                         dflash_context_has_meta_backend(backends) ||
