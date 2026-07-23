@@ -8996,6 +8996,9 @@ struct dflash_cross_ring_handle {
     // Null on CUDA (CUDA uses the raw-ptr variants above); the raw variants are null on Vulkan.
     void   (*fn_set_tensor_tensor)(ggml_tensor *, const void *, size_t, size_t);
     bool   (*fn_write_d2d_tensor)(void *, int, int, ggml_tensor *, int, int, int);
+    // Batch D2D copy: begin/end batching of multiple D2D copies into one submit+wait
+    void   (*fn_begin_batch)(void *);
+    void   (*fn_end_batch)(void *);
 };
 
 void * llama_context::init_cross_ring_gpu(int n_layers, int n_embd, int ring_size) {
@@ -9024,6 +9027,8 @@ void * llama_context::init_cross_ring_gpu(int n_layers, int n_embd, int ring_siz
     using set_tensor_fn_t = void   (*)(void *, const void *, size_t, size_t);
     using set_tensor_tensor_fn_t = void (*)(ggml_tensor *, const void *, size_t, size_t);
     using write_d2d_tensor_fn_t  = bool (*)(void *, int, int, ggml_tensor *, int, int, int);
+    using begin_batch_fn_t = void (*)(void *);
+    using end_batch_fn_t  = void (*)(void *);
 
     auto fn_alloc_device = (alloc_device_fn_t)
         ggml_backend_reg_get_proc_address(cuda_reg, "dflash_cross_ring_gpu_alloc_device");
@@ -9038,6 +9043,8 @@ void * llama_context::init_cross_ring_gpu(int n_layers, int n_embd, int ring_siz
     // Tensor variants (Vulkan-only). Null on CUDA, which uses the raw variants above.
     auto fn_set_tensor_tensor = (set_tensor_tensor_fn_t) ggml_backend_reg_get_proc_address(cuda_reg, "dflash_cross_ring_gpu_set_tensor_tensor");
     auto fn_write_d2d_tensor  = (write_d2d_tensor_fn_t)  ggml_backend_reg_get_proc_address(cuda_reg, "dflash_cross_ring_gpu_write_d2d_tensor");
+    auto fn_begin_batch = (begin_batch_fn_t) ggml_backend_reg_get_proc_address(cuda_reg, "dflash_cross_ring_gpu_begin_batch");
+    auto fn_end_batch   = (end_batch_fn_t)   ggml_backend_reg_get_proc_address(cuda_reg, "dflash_cross_ring_gpu_end_batch");
 
     // Need the 7 shared fns, plus at least one of each {set_tensor, set_tensor_tensor} / {write_d2d, write_d2d_tensor} pair.
     if (!fn_alloc || !fn_free || !fn_write || !fn_sync || !fn_snapshot || !fn_interleave) {
@@ -9067,6 +9074,8 @@ void * llama_context::init_cross_ring_gpu(int n_layers, int n_embd, int ring_siz
     handle->fn_set_tensor = fn_set_tensor;
     handle->fn_set_tensor_tensor = fn_set_tensor_tensor;
     handle->fn_write_d2d_tensor  = fn_write_d2d_tensor;
+    handle->fn_begin_batch = fn_begin_batch;
+    handle->fn_end_batch   = fn_end_batch;
     return handle;
 }
 
@@ -9296,6 +9305,18 @@ void llama_dflash_cross_ring_gpu_set_cross(
 
     int cross_len = ring_filled < ctx_window ? ring_filled : ctx_window;
     ctx->set_cross_data_gpu(seq_id, d_staging, cross_len, n_layers, n_embd, h->fn_set_tensor, h->fn_set_tensor_tensor);
+}
+
+void llama_dflash_cross_ring_gpu_begin_batch(void * handle) {
+    if (!handle) return;
+    auto * h = (dflash_cross_ring_handle *)handle;
+    if (h->fn_begin_batch) h->fn_begin_batch(h->gpu_ring);
+}
+
+void llama_dflash_cross_ring_gpu_end_batch(void * handle) {
+    if (!handle) return;
+    auto * h = (dflash_cross_ring_handle *)handle;
+    if (h->fn_end_batch) h->fn_end_batch(h->gpu_ring);
 }
 
 // DFlash: dump captured hidden states to file for drafter training

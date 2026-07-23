@@ -17938,6 +17938,20 @@ struct dflash_cross_ring_vk {
     bool uma_host_visible = false;
 };
 
+// Phase 2: Global batch D2D copy support. When batch is active, copies are
+// recorded into a single command buffer and submitted+waited once at end_batch.
+// This avoids creating a temp context + submit + fence wait per ggml_vk_buffer_copy.
+static vk_context g_dflash_batch_ctx;
+static bool g_dflash_batch_active = false;
+static vk_device g_dflash_batch_device;
+
+static bool dflash_vk_batch_copy(vk_buffer& dst, size_t dst_off, vk_buffer& src, size_t src_off, size_t size) {
+    if (!g_dflash_batch_active || !g_dflash_batch_ctx) return false;
+    if (src->device != g_dflash_batch_device || dst->device != g_dflash_batch_device) return false;
+    ggml_vk_buffer_copy_async(g_dflash_batch_ctx, dst, dst_off, src, src_off, size);
+    return true;
+}
+
 // Runtime debug tracing for the Vulkan cross-ring. Enable with GGML_DFLASH_GPU_RING_DEBUG=1.
 static bool dflash_vk_ring_debug_enabled() {
     static int v = -1;
@@ -18156,6 +18170,33 @@ extern "C" bool dflash_vk_backend_wait_for_stream(ggml_backend_t backend) {
     return true;
 }
 
+// Phase 2: Batch D2D copy support. When batch is active, copies are recorded
+// into a single command buffer and submitted+waited once at end_batch time.
+extern "C" void dflash_cross_ring_gpu_begin_batch(void * handle) {
+    if (!handle || g_dflash_batch_active) return;
+    auto * ring = (dflash_cross_ring_vk *)handle;
+    std::lock_guard<std::recursive_mutex> guard(ring->device->mutex);
+    g_dflash_batch_device = ring->device;
+    g_dflash_batch_ctx = ggml_vk_create_temporary_context(ring->device->transfer_queue.cmd_pool);
+    ggml_vk_ctx_begin(ring->device, g_dflash_batch_ctx);
+    g_dflash_batch_active = true;
+}
+
+extern "C" void dflash_cross_ring_gpu_end_batch(void * handle) {
+    if (!g_dflash_batch_active || !handle) return;
+    auto * ring = (dflash_cross_ring_vk *)handle;
+    std::lock_guard<std::recursive_mutex> guard(ring->device->mutex);
+    ggml_vk_ctx_end(g_dflash_batch_ctx);
+    ggml_vk_submit(g_dflash_batch_ctx, ring->device->fence);
+    VK_CHECK(ring->device->device.waitForFences({ ring->device->fence }, true, UINT64_MAX),
+             "dflash_cross_ring_gpu_end_batch waitForFences");
+    ring->device->device.resetFences({ ring->device->fence });
+    ggml_vk_queue_command_pools_cleanup(ring->device);
+    g_dflash_batch_ctx.reset();
+    g_dflash_batch_active = false;
+    g_dflash_batch_device = nullptr;
+}
+
 extern "C" void dflash_cross_ring_gpu_set_tensor_tensor(ggml_tensor * dst, const void * src, size_t offset, size_t size) {
     if (!dst || !src || size == 0 || !dst->buffer) return;
     vk::DeviceAddress src_addr = (vk::DeviceAddress)(uintptr_t)src;
@@ -18191,7 +18232,9 @@ extern "C" void dflash_cross_ring_gpu_set_tensor_tensor(ggml_tensor * dst, const
     // arch: the GPU hidden capture also disrupts the target's DeltaNet compute).
     // Until the semaphore is wired in, the cross-ring D2D produces wrong drafts;
     // use GGML_DFLASH_GPU_RING=0 (CPU hidden capture) for correct DFlash.
-    ggml_vk_buffer_copy(dst_buf, dst_off, src_buf, src_ref.offset, size);
+    if (!dflash_vk_batch_copy(dst_buf, dst_off, src_buf, src_ref.offset, size)) {
+        ggml_vk_buffer_copy(dst_buf, dst_off, src_buf, src_ref.offset, size);
+    }
 }
 extern "C" bool dflash_cross_ring_gpu_write_d2d_tensor(void * handle, int layer, int ring_pos, ggml_tensor * src, int src_offset, int n_tokens, int n_embd) {
     // Phase 3: D2D copy target hidden tensor -> ring (no CPU readback). src is the
@@ -18226,7 +18269,9 @@ extern "C" bool dflash_cross_ring_gpu_write_d2d_tensor(void * handle, int layer,
             DFLASH_VK_RING_DBG("write_d2d_tensor: reject OOB layer=%d dst_pos=%d src_off=%zu dst_off=%zu bytes=%zu src_size=%zu dst_size=%zu", layer, dst_pos, src_span_off, dst_off, bytes, src_buf ? src_buf->size : 0, ring->rings ? ring->rings->size : 0);
             return false;
         }
-        ggml_vk_buffer_copy(ring->rings, dst_off, src_buf, src_span_off, bytes);
+        if (!dflash_vk_batch_copy(ring->rings, dst_off, src_buf, src_span_off, bytes)) {
+            ggml_vk_buffer_copy(ring->rings, dst_off, src_buf, src_span_off, bytes);
+        }
         return true;
     };
 
@@ -18244,6 +18289,8 @@ static void * ggml_backend_vk_reg_get_proc_address(ggml_backend_reg_t /*reg*/, c
     if (std::strcmp(name, "dflash_cross_ring_gpu_interleave") == 0)      return (void *)dflash_cross_ring_gpu_interleave;
     if (std::strcmp(name, "dflash_cross_ring_gpu_set_tensor_tensor") == 0)return (void *)dflash_cross_ring_gpu_set_tensor_tensor;
     if (std::strcmp(name, "dflash_cross_ring_gpu_write_d2d_tensor") == 0) return (void *)dflash_cross_ring_gpu_write_d2d_tensor;
+    if (std::strcmp(name, "dflash_cross_ring_gpu_begin_batch") == 0)     return (void *)dflash_cross_ring_gpu_begin_batch;
+    if (std::strcmp(name, "dflash_cross_ring_gpu_end_batch") == 0)       return (void *)dflash_cross_ring_gpu_end_batch;
     if (std::strcmp(name, "dflash_cuda_backend_wait_for_stream") == 0)    return (void *)dflash_vk_backend_wait_for_stream;
     return nullptr;
 }

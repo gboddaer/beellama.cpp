@@ -3651,6 +3651,10 @@ private:
         int64_t cpu_copy_us = 0;
         int64_t gpu_enqueue_us = 0;
         bool cpu_ring_written_all = cpu_ring_should_track;
+        // Phase 2: batch D2D copies across all layers into one submit+wait
+        if (gpu_ring_handle) {
+            llama_dflash_cross_ring_gpu_begin_batch(gpu_ring_handle);
+        }
         for (int layer = 0; layer < n_target_layers && layer < n_src_layers; ++layer) {
             float * data = llama_get_layer_hidden(ctx_tgt, layer);
             int64_t embd = llama_get_layer_hidden_n_embd(ctx_tgt, layer);
@@ -3717,6 +3721,10 @@ private:
                     gpu_upload_queued = true;
                 }
             }
+        }
+        // Phase 2: flush batched D2D copies (single submit + wait) before synchronize
+        if (gpu_ring_handle) {
+            llama_dflash_cross_ring_gpu_end_batch(gpu_ring_handle);
         }
         if (gpu_d2d_failed) {
             discard_cross_ring("GPU hidden D2D ring write failed");
