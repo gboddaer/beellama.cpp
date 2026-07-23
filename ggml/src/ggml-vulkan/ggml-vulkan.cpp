@@ -18147,12 +18147,12 @@ extern "C" bool dflash_vk_backend_wait_for_stream(ggml_backend_t backend) {
     if (backend->iface.get_name != ggml_backend_vk_name) return false;
     auto * ctx = (ggml_backend_vk_context *) backend->context;
     if (!ctx || !ctx->device) return false;
-    // Full device wait: guarantees all compute-queue graph copies (the hidden
-    // capture) are complete and visible to subsequent transfer-queue reads.
-    // Heavier than CUDA's event-stream-wait but correct for backends without a
-    // cheap cross-queue event/semaphore exposed to the DFlash layer; a
-    // semaphore-based fast path can follow once the data-correctness is proven.
-    ctx->device->device.waitIdle();
+    // Wait only for the compute queue to drain, not the entire device.
+    // This is lighter than device.waitIdle() (which also drains the transfer
+    // and graphics queues) but still guarantees compute-queue graph copies
+    // (the hidden capture) are complete and visible to subsequent transfer-queue
+    // D2D reads. A timeline-semaphore fast path can follow once correctness is proven.
+    ctx->device->compute_queue.queue.waitIdle();
     return true;
 }
 
