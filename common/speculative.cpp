@@ -3153,6 +3153,12 @@ struct common_speculative_impl_dflash : public common_speculative_impl {
 
             const int64_t t2 = ggml_time_us();
 
+            // Phase 4: ensure deferred interleave copies are complete before graph build reads them.
+            // (Same-queue ordering guarantees correctness, but the graph compute may use a different queue.)
+            if (gpu_ring_handle) {
+                llama_dflash_cross_ring_gpu_wait_interleave(gpu_ring_handle);
+            }
+
             // run drafter forward pass
             int ret = llama_decode(ctx_dft, batch_dft);
             if (ret != 0) {
@@ -3345,6 +3351,11 @@ struct common_speculative_impl_dflash : public common_speculative_impl {
         common_batch_add(batch_dft, id_last, draft_pos_base, { seq_id }, true);
         for (int i = 1; i < block_size; ++i) {
             common_batch_add(batch_dft, mask_token_id, draft_pos_base + i, { seq_id }, true);
+        }
+
+        // Phase 4: ensure deferred interleave copies are complete before graph build reads them.
+        if (gpu_ring_handle) {
+            llama_dflash_cross_ring_gpu_wait_interleave(gpu_ring_handle);
         }
 
         int ret = llama_decode(ctx_dft, batch_dft);

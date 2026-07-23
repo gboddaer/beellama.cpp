@@ -17939,6 +17939,9 @@ struct dflash_cross_ring_vk {
     // Phase 3: track whether async work is pending on the transfer queue.
     // Set true after any submit to the transfer queue; cleared after a fence wait.
     bool transfer_pending = false;
+    // Phase 4: dedicated fence for deferred interleave wait.
+    vk::Fence interleave_fence = nullptr;
+    bool interleave_pending = false;
 };
 
 // Phase 2: Global batch D2D copy support. When batch is active, copies are
@@ -18025,6 +18028,7 @@ extern "C" void * dflash_cross_ring_gpu_alloc_device(int dev_idx, int n_layers, 
     try {
         ring->rings   = ggml_vk_create_buffer_device(dev, ring_bytes);
         ring->staging  = ggml_vk_create_buffer_device(dev, staging_bytes);
+        ring->interleave_fence = dev->device.createFence({});
     } catch (...) {
         delete ring;
         return nullptr;
@@ -18042,6 +18046,9 @@ extern "C" void dflash_cross_ring_gpu_free(void * handle) {
     auto * ring = (dflash_cross_ring_vk *)handle;
     vk::DeviceAddress addr = ring->staging ? ring->staging->bda_addr : (vk::DeviceAddress)0;
     dflash_vk_staging_unregister(addr);
+    if (ring->interleave_fence) {
+        ring->device->device.destroyFence(ring->interleave_fence);
+    }
     delete ring;  // vk_buffer shared_ptrs release on drop
 }
 extern "C" void dflash_cross_ring_gpu_write(void * handle, int layer, int ring_pos, const float * data, int n_tokens, int n_embd) {
@@ -18122,6 +18129,14 @@ extern "C" bool dflash_cross_ring_gpu_snapshot(void * handle, int write_pos, int
 extern "C" const float * dflash_cross_ring_gpu_interleave(void * handle, int write_pos, int filled, int ctx_window) {
     if (!handle) return nullptr;
     auto * ring = (dflash_cross_ring_vk *)handle;
+    // Phase 4: if a previous interleave is still pending, wait for it before reusing staging.
+    if (ring->interleave_pending) {
+        VK_CHECK(ring->device->device.waitForFences({ ring->interleave_fence }, true, UINT64_MAX),
+                 "dflash_cross_ring_gpu_interleave wait previous");
+        ring->device->device.resetFences({ ring->interleave_fence });
+        ring->interleave_pending = false;
+        ring->transfer_pending = false;
+    }
     int cross_len = filled < ctx_window ? filled : ctx_window;
     if (cross_len > ring->ring_size) cross_len = ring->ring_size;
     if (cross_len <= 0) return nullptr;
@@ -18130,9 +18145,10 @@ extern "C" const float * dflash_cross_ring_gpu_interleave(void * handle, int wri
     int read_start = ((write_pos - cross_len) % ring->ring_size + ring->ring_size) % ring->ring_size;
     DFLASH_VK_RING_DBG("interleave write_pos=%d filled=%d ctx_window=%d cross_len=%d read_start=%d n_layers=%d", write_pos, filled, ctx_window, cross_len, read_start, ring->n_layers);
     // GPU-side interleave: record one vkCmdCopyBuffer per (token, layer) slice into the
-    // interleaved staging buffer, all in a single transfer command buffer, then submit+wait.
-    // Keeps data on-GPU (no GPU->CPU->GPU round-trip). A dedicated compute shader could
-    // fuse these into one dispatch later.
+    // interleaved staging buffer, all in a single transfer command buffer, then submit.
+    // Phase 4: defer the fence wait — the data will be ready by the time set_tensor_d2d_tensor
+    // runs (same queue ordering). The fence is waited at the next interleave call or
+    // when explicitly requested via dflash_cross_ring_gpu_wait_interleave.
     std::lock_guard<std::recursive_mutex> guard(ring->device->mutex);
     vk_context subctx = ggml_vk_create_temporary_context(ring->device->transfer_queue.cmd_pool);
     ggml_vk_ctx_begin(ring->device, subctx);
@@ -18150,13 +18166,23 @@ extern "C" const float * dflash_cross_ring_gpu_interleave(void * handle, int wri
         }
     }
     ggml_vk_ctx_end(subctx);
-    ggml_vk_submit(subctx, ring->device->fence);
+    ggml_vk_submit(subctx, ring->interleave_fence);
+    ring->interleave_pending = true;
     ring->transfer_pending = true;
-    VK_CHECK(ring->device->device.waitForFences({ ring->device->fence }, true, UINT64_MAX), "dflash_cross_ring_gpu_interleave waitForFences");
-    ring->device->device.resetFences({ ring->device->fence });
-    ring->transfer_pending = false;
     ggml_vk_queue_command_pools_cleanup(ring->device);
     return (const float *)ring->staging->bda_addr;
+}
+
+// Phase 4: wait for a pending deferred interleave. Called before data is needed.
+extern "C" void dflash_cross_ring_gpu_wait_interleave(void * handle) {
+    if (!handle) return;
+    auto * ring = (dflash_cross_ring_vk *)handle;
+    if (!ring->interleave_pending) return;
+    VK_CHECK(ring->device->device.waitForFences({ ring->interleave_fence }, true, UINT64_MAX),
+             "dflash_cross_ring_gpu_wait_interleave waitForFences");
+    ring->device->device.resetFences({ ring->interleave_fence });
+    ring->interleave_pending = false;
+    ring->transfer_pending = false;
 }
 // Vulkan-only tensor variants. CUDA does not register these names.
 // Vulkan equivalent of CUDA's dflash_cuda_backend_wait_for_stream: ensure the target
@@ -18304,6 +18330,7 @@ static void * ggml_backend_vk_reg_get_proc_address(ggml_backend_reg_t /*reg*/, c
     if (std::strcmp(name, "dflash_cross_ring_gpu_write_d2d_tensor") == 0) return (void *)dflash_cross_ring_gpu_write_d2d_tensor;
     if (std::strcmp(name, "dflash_cross_ring_gpu_begin_batch") == 0)     return (void *)dflash_cross_ring_gpu_begin_batch;
     if (std::strcmp(name, "dflash_cross_ring_gpu_end_batch") == 0)       return (void *)dflash_cross_ring_gpu_end_batch;
+    if (std::strcmp(name, "dflash_cross_ring_gpu_wait_interleave") == 0) return (void *)dflash_cross_ring_gpu_wait_interleave;
     if (std::strcmp(name, "dflash_cuda_backend_wait_for_stream") == 0)    return (void *)dflash_vk_backend_wait_for_stream;
     return nullptr;
 }

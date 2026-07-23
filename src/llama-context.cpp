@@ -8999,6 +8999,8 @@ struct dflash_cross_ring_handle {
     // Batch D2D copy: begin/end batching of multiple D2D copies into one submit+wait
     void   (*fn_begin_batch)(void *);
     void   (*fn_end_batch)(void *);
+    // Phase 4: wait for a pending deferred interleave
+    void   (*fn_wait_interleave)(void *);
 };
 
 void * llama_context::init_cross_ring_gpu(int n_layers, int n_embd, int ring_size) {
@@ -9029,6 +9031,7 @@ void * llama_context::init_cross_ring_gpu(int n_layers, int n_embd, int ring_siz
     using write_d2d_tensor_fn_t  = bool (*)(void *, int, int, ggml_tensor *, int, int, int);
     using begin_batch_fn_t = void (*)(void *);
     using end_batch_fn_t  = void (*)(void *);
+    using wait_interleave_fn_t = void (*)(void *);
 
     auto fn_alloc_device = (alloc_device_fn_t)
         ggml_backend_reg_get_proc_address(cuda_reg, "dflash_cross_ring_gpu_alloc_device");
@@ -9045,6 +9048,7 @@ void * llama_context::init_cross_ring_gpu(int n_layers, int n_embd, int ring_siz
     auto fn_write_d2d_tensor  = (write_d2d_tensor_fn_t)  ggml_backend_reg_get_proc_address(cuda_reg, "dflash_cross_ring_gpu_write_d2d_tensor");
     auto fn_begin_batch = (begin_batch_fn_t) ggml_backend_reg_get_proc_address(cuda_reg, "dflash_cross_ring_gpu_begin_batch");
     auto fn_end_batch   = (end_batch_fn_t)   ggml_backend_reg_get_proc_address(cuda_reg, "dflash_cross_ring_gpu_end_batch");
+    auto fn_wait_interleave = (wait_interleave_fn_t) ggml_backend_reg_get_proc_address(cuda_reg, "dflash_cross_ring_gpu_wait_interleave");
 
     // Need the 7 shared fns, plus at least one of each {set_tensor, set_tensor_tensor} / {write_d2d, write_d2d_tensor} pair.
     if (!fn_alloc || !fn_free || !fn_write || !fn_sync || !fn_snapshot || !fn_interleave) {
@@ -9076,6 +9080,7 @@ void * llama_context::init_cross_ring_gpu(int n_layers, int n_embd, int ring_siz
     handle->fn_write_d2d_tensor  = fn_write_d2d_tensor;
     handle->fn_begin_batch = fn_begin_batch;
     handle->fn_end_batch   = fn_end_batch;
+    handle->fn_wait_interleave = fn_wait_interleave;
     return handle;
 }
 
@@ -9317,6 +9322,12 @@ void llama_dflash_cross_ring_gpu_end_batch(void * handle) {
     if (!handle) return;
     auto * h = (dflash_cross_ring_handle *)handle;
     if (h->fn_end_batch) h->fn_end_batch(h->gpu_ring);
+}
+
+void llama_dflash_cross_ring_gpu_wait_interleave(void * handle) {
+    if (!handle) return;
+    auto * h = (dflash_cross_ring_handle *)handle;
+    if (h->fn_wait_interleave) h->fn_wait_interleave(h->gpu_ring);
 }
 
 // DFlash: dump captured hidden states to file for drafter training
