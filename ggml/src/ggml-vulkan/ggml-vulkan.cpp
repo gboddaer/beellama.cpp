@@ -17936,6 +17936,9 @@ struct dflash_cross_ring_vk {
     vk_buffer rings;    // device-local, size = n_layers*ring_size*n_embd*4
     vk_buffer staging;  // device-local interleaved output, size = ring_size*n_layers*n_embd*4
     bool uma_host_visible = false;
+    // Phase 3: track whether async work is pending on the transfer queue.
+    // Set true after any submit to the transfer queue; cleared after a fence wait.
+    bool transfer_pending = false;
 };
 
 // Phase 2: Global batch D2D copy support. When batch is active, copies are
@@ -18078,7 +18081,13 @@ extern "C" void dflash_cross_ring_gpu_write(void * handle, int layer, int ring_p
 extern "C" void dflash_cross_ring_gpu_synchronize(void * handle) {
     if (!handle) return;
     auto * ring = (dflash_cross_ring_vk *)handle;
-    ring->device->transfer_queue.queue.waitIdle();
+    // Phase 3: only wait if async work is pending on the transfer queue.
+    // Most paths (batch end_batch, interleave, ggml_vk_buffer_copy) already wait
+    // on their own fence, so the queue is typically idle by the time we get here.
+    if (ring->transfer_pending) {
+        ring->device->transfer_queue.queue.waitIdle();
+        ring->transfer_pending = false;
+    }
 }
 extern "C" bool dflash_cross_ring_gpu_snapshot(void * handle, int write_pos, int filled, int ctx_window, float * host_data, int n_tokens, int n_layers, int n_embd) {
     if (!handle || !host_data) return false;
@@ -18142,8 +18151,10 @@ extern "C" const float * dflash_cross_ring_gpu_interleave(void * handle, int wri
     }
     ggml_vk_ctx_end(subctx);
     ggml_vk_submit(subctx, ring->device->fence);
+    ring->transfer_pending = true;
     VK_CHECK(ring->device->device.waitForFences({ ring->device->fence }, true, UINT64_MAX), "dflash_cross_ring_gpu_interleave waitForFences");
     ring->device->device.resetFences({ ring->device->fence });
+    ring->transfer_pending = false;
     ggml_vk_queue_command_pools_cleanup(ring->device);
     return (const float *)ring->staging->bda_addr;
 }
@@ -18188,6 +18199,7 @@ extern "C" void dflash_cross_ring_gpu_end_batch(void * handle) {
     std::lock_guard<std::recursive_mutex> guard(ring->device->mutex);
     ggml_vk_ctx_end(g_dflash_batch_ctx);
     ggml_vk_submit(g_dflash_batch_ctx, ring->device->fence);
+    ring->transfer_pending = true;
     VK_CHECK(ring->device->device.waitForFences({ ring->device->fence }, true, UINT64_MAX),
              "dflash_cross_ring_gpu_end_batch waitForFences");
     ring->device->device.resetFences({ ring->device->fence });
@@ -18195,6 +18207,7 @@ extern "C" void dflash_cross_ring_gpu_end_batch(void * handle) {
     g_dflash_batch_ctx.reset();
     g_dflash_batch_active = false;
     g_dflash_batch_device = nullptr;
+    ring->transfer_pending = false;
 }
 
 extern "C" void dflash_cross_ring_gpu_set_tensor_tensor(ggml_tensor * dst, const void * src, size_t offset, size_t size) {
