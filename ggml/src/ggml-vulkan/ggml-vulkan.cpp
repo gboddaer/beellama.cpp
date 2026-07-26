@@ -18196,14 +18196,15 @@ extern "C" bool dflash_vk_backend_wait_for_stream(ggml_backend_t backend) {
     if (!backend || !backend->context) return false;
     // Only handle Vulkan backends (guard against a non-Vulkan backend being passed).
     if (backend->iface.get_name != ggml_backend_vk_name) return false;
-    auto * ctx = (ggml_backend_vk_context *) backend->context;
-    if (!ctx || !ctx->device) return false;
-    // Wait only for the compute queue to drain, not the entire device.
-    // This is lighter than device.waitIdle() (which also drains the transfer
-    // and graphics queues) but still guarantees compute-queue graph copies
-    // (the hidden capture) are complete and visible to subsequent transfer-queue
-    // D2D reads. A timeline-semaphore fast path can follow once correctness is proven.
-    ctx->device->compute_queue.queue.waitIdle();
+    // Phase 5: return immediately — no-op.
+    // The hidden capture ops (ggml_cpy into hgpu->layers) are graph-embedded
+    // on the compute queue. ggml_backend_sched_synchronize() is called
+    // unconditionally after dflash_wait_for_gpu_capture_stream() and calls
+    // ggml_vk_synchronize() which waits on ctx->fence (covers all compute
+    // queue work including hidden capture). The old compute_queue.queue.waitIdle()
+    // was a redundant double-sync: full compute queue drain here, then another
+    // full drain in ggml_vk_synchronize(). Removing it eliminates the dominant
+    // per-cycle CPU stall while preserving correctness.
     return true;
 }
 
