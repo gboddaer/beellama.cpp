@@ -7149,10 +7149,12 @@ int llama_context::decode(const llama_batch & batch_inp) {
             LLAMA_LOG_INFO("%s: dflash crash breadcrumb: after process_ubatch res=%p status=%d tokens=%u outputs=%u\n",
                     __func__, (const void *) res, (int) status, ubatch.n_tokens, n_outputs);
         }
-        // DFlash GPU graph capture writes hidden tensors on GGML's CUDA stream,
-        // while the cross-ring D2D copies run on cudaStreamPerThread. Prefer a
-        // CUDA event dependency between those streams; fall back to the full
-        // scheduler sync for CPU callback capture or backends without the helper.
+        // DFlash GPU graph capture writes hidden tensors on GGML's backend stream.
+        // dflash_wait_for_gpu_capture_stream() establishes a lightweight GPU-side
+        // dependency (CUDA: event-based stream wait; Vulkan: no-op since
+        // ggml_backend_sched_synchronize provides the sync). The scheduler sync
+        // below is the authoritative synchronization point — called unconditionally
+        // for all backends and all capture modes.
         const bool dflash_gpu_capture_stream_ready =
             dflash_capture && dflash_wait_for_gpu_capture_stream();
         if (dflash_capture && dflash_crash_trace_enabled()) {
@@ -7165,16 +7167,13 @@ int llama_context::decode(const llama_batch & batch_inp) {
                     cparams.tape_gpu_n_seqs,
                     (void *) cparams.cb_eval);
         }
-        if (dflash_capture && !dflash_gpu_capture_stream_ready) {
-            const int64_t t_sync_start_us = dflash_capture->profile ? ggml_time_us() : 0;
+        if (dflash_capture) {
+            const int64_t t_sync_start_us =
+                dflash_capture->profile && dflash_profile_sync_split_enabled() ? ggml_time_us() : 0;
             ggml_backend_sched_synchronize(sched.get());
             if (dflash_capture->profile && dflash_profile_sync_split_enabled()) {
                 dflash_capture->profile_verify_sync_split_us += ggml_time_us() - t_sync_start_us;
             }
-        } else if (dflash_capture && dflash_capture->profile && dflash_profile_sync_split_enabled()) {
-            const int64_t t_sync_start_us = ggml_time_us();
-            ggml_backend_sched_synchronize(sched.get());
-            dflash_capture->profile_verify_sync_split_us += ggml_time_us() - t_sync_start_us;
         }
         if (dflash_capture && dflash_crash_trace_enabled()) {
             LLAMA_LOG_INFO("%s: dflash crash breadcrumb: after decode sync capture_stream_ready=%d tokens=%u\n",
