@@ -113,12 +113,16 @@ std::vector<llama_token> common_sampler_sample_reduced_and_accept_n(
 
 bool common_sampler_supports_reduced(struct common_sampler * gsmpl);
 
+// helpers
+
+bool common_sampler_has_active_grammar(const struct common_sampler * gsmpl);
+bool common_sampler_reasoning_is_forcing(const struct common_sampler * gsmpl);
+bool common_sampler_stops_speculative_accept(const struct common_sampler * gsmpl, bool grammar_active_at_start);
+
 uint32_t common_sampler_get_seed(const struct common_sampler * gsmpl);
 
 // force the reasoning budget sampler (if any) to begin forcing its end sequence now.
 bool common_sampler_reasoning_budget_force(struct common_sampler * gsmpl);
-
-// helpers
 
 // access the internal list of current candidate tokens
 // if do_sort == true, the candidates are guaranteed to be sorted afterwards (in descending order of probability)

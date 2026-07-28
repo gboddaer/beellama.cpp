@@ -466,8 +466,6 @@ ggml_tensor * llama_model_qwen35::graph::build_layer_attn_linear(
     beta = ggml_reshape_4d(ctx0, beta, 1, num_v_heads, n_seq_tokens, n_seqs);
     cb(beta, "beta", il);
 
-    ggml_tensor * beta_presigmoid = beta;
-
     beta = ggml_sigmoid(ctx0, beta);
     cb(beta, "beta_sigmoid", il);
 

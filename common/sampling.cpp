@@ -620,8 +620,8 @@ llama_token common_sampler_sample(struct common_sampler * gsmpl, struct llama_co
 
     id = cur_p.data[cur_p.selected].id;
     if (enable_sample_trace) {
-        fprintf(stderr, "[DFLASH_SAMPLE] sample idx=%d id=%d selected=%d size=%zu\n",
-            idx, (int) id, cur_p.selected, cur_p.size);
+        fprintf(stderr, "[DFLASH_SAMPLE] sample idx=%d id=%d selected=%ld size=%zu\n",
+            idx, (int) id, (long) cur_p.selected, (size_t) cur_p.size);
     }
 
     if (grammar_first || !grammar_should_apply(gsmpl)) {
