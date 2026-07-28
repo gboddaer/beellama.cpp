@@ -925,6 +925,274 @@ struct server_metrics {
     }
 };
 
+//
+// DFlash reduced verify infrastructure (ported from fork)
+//
+// The reduced verify plan determines whether compact verification is safe
+// for the current sampling configuration. It checks sampler chain compatibility,
+// penalty settings, grammar state, and other conditions.
+//
+
+struct dflash_reduced_verify_plan {
+    bool enabled = false;
+    int top_k = 1;
+    const char * reason = "disabled";
+};
+
+static bool dflash_reduced_sampler_chain_supported(
+        const common_params_sampling & sampling,
+        bool                           stochastic,
+        const char                  ** reason) {
+    auto reject = [&](const char * why) {
+        if (reason) {
+            *reason = why;
+        }
+        return false;
+    };
+
+    bool saw_top_k = false;
+    for (const auto sampler : sampling.samplers) {
+        switch (sampler) {
+            case COMMON_SAMPLER_TYPE_NONE:
+                break;
+            case COMMON_SAMPLER_TYPE_PENALTIES:
+                if (!(sampling.penalty_repeat == 1.0f && sampling.penalty_freq == 0.0f && sampling.penalty_present == 0.0f)) {
+                    return reject("penalties");
+                }
+                break;
+            case COMMON_SAMPLER_TYPE_DRY:
+                if (sampling.dry_multiplier != 0.0f && sampling.dry_penalty_last_n != 0) {
+                    return reject("dry");
+                }
+                break;
+            case COMMON_SAMPLER_TYPE_TOP_N_SIGMA:
+                if (sampling.top_n_sigma >= 0.0f) {
+                    return reject("top-n-sigma");
+                }
+                break;
+            case COMMON_SAMPLER_TYPE_TOP_K:
+                saw_top_k = true;
+                break;
+            case COMMON_SAMPLER_TYPE_TYPICAL_P:
+                if (sampling.typ_p < 1.0f) {
+                    if (!stochastic) {
+                        return reject("typical");
+                    }
+                    if (!saw_top_k) {
+                        return reject("sampler-order");
+                    }
+                }
+                break;
+            case COMMON_SAMPLER_TYPE_TOP_P:
+                if (stochastic && sampling.top_p < 1.0f && !saw_top_k) {
+                    return reject("sampler-order");
+                }
+                break;
+            case COMMON_SAMPLER_TYPE_MIN_P:
+                if (stochastic && sampling.min_p > 0.0f && !saw_top_k) {
+                    return reject("sampler-order");
+                }
+                break;
+            case COMMON_SAMPLER_TYPE_XTC:
+                if (sampling.xtc_probability > 0.0f) {
+                    return reject("xtc");
+                }
+                break;
+            case COMMON_SAMPLER_TYPE_TEMPERATURE:
+                break;
+            case COMMON_SAMPLER_TYPE_INFILL:
+                break;
+            default:
+                break;
+        }
+    }
+    return true;
+}
+
+static dflash_reduced_verify_plan dflash_select_reduced_verify_plan(
+        const common_params_sampling    & sampling,
+        const common_params_speculative & speculative,
+        bool                              use_rejection,
+        bool                              has_tree) {
+    dflash_reduced_verify_plan plan;
+
+    if (has_tree) {
+        plan.reason = "tree";
+        return plan;
+    }
+    if (use_rejection) {
+        plan.reason = "rejection";
+        return plan;
+    }
+    if (sampling.n_probs > 0) {
+        plan.reason = "prob-reporting";
+        return plan;
+    }
+    if (!sampling.grammar.empty() && !sampling.grammar_lazy) {
+        plan.reason = "grammar";
+        return plan;
+    }
+    if (sampling.has_logit_bias() || sampling.ignore_eos) {
+        plan.reason = "logit-bias";
+        return plan;
+    }
+    if (!(sampling.penalty_repeat == 1.0f && sampling.penalty_freq == 0.0f && sampling.penalty_present == 0.0f)) {
+        plan.reason = "penalties";
+        return plan;
+    }
+    if (sampling.dry_multiplier != 0.0f && sampling.dry_penalty_last_n != 0) {
+        plan.reason = "dry";
+        return plan;
+    }
+    if (sampling.top_n_sigma >= 0.0f) {
+        plan.reason = "top-n-sigma";
+        return plan;
+    }
+    if (sampling.xtc_probability > 0.0f) {
+        plan.reason = "xtc";
+        return plan;
+    }
+    if (sampling.mirostat != 0) {
+        plan.reason = "mirostat";
+        return plan;
+    }
+    if (sampling.adaptive_target >= 0.0f) {
+        plan.reason = "adaptive";
+        return plan;
+    }
+    if (sampling.dynatemp_range > 0.0f) {
+        plan.reason = "dynamic-temp";
+        return plan;
+    }
+    if (sampling.reasoning_budget_tokens >= 0) {
+        plan.reason = "finite-reasoning-budget";
+        return plan;
+    }
+    if (speculative.type() != COMMON_SPECULATIVE_TYPE_DFLASH) {
+        plan.reason = "not-dflash";
+        return plan;
+    }
+
+    const bool stochastic = sampling.temp > 0.0f;
+    const char * sampler_reason = nullptr;
+    if (!dflash_reduced_sampler_chain_supported(sampling, stochastic, &sampler_reason)) {
+        plan.reason = sampler_reason;
+        return plan;
+    }
+
+    if (sampling.temp <= 0.0f) {
+        plan.enabled = true;
+        plan.top_k = 1;
+        plan.reason = "greedy";
+        return plan;
+    }
+
+    if (sampling.top_k <= 0) {
+        plan.reason = "unbounded-top-k";
+        return plan;
+    }
+
+    if (sampling.top_k <= 256) {
+        plan.enabled = true;
+        plan.top_k = sampling.top_k;
+        plan.reason = "top-k";
+        return plan;
+    }
+
+    plan.reason = "top-k-too-large";
+    return plan;
+}
+
+static bool dflash_batch_view_is_reduced_verify(
+        const std::vector<server_slot> & slots,
+        const common_params_sampling   & fallback_sampling,
+        const common_params_speculative & speculative,
+        bool                             use_rejection,
+        bool                             has_tree,
+        int32_t                          view_start,
+        int32_t                          view_n_tokens,
+        int                              top_k,
+        const char                    ** reason) {
+    auto reject = [&](const char * why) {
+        if (reason) {
+            *reason = why;
+        }
+        return false;
+    };
+
+    if (view_n_tokens <= 0 || top_k <= 0) {
+        return reject("empty-view");
+    }
+
+    std::vector<uint8_t> covered((size_t) view_n_tokens, 0);
+    int covered_count = 0;
+    int expected_rows_per_slot = -1;
+
+    for (const auto & slot : slots) {
+        if (slot.state != SLOT_STATE_GENERATING || !slot.can_speculate() || slot.spec_draft.empty()) {
+            continue;
+        }
+        if (!common_sampler_supports_reduced(slot.smpl.get())) {
+            return reject("sampler");
+        }
+        const common_params_sampling & slot_sampling = slot.task ? slot.task->params.sampling : fallback_sampling;
+        const dflash_reduced_verify_plan slot_plan =
+            dflash_select_reduced_verify_plan(slot_sampling, speculative, use_rejection, has_tree);
+        if (!slot_plan.enabled) {
+            return reject(slot_plan.reason);
+        }
+        if (slot_plan.top_k != top_k) {
+            return reject("top-k-mismatch");
+        }
+        if (slot.spec_i_batch.size() != slot.spec_draft.size() + 1) {
+            return reject("spec-index-count");
+        }
+
+        auto cover_index = [&](int idx) {
+            if (idx < view_start || idx >= view_start + view_n_tokens) {
+                return false;
+            }
+            const int rel = idx - view_start;
+            if (covered[(size_t) rel] != 0) {
+                return false;
+            }
+            covered[(size_t) rel] = 1;
+            covered_count++;
+            return true;
+        };
+
+        int slot_rows = 0;
+        for (int idx : slot.spec_i_batch) {
+            if (!cover_index(idx)) {
+                return reject(idx < view_start || idx >= view_start + view_n_tokens
+                        ? "spec-index-outside-view" : "duplicate-index");
+            }
+            slot_rows++;
+        }
+        for (int idx : slot.spec_pad_i_batch) {
+            if (!cover_index(idx)) {
+                return reject(idx < view_start || idx >= view_start + view_n_tokens
+                        ? "pad-index-outside-view" : "duplicate-index");
+            }
+            slot_rows++;
+        }
+
+        if (slot_rows > 0) {
+            if (expected_rows_per_slot < 0) {
+                expected_rows_per_slot = slot_rows;
+            } else if (slot_rows != expected_rows_per_slot) {
+                return reject("row-count-mismatch");
+            }
+        }
+    }
+
+    if (covered_count != view_n_tokens) {
+        return reject("incomplete-coverage");
+    }
+
+    return true;
+}
+
 
 //
 // server_context_impl (private implementation)
@@ -980,6 +1248,10 @@ private:
 
     common_context_seq_rm_type ctx_tgt_seq_rm_type = COMMON_CONTEXT_SEQ_RM_TYPE_NO;
     common_context_seq_rm_type ctx_dft_seq_rm_type = COMMON_CONTEXT_SEQ_RM_TYPE_NO;
+
+    // DFlash compact verifier: true when current decode used reduced verify
+    // (argmax only, no full logits). Currently disabled pending recovery infra.
+    bool dflash_compact_verify_active = false;
 
     common_speculative_ptr spec;
 
@@ -4148,14 +4420,17 @@ private:
             && std::any_of(slots.begin(), slots.end(), [](const server_slot & s) { return !s.spec_draft.empty(); });
         if (dflash_tape_active) { llama_set_tape_recording(ctx_tgt, true); }
 
-        // DFlash compact verifier: activate reduced verify so the graph builder
-        // skips full logits and only computes argmax. Combined with the eval
-        // callback skip (dflash_graph_hidden_ready in llama-context.cpp), this
-        // allows the graph to run as a batch without node-by-node execution.
-        if (dflash_tape_active) {
+        // DFlash compact verifier: set argmax logits for graph reuse.
+        // This flag is set ONCE and kept stable. It produces argmax alongside
+        // full logits, so sampling still works with full logits.
+        // Reduced verify (argmax-only) is not used because it requires
+        // higher top_k for stochastic sampling and proper recovery infra.
+        static bool dflash_verify_logits_initialized = false;
+        if (dflash_tape_active && !dflash_verify_logits_initialized) {
             llama_set_dflash_verify_logits(ctx_tgt, true, 1);
-
+            dflash_verify_logits_initialized = true;
         }
+        dflash_compact_verify_active = false;  // argmax-only sampling disabled
 
         const int ret = llama_decode(ctx_tgt, batch_view);
         // NOTE: do NOT call set_tape_recording(false) here — it clobbers
@@ -4443,7 +4718,8 @@ private:
                 common_sampler_ptr smpl_save(common_sampler_clone(slot.smpl.get()));
 
                 GGML_ASSERT(slot.spec_i_batch.size() == n_draft + 1);
-                auto accepted = common_sampler_sample_and_accept_n(slot.smpl.get(), slot.ctx_tgt, slot.spec_i_batch, slot.spec_draft);
+                // Use full logits for draft verification (argmax is computed but not used for sampling)
+                std::vector<llama_token> accepted = common_sampler_sample_and_accept_n(slot.smpl.get(), slot.ctx_tgt, slot.spec_i_batch, slot.spec_draft);
                 slot.spec_i_batch.clear();
                 slot.spec_pad_i_batch.clear();
 

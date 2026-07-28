@@ -464,6 +464,36 @@ void common_sampler_accept(struct common_sampler * gsmpl, llama_token token, boo
     gsmpl->prev.push_back(token);
 }
 
+static common_sampler_accept_info common_sampler_accept_impl(
+        struct common_sampler            * gsmpl,
+        llama_token                        token,
+        bool                               is_generated,
+        common_sampler_accept_info       * info) {
+    common_sampler_accept_info local;
+    local.token = token;
+    local.is_generated = is_generated;
+    if (gsmpl && gsmpl->rbudget) {
+        local.reasoning_state_before = common_reasoning_budget_get_state(gsmpl->rbudget);
+    }
+
+    common_sampler_accept(gsmpl, token, is_generated);
+
+    if (gsmpl && gsmpl->rbudget) {
+        local.reasoning_state_after = common_reasoning_budget_get_state(gsmpl->rbudget);
+    }
+
+    if (info) {
+        *info = local;
+    }
+    return local;
+}
+
+common_sampler_accept_info common_sampler_accept_with_info(struct common_sampler * gsmpl, llama_token token, bool is_generated) {
+    common_sampler_accept_info info;
+    common_sampler_accept_impl(gsmpl, token, is_generated, &info);
+    return info;
+}
+
 void common_sampler_reset(struct common_sampler * gsmpl) {
     if (!gsmpl) {
         return;
@@ -688,6 +718,119 @@ std::vector<llama_token> common_sampler_sample_and_accept_n(struct common_sample
     }
 
     return common_sampler_sample_and_accept_n(gsmpl, ctx, idxs, draft, grammar_first);
+}
+
+bool common_sampler_has_active_grammar(const struct common_sampler * gsmpl) {
+    if (!gsmpl || !gsmpl->grmr) {
+        return false;
+    }
+    return llama_sampler_grammar_is_active(gsmpl->grmr);
+}
+
+bool common_sampler_reasoning_is_forcing(const struct common_sampler * gsmpl) {
+    if (!gsmpl) {
+        return true;
+    }
+    return common_reasoning_budget_get_state(gsmpl->rbudget) == REASONING_BUDGET_FORCING;
+}
+
+bool common_sampler_stops_speculative_accept(const struct common_sampler * gsmpl, bool grammar_active_at_start) {
+    if (!gsmpl) {
+        return true;
+    }
+    if (common_sampler_reasoning_is_forcing(gsmpl)) {
+        return true;
+    }
+    return common_sampler_has_active_grammar(gsmpl) && !grammar_active_at_start;
+}
+
+bool common_sampler_supports_reduced(struct common_sampler * gsmpl) {
+    if (!gsmpl) {
+        return false;
+    }
+    if (common_sampler_has_active_grammar(gsmpl)) {
+        return false;
+    }
+    if (!common_sampler_reasoning_is_forcing(gsmpl)) {
+        return true;
+    }
+    return false;
+}
+
+std::vector<llama_token> common_sampler_sample_reduced_and_accept_n(
+        struct common_sampler * gsmpl,
+        const llama_token     * candidate_ids,
+        const float           * candidate_logits,
+        int32_t                 n_rows,
+        int32_t                 k,
+        const llama_tokens    & draft,
+        const common_sampler_accept_callback & on_accept) {
+    GGML_ASSERT(gsmpl != nullptr);
+    GGML_ASSERT(candidate_ids != nullptr);
+    GGML_ASSERT(candidate_logits != nullptr);
+    GGML_ASSERT(n_rows == (int32_t) draft.size() + 1);
+    GGML_ASSERT(k > 0);
+
+    if (!common_sampler_supports_reduced(gsmpl)) {
+        return {};
+    }
+
+    auto sample_row = [&](int32_t row) -> llama_token {
+        gsmpl->cur.resize(k);
+        const size_t row_off = (size_t) row * (size_t) k;
+        for (int32_t i = 0; i < k; ++i) {
+            gsmpl->cur[i] = llama_token_data {
+                candidate_ids[row_off + i],
+                candidate_logits[row_off + i],
+                0.0f,
+            };
+        }
+
+        gsmpl->cur_p = { gsmpl->cur.data(), gsmpl->cur.size(), -1, false };
+        llama_sampler_apply(gsmpl->chain, &gsmpl->cur_p);
+
+        GGML_ASSERT(gsmpl->cur_p.selected >= 0);
+        return gsmpl->cur_p.data[gsmpl->cur_p.selected].id;
+    };
+
+    std::vector<llama_token> result;
+    result.reserve((size_t) n_rows);
+
+    const bool grammar_active_at_start = common_sampler_has_active_grammar(gsmpl);
+    auto accept = [&](llama_token id) {
+        if (on_accept) {
+            const auto info = common_sampler_accept_with_info(gsmpl, id, true);
+            result.push_back(id);
+            return on_accept(info);
+        }
+        common_sampler_accept(gsmpl, id, true);
+        result.push_back(id);
+        return true;
+    };
+
+    size_t i = 0;
+    for (; i < draft.size(); ++i) {
+        const llama_token id = sample_row((int32_t) i);
+
+        if (!accept(id)) {
+            break;
+        }
+
+        if (common_sampler_stops_speculative_accept(gsmpl, grammar_active_at_start)) {
+            break;
+        }
+
+        if (draft[i] != id) {
+            break;
+        }
+    }
+
+    if (i == draft.size()) {
+        const llama_token id = sample_row((int32_t) i);
+        (void) accept(id);
+    }
+
+    return result;
 }
 
 uint32_t common_sampler_get_seed(const struct common_sampler * gsmpl) {
