@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+"""Vulkan gap-closure benchmark runner with persistent-server and provenance support."""
 import argparse
 import hashlib
 import json
@@ -14,41 +15,183 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
 
+# Validation thresholds
+MAX_TPS_SENTINEL = 10_000  # t/s above this is implausible
+MIN_VALID_TOKENS = 2       # fewer tokens is not useful
+MAX_PROMPT_ECHO_COUNT = 2  # more occurrences of instruction phrase = echo
 
-def extract_measurement(response):
-    """Extract measurement from either chat or completions response format."""
+
+def extract_measurement(response, prompt_kind="coding"):
+    """Extract measurement from response with validity checking.
+    
+    Args:
+        response: API response JSON
+        prompt_kind: "coding" or "math" for prompt-specific validation
+    
+    Returns dict with measurement fields including validity.
+    """
     timings = response.get("timings") or {}
     draft_n = int(timings.get("draft_n") or 0)
-    accepted = int(timings.get("draft_n_accepted") or 0)
+    draft_n_accepted = int(timings.get("draft_n_accepted") or 0)
 
-    # Extract content and tokens from either format
+    # Extract content, finish reason, and tokens
     content = ""
+    finish_reason = None
     tokens_predicted = 0
 
     if "choices" in response:
-        # Completions or chat format
         choices = response.get("choices", [])
         if choices:
             choice = choices[0]
             content = choice.get("text", "") or choice.get("message", {}).get("content", "")
+            finish_reason = choice.get("finish_reason")
             tokens_predicted = response.get("usage", {}).get("completion_tokens", 0) or choice.get("tokens_predicted", 0)
     elif "content" in response:
-        # Flat format
         content = response.get("content", "")
         tokens_predicted = int(response.get("tokens_predicted") or 0)
 
+    predicted_per_second = float(timings.get("predicted_per_second") or 0.0)
+    
+    # Calculate draft acceptance
+    draft_accept_pct = (100.0 * draft_n_accepted / draft_n) if draft_n else None
+
+    # Validity checking
+    invalid_reasons = []
+    
+    # Check for empty content
+    if not content.strip():
+        invalid_reasons.append("empty_content")
+    
+    # Check for too few tokens
+    if tokens_predicted <= MIN_VALID_TOKENS:
+        invalid_reasons.append("too_few_tokens")
+    
+    # Check for invalid throughput
+    if predicted_per_second <= 0:
+        invalid_reasons.append("invalid_tps")
+    
+    # Check for implausibly high throughput (sentinel values)
+    if predicted_per_second >= MAX_TPS_SENTINEL:
+        invalid_reasons.append("implausible_tps")
+    
+    # Check for prompt echo
+    instruction_phrases = {
+        "coding": ["Only output the code", "def fibonacci"],
+        "math": ["quadratic equation", "2.4 hours"],
+    }
+    prompt_phrases = instruction_phrases.get(prompt_kind, [])
+    for phrase in prompt_phrases:
+        if content.count(phrase) > MAX_PROMPT_ECHO_COUNT:
+            invalid_reasons.append("prompt_echo")
+            break
+    
+    # Coding-specific checks
+    if prompt_kind == "coding":
+        if finish_reason != "stop":
+            invalid_reasons.append("coding_not_stopped")
+        
+        # Try to extract and compile Python code
+        python_code = _extract_python_code(content)
+        if python_code:
+            try:
+                compile(python_code, "<model-output>", "exec")
+                if "def fibonacci" not in python_code:
+                    invalid_reasons.append("coding_missing_fibonacci")
+            except SyntaxError:
+                invalid_reasons.append("coding_syntax_error")
+        else:
+            # No Python code found - might be acceptable for some prompts
+            pass
+    
+    # Math-specific checks
+    if prompt_kind == "math":
+        if "2.4" not in content.lower():
+            invalid_reasons.append("math_wrong_answer")
+    
     return {
         "tokens_predicted": tokens_predicted,
-        "predicted_per_second": float(timings.get("predicted_per_second") or 0.0),
-        "draft_accept_pct": (100.0 * accepted / draft_n) if draft_n else None,
+        "predicted_per_second": predicted_per_second,
+        "draft_n": draft_n,
+        "draft_n_accepted": draft_n_accepted,
+        "draft_accept_pct": draft_accept_pct,
+        "finish_reason": finish_reason,
         "content_sha256": hashlib.sha256(
             content.encode("utf-8")
         ).hexdigest(),
         "content": content,
+        "valid": len(invalid_reasons) == 0,
+        "invalid_reasons": invalid_reasons,
     }
 
 
+def _extract_python_code(content):
+    """Extract Python code from markdown fenced response."""
+    # Try fenced code blocks first
+    if "```python" in content:
+        start = content.index("```python") + 9
+        end = content.index("```", start + 1)
+        return content[start:end].strip()
+    # Try generic code blocks
+    if "```" in content:
+        start = content.index("```") + 3
+        end = content.index("```", start + 1)
+        return content[start:end].strip()
+    return None
+
+
+def make_provenance_record(server_path, model_path, draft_path=None, 
+                          device_line="", command=None, environment=None):
+    """Create a comprehensive provenance record."""
+    record = {
+        "server_path": str(server_path),
+        "server_version": "",
+        "server_sha256": sha256_file(server_path) if os.path.isfile(server_path) else "",
+        "source_head": "",
+        "model_path": str(model_path),
+        "model_sha256": sha256_file(model_path) if os.path.isfile(model_path) else "",
+        "model_size": os.path.getsize(model_path) if os.path.isfile(model_path) else 0,
+    }
+    
+    if draft_path:
+        record["draft_path"] = str(draft_path)
+        record["draft_sha256"] = sha256_file(draft_path) if os.path.isfile(draft_path) else ""
+        record["draft_size"] = os.path.getsize(draft_path) if os.path.isfile(draft_path) else 0
+    
+    record["device"] = device_line
+    record["command"] = command or []
+    record["environment"] = environment or {}
+    record["timestamp"] = time.time()
+    
+    # Try to get server version
+    try:
+        ver = subprocess.run(
+            [str(server_path), "--version"],
+            check=True,
+            text=True,
+            capture_output=True,
+        ).stdout.strip()
+        record["server_version"] = ver
+    except Exception:
+        pass
+    
+    # Get source HEAD
+    try:
+        head = subprocess.check_output(
+            ["git", "rev-parse", "HEAD"],
+            cwd=ROOT,
+            text=True
+        ).strip()
+        record["source_head"] = head
+    except Exception:
+        pass
+    
+    return record
+
+
 def summary_stats(values):
+    """Calculate summary statistics."""
+    if not values:
+        return None
     med = statistics.median(values)
     deviations = [abs(value - med) for value in values]
     return {
@@ -56,10 +199,12 @@ def summary_stats(values):
         "min": min(values),
         "max": max(values),
         "mad": statistics.median(deviations),
+        "count": len(values),
     }
 
 
 def sha256_file(path):
+    """Calculate SHA-256 hash of a file."""
     h = hashlib.sha256()
     with open(path, "rb") as handle:
         for chunk in iter(lambda: handle.read(1024 * 1024), b""):
@@ -82,6 +227,7 @@ def http_json(url, payload=None, timeout=600):
 
 
 def wait_ready(proc, port, timeout_s=180):
+    """Wait for server to become healthy."""
     deadline = time.monotonic() + timeout_s
     while time.monotonic() < deadline:
         if proc.poll() is not None:
@@ -95,6 +241,7 @@ def wait_ready(proc, port, timeout_s=180):
 
 
 def find_device(server):
+    """Find a Vulkan device matching criteria."""
     text = subprocess.run(
         [str(server), "--list-devices"], check=True,
         text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
@@ -106,22 +253,23 @@ def find_device(server):
 
 
 def mode_args(mode, draft):
+    """Generate mode-specific command line arguments."""
     if mode == "base":
         return ["--spec-type", "none"]
     if mode == "mtp":
         return ["--spec-type", "draft-mtp", "--spec-draft-n-max", "8"]
     if mode == "dflash":
-        return [
+        args_list = [
             "--spec-type", "dflash",
             "--spec-draft-model", str(draft),
             "--spec-draft-n-max", "8",
-            "--spec-branch-budget", "0",
-            "--spec-dflash-cross-ctx", "512",
         ]
-    raise ValueError(mode)
+        return args_list
+    raise ValueError(f"Unknown mode: {mode}")
 
 
 def main():
+    """Main entry point for the benchmark runner."""
     parser = argparse.ArgumentParser(
         description="Vulkan gap-closure benchmark runner."
     )
@@ -143,6 +291,15 @@ def main():
         "--warmup-tokens", type=int, default=32,
         help="Tokens for the warm-up request (default: 32).",
     )
+    # Persistent-server options
+    parser.add_argument(
+        "--restart-between-reps", action="store_true",
+        help="Restart server between repetitions (default: false).",
+    )
+    parser.add_argument(
+        "--skip-warmup", action="store_true",
+        help="Skip warm-up request (default: false).",
+    )
     args = parser.parse_args()
 
     # --- configuration from environment ---
@@ -152,6 +309,7 @@ def main():
     port = int(os.environ.get("VK_GAP_PORT", "8099"))
     temp = float(os.environ.get("VK_GAP_TEMP", "0"))
     top_k = int(os.environ.get("VK_GAP_TOP_K", "20"))
+    np = os.environ.get("VK_GAP_NP", "1")
 
     # --- pre-flight checks ---
     if not os.path.isfile(server_path):
@@ -173,13 +331,13 @@ def main():
     # --- build command ---
     common = [
         str(server_path), "-m", str(model_path),
-        "--port", str(port), "-np", os.environ.get("VK_GAP_NP", "1"),
+        "--port", str(port), "-np", np,
         "--kv-unified", "-ngl", "all", "-b", "2048", "-ub", "512",
         "--ctx-size", "8192", "--cache-type-k", "q4_0",
         "--cache-type-v", "q4_0",
         "--cache-ram", "0",
         "--flash-attn", "on",
-        "--device", device_id, "--jinja", "--reasoning", "off",
+        "--device", device_id, "--z", "--reasoning", "off",
         "--no-mmap", "--no-host", "--host", "127.0.0.1",
     ]
     all_args = common + mode_args(args.mode, Path(draft_path) if draft_path else None)
@@ -229,11 +387,7 @@ def main():
     prompt_text = prompts[args.prompt]
 
     # --- warm-up request ---
-    # MTP and DFlash have a pre-existing upstream bug where a warm-up request
-    # corrupts the next request's speculative state (stale embeddings / ring
-    # buffer), producing garbage drafts. Skip warm-up entirely for spec modes
-    # and rely on server restarts between reps for clean state.
-    if args.mode == "base":
+    if not args.skip_warmup:
         warmup_payload = dict(payload, prompt=prompt_text, n_predict=args.warmup_tokens)
         try:
             http_json(f"http://127.0.0.1:{port}/v1/completions", warmup_payload, timeout=600)
@@ -242,42 +396,33 @@ def main():
             server_proc.terminate()
             server_proc.wait(timeout=5)
             sys.exit(1)
-    else:
-        print(f"skipping warm-up for {args.mode} (speculative state corruption workaround)", file=sys.stderr)
 
     # --- measured requests ---
     payload["prompt"] = prompt_text
     payload["n_predict"] = args.gen_tokens
 
-    # MTP and DFlash both have a pre-existing upstream bug where speculative
-    # state corrupts across requests when slots are reused. Restart server
-    # between reps to guarantee clean state.
-    restart_between_reps = args.mode in ("dflash", "mtp")
-
-    def start_server():
-        """Start (or restart) the server and wait for readiness."""
-        if server_proc.poll() is None:
-            server_proc.terminate()
-            server_proc.wait(timeout=5)
-        log_fh = open(log_path, "a", encoding="utf-8")
-        proc = subprocess.Popen(all_args, stdout=log_fh, stderr=subprocess.STDOUT)
-        try:
-            wait_ready(proc, port)
-        except Exception as exc:
-            print(f"server readiness failed: {exc}", file=sys.stderr)
-            proc.terminate()
-            proc.wait(timeout=5)
-            sys.exit(1)
-        return proc, log_fh
+    # Create provenance record
+    provenance = make_provenance_record(
+        server_path=server_path,
+        model_path=model_path,
+        draft_path=draft_path,
+        device_line=device_line,
+        command=all_args,
+        environment={k: v for k, v in os.environ.items() 
+                    if k.startswith("GGML_DFLASH_") or k.startswith("VK_GAP_")},
+    )
 
     records = []
     with open(output_path, "a", encoding="utf-8") as out_fh:
         for rep in range(1, args.repetitions + 1):
-            if restart_between_reps and rep > 1:
+            # Optional server restart between repetitions
+            if args.restart_between_reps and rep > 1:
                 print(f"rep {rep}: restarting server for clean state", file=sys.stderr)
                 server_proc.terminate()
                 server_proc.wait(timeout=5)
-                server_proc, log_fh = start_server()
+                log_fh.close()
+                server_proc, log_fh = _restart_server(all_args, log_path, port)
+
             rep_payload = dict(payload)
             try:
                 response = http_json(
@@ -287,42 +432,50 @@ def main():
                 )
             except (urllib.error.URLError, TimeoutError, json.JSONDecodeError) as exc:
                 print(f"rep {rep}: request failed: {exc}", file=sys.stderr)
+                # Record the error
+                record = {
+                    "valid": False,
+                    "error_type": type(exc).__name__,
+                    "error_message": str(exc),
+                    "rep": rep,
+                    "provenance": provenance,
+                }
+                out_fh.write(json.dumps(record) + "\n")
+                records.append(record)
                 continue
             except Exception as exc:
                 print(f"rep {rep}: unexpected error: {exc}", file=sys.stderr)
+                # Record the error
+                record = {
+                    "valid": False,
+                    "error_type": type(exc).__name__,
+                    "error_message": str(exc),
+                    "rep": rep,
+                    "provenance": provenance,
+                }
+                out_fh.write(json.dumps(record) + "\n")
+                records.append(record)
                 continue
 
-            measurement = extract_measurement(response)
-            if measurement["tokens_predicted"] <= 0 or measurement["predicted_per_second"] <= 0:
-                print(f"rep {rep}: invalid measurement (tp={measurement['tokens_predicted']}, tps={measurement['predicted_per_second']})", file=sys.stderr)
-                continue
-
+            measurement = extract_measurement(response, args.prompt)
+            
+            # Always record, even if invalid
             record = {
-                "revision": subprocess.check_output(
-                    ["git", "rev-parse", "HEAD"], cwd=ROOT, text=True
-                ).strip(),
-                "server": str(server_path),
-                "server_sha256": sha256_file(server_path),
-                "device": device_line,
-                "model": str(model_path),
-                "draft": str(draft_path) if args.mode == "dflash" else None,
                 "mode": args.mode,
                 "prompt": args.prompt,
-                "repetition": rep,
-                "command": [str(a) for a in all_args],
+                "rep": rep,
                 "request": rep_payload,
                 "measurement": measurement,
                 "log": str(log_path),
-                "environment": {
-                    key: value for key, value in os.environ.items()
-                    if key.startswith("GGML_DFLASH_") or key.startswith("VK_GAP_")
-                },
+                "provenance": provenance,
             }
             records.append(record)
             out_fh.write(json.dumps(record) + "\n")
+            
+            valid_str = "OK" if measurement["valid"] else f"INVALID ({', '.join(measurement['invalid_reasons'])})"
             print(f"rep {rep}: t/s={measurement['predicted_per_second']:.2f} "
                   f"toks={measurement['tokens_predicted']} "
-                  f"hash={measurement['content_sha256'][:8]}")
+                  f"finish={measurement['finish_reason']} {valid_str}")
 
     print(f"wrote {len(records)} records to {output_path}")
 
@@ -338,6 +491,20 @@ def main():
     # Exit nonzero if we produced no records
     if not records:
         sys.exit(1)
+
+
+def _restart_server(all_args, log_path, port):
+    """Restart server and wait for readiness."""
+    log_fh = open(log_path, "a", encoding="utf-8")
+    proc = subprocess.Popen(all_args, stdout=log_fh, stderr=subprocess.STDOUT)
+    try:
+        wait_ready(proc, port)
+    except Exception as exc:
+        print(f"server readiness failed: {exc}", file=sys.stderr)
+        proc.terminate()
+        proc.wait(timeout=5)
+        sys.exit(1)
+    return proc, log_fh
 
 
 if __name__ == "__main__":
