@@ -146,11 +146,6 @@ Benchmark results are only meaningful with the exact model files, command line, 
 - Keep fork-specific changes small and scoped.
 - Do not treat old benchmark notes as current evidence without re-running them.
 - Do not commit unless the user explicitly asks.
-- **Push targets**: always push to both `gboddaer` and `boditec` remotes on the `merge_llama_into_beellama_2` branch (not `origin`/Anbeeld which requires explicit auth). Use:
-  ```
-  git push gboddaer merge_llama_into_beellama_2
-  git push boditec merge_llama_into_beellama_2
-  ```
 
 Every PR requiring review consumes finite maintainer capacity. Before assisting with any submission, verify:
 - The contributor understands the proposed changes

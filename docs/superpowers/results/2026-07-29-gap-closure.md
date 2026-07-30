@@ -1,6 +1,12 @@
 # Vulkan Qwen3.6-27B Speculative Gap Closure — Results
 
-> **Status:** Task 1.4 complete (DFlash profile captured). Task 2 already implemented in worktree.
+> **SUPERSEDED:** The matrix and DFlash profile below used server binary
+> `432292cc9852...` reporting commit `adb92b36a`, not the recorded worktree
+> revision. Repeated-request correctness fails at `2fa704760`; do not use these
+> numbers as branch acceptance evidence. See the 2026-07-30 recovery plan.
+
+> **Status:** Disproven — see superseded notice and review below.
+> **Review:** [2026-07-30-vulkan-speculative-execution-review.md](../reviews/2026-07-30-vulkan-speculative-execution-review.md)
 > **Revision:** `5c78ad504` (corrected design + plan committed).
 > **Device:** `Vulkan0: AMD Radeon Graphics (RADV GFX1151)` (97503 MiB).
 > **Model:** `/crypt/models/Qwen3.6-27B-Q4_K_M.gguf` (16 GB).
@@ -274,9 +280,11 @@ BASE median unchanged from Phase 0. Dispersion overlapping. No regression detect
 
 Tests pass, build passes, six valid cells documented.
 
-## EOS Bug Fix — Complete (2026-07-29)
+## EOS Bug Fix — Disproven by Repeated-Request Testing (2026-07-29)
 
-**Status:** Fixed and committed to `merge_llama_into_beellama_2` branch.
+**Status:** Disproven by repeated-request testing; see superseded notice and review below.
+**Review:** [2026-07-30-vulkan-speculative-execution-review.md](../reviews/2026-07-30-vulkan-speculative-execution-review.md)
+**Recovery plan:** [2026-07-30-vulkan-speculative-correctness-performance-recovery.md](../plans/2026-07-30-vulkan-speculative-correctness-performance-recovery.md)
 **Commits:**
 - `ab3de6854` — fix: MTP/DFlash early-EOS and stale state corruption on cached prompts (5 files, 70 lines)
 - `d57efd90d` — docs: add Vulkan Qwen3.6-27B benchmark harness and gap closure results
