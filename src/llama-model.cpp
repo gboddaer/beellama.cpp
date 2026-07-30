@@ -2173,9 +2173,9 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                     if (mtp_on_hybrid_qwen35) {
                         // MTP context: only include the MTP layers (last n_layer_nextn layers)
                         // n_main is the number of transformer layers excluding MTP heads.
-                        // Using hparams.n_layer() directly would return the TOTAL layers
-                        // (including MTP), causing the filter to exclude all layers.
-                        const uint32_t n_main = hparams.n_layer() - hparams.n_layer_nextn;
+                        // hparams.n_layer() already returns n_layer_all - n_layer_nextn,
+                        // so this is the correct boundary for MTP layers.
+                        const uint32_t n_main = hparams.n_layer();
                         filter = [n_main](int32_t il) { return (uint32_t)il >= n_main; };
                     }
 

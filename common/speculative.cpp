@@ -4297,7 +4297,10 @@ common_speculative_draft_params & common_speculative_get_draft_params(
 // Reset per-request speculative state. Call when reusing a slot with cached
 // prompt tokens to avoid stale embeddings (MTP) or ring state (DFlash).
 void common_speculative_reset(common_speculative * spec, llama_seq_id seq_id) {
-    if (!spec || !spec->impls.empty()) {
+    if (spec == nullptr) {
+        return;
+    }
+    if (!spec->impls.empty()) {
         for (auto & impl : spec->impls) {
             switch (impl->type) {
                 case COMMON_SPECULATIVE_TYPE_DRAFT_MTP: {

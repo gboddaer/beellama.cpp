@@ -167,6 +167,31 @@ static void test(void) {
     assert(params.use_mmap == false);
     assert(params.no_perf == true);
 
+    printf("test-arg-parser: test DFlash CLI arguments\n\n");
+
+    // --spec-branch-budget
+    argv = {"binary_name", "--spec-branch-budget", "4"};
+    assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), params, LLAMA_EXAMPLE_SERVER));
+    assert(params.speculative.branch_budget == 4);
+    assert(params.speculative.branch_budget_explicit);
+
+    // --spec-dflash-cross-ctx
+    argv = {"binary_name", "--spec-dflash-cross-ctx", "1024"};
+    assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), params, LLAMA_EXAMPLE_SERVER));
+    assert(params.speculative.dflash_cross_ctx == 1024);
+
+    // Both together
+    argv = {"binary_name", "--spec-branch-budget", "8", "--spec-dflash-cross-ctx", "2048"};
+    assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), params, LLAMA_EXAMPLE_SERVER));
+    assert(params.speculative.branch_budget == 8);
+    assert(params.speculative.branch_budget_explicit);
+    assert(params.speculative.dflash_cross_ctx == 2048);
+
+    // Negative branch budget should be clamped to 0
+    argv = {"binary_name", "--spec-branch-budget", "-1"};
+    assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), params, LLAMA_EXAMPLE_SERVER));
+    assert(params.speculative.branch_budget == 0);
+
     printf("test-arg-parser: test environment variables being overwritten\n\n");
 
     setenv("LLAMA_ARG_MODEL", "blah.gguf", true);

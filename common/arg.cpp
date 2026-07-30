@@ -3898,6 +3898,31 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             params.speculative.ngram_map_k4v.min_hits = value;
         }
     ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}));
+    add_opt(common_arg(
+        {"--spec-branch-budget"}, "N",
+        string_format("DDTree branch nodes beyond the main draft path (default: %d, 0 = flat)", params.speculative.branch_budget),
+        [](common_params & params, int value) {
+            params.speculative.branch_budget = std::max(0, value);
+            params.speculative.branch_budget_explicit = true;
+            params.speculative.note_dflash_only_arg();
+        }
+    ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_SPEC_BRANCH_BUDGET"));
+    add_opt(common_arg(
+        {"--spec-dflash-max-slots"}, "N",
+        "max concurrent server slots with DFlash state; higher slots fall back to non-speculative decode (default: match -np)",
+        [](common_params & params, int value) {
+            params.speculative.dflash_max_slots = std::max(0, value);
+            params.speculative.note_dflash_only_arg();
+        }
+    ).set_spec().set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_SPECULATIVE}).set_env("LLAMA_ARG_SPEC_DFLASH_MAX_SLOTS"));
+    add_opt(common_arg(
+        {"--spec-dflash-cross-ctx"}, "N",
+        string_format("DFlash cross-attention window in tokens; how many target hidden states the drafter sees (default: %d)", params.speculative.dflash_cross_ctx),
+        [](common_params & params, int value) {
+            params.speculative.dflash_cross_ctx = value;
+            params.speculative.note_dflash_only_arg();
+        }
+    ).set_spec().set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_SPECULATIVE}).set_env("LLAMA_ARG_SPEC_DFLASH_CROSS_CTX"));
 
     //
     // removed params
