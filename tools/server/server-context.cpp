@@ -1678,7 +1678,6 @@ private:
             cparams_mtp.type_v        = params_base.speculative.draft.cache_type_v;
             cparams_mtp.n_rs_seq      = 0;
             cparams_mtp.n_outputs_max = params_base.n_parallel;
-            cparams_mtp.ctx_other     = ctx_tgt;
 
             ctx_dft.reset(llama_init_from_model(model_tgt, cparams_mtp));
             if (ctx_dft == nullptr) {
@@ -2304,6 +2303,22 @@ private:
     }
 
     bool launch_slot_with_task(server_slot & slot, server_task && task) {
+        // Reset speculative state before starting a new request. This prevents stale
+        // embeddings and ring state from leaking between requests, which causes
+        // garbage drafts (prompt echo) when prompt tokens are cached from a prior
+        // request.
+        if (slot.can_speculate()) {
+            // Clear draft KV cache
+            if (slot.ctx_dft) {
+                common_context_seq_rm(slot.ctx_dft, slot.id, -1, -1);
+            }
+            // Reset MTP pending_h (carries last embedding from previous decode)
+            // and DFlash ring state when reusing a slot with cached tokens.
+            if (slot.prompt.n_tokens() > 0) {
+                common_speculative_reset(slot.get_spec(), slot.id);
+            }
+        }
+
         // process per-request lora adapters
         if (!task.params.lora.empty()) {
             auto task_loras = construct_lora_list(task.params.lora);
@@ -4492,9 +4507,12 @@ private:
         // TODO: avoid restoring the draft context and re-evaluating the drafted tokens when not needed [TAG_SPEC_AVOID_DRAFT_REEVAL]
         //       for now, always re-evaluate for simplicity
         //       ref: https://github.com/ggml-org/llama.cpp/pull/22728#issuecomment-4400925384
-        // Multi-slot: process speculative batch for each slot's spec
+        // Multi-slot: process speculative batch for each slot's spec.
+        // Skip slots that use the shared context-level spec to avoid double-processing.
+        // (slot.spec_shared == spec means the slot uses the shared spec, which is
+        // processed below. Only slots with per-slot specs (DFlash) need processing here.)
         for (auto & s : slots) {
-            if (s.get_spec() && !common_speculative_process(s.get_spec(), batch_view)) {
+            if (s.spec && !common_speculative_process(s.get_spec(), batch_view)) {
                 SRV_ERR("%s", "failed to process speculative batch\n");
                 throw std::runtime_error("failed to process speculative batch");
             }

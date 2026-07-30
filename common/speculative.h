@@ -92,6 +92,11 @@ struct common_speculative_draft_params {
 common_speculative_draft_params & common_speculative_get_draft_params(common_speculative * spec, llama_seq_id seq_id);
 
 // optionally call once at the beginning of a new generation
+// reset per-request state (MTP pending_h, DFlash ring state, etc.)
+// call when reusing a slot with cached prompt tokens to avoid stale embeddings
+void common_speculative_reset(common_speculative * spec, llama_seq_id seq_id);
+
+// after prefill: initialize per-request speculative state
 void common_speculative_begin(common_speculative * spec, llama_seq_id seq_id, const llama_tokens & prompt);
 
 // process the batch and update the internal state of the speculative context

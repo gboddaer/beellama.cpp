@@ -688,6 +688,16 @@ std::vector<llama_token> common_sampler_sample_and_accept_n(struct common_sample
 
         result.push_back(id);
 
+        // Early termination on EOS: if the accepted token is EOS,
+        // stop checking further draft positions — the model has finished.
+        if (llama_vocab_is_eog(llama_model_get_vocab(llama_get_model(ctx)), id)) {
+            if (enable_qa_trace) {
+                fprintf(stderr, "[DFLASH_QA] sample_accept EOS at i=%zu (id=%d) -> break\n",
+                    i, (int) id);
+            }
+            break;
+        }
+
         if (draft[i] != id) {
             if (enable_qa_trace) {
                 fprintf(stderr, "[DFLASH_QA] sample_accept REJECT at i=%zu (draft=%d sampled=%d) -> break\n",
