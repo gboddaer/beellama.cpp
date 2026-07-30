@@ -2318,15 +2318,14 @@ private:
         // garbage drafts (prompt echo) when prompt tokens are cached from a prior
         // request.
         if (slot.can_speculate()) {
-            // Clear draft KV cache
+            // Clear draft KV cache unconditionally for speculative slots.
             if (slot.ctx_dft) {
                 common_context_seq_rm(slot.ctx_dft, slot.id, -1, -1);
             }
             // Reset MTP pending_h (carries last embedding from previous decode)
-            // and DFlash ring state when reusing a slot with cached tokens.
-            if (slot.prompt.n_tokens() > 0) {
-                common_speculative_reset(slot.get_spec(), slot.id);
-            }
+            // and DFlash ring state. This must happen for every new speculative
+            // request to prevent stale state from leaking between requests.
+            common_speculative_reset(slot.get_spec(), slot.id);
         }
 
         // process per-request lora adapters

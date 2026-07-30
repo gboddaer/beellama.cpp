@@ -363,6 +363,11 @@ struct common_speculative_impl {
 
     virtual void accept(llama_seq_id seq_id, uint16_t n_accepted, bool is_other) = 0;
 
+    // Reset per-request state for a specific sequence. Called when reusing
+    // a slot with cached prompt tokens to avoid stale state from leaking
+    // between requests (MTP pending_h, DFlash ring, etc.).
+    virtual void reset_request(llama_seq_id /*seq_id*/, const char * /*reason*/) {}
+
     // true if this implementation requires the target context to extract post-norm embeddings
     virtual bool need_embd() const = 0;
 
@@ -803,6 +808,16 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                     "Drafts may degrade.\n",
                     __func__, (int) pos_max, N - 1);
         }
+    }
+
+    void reset_request(llama_seq_id seq_id, const char * reason) override {
+        LOG_TRC("%s: seq_id=%d reason=%s\n", __func__, (int) seq_id, reason ? reason : "");
+        pending_h[seq_id].assign(n_embd, 0.0f);
+        i_batch_beg[seq_id] = -1;
+        i_batch_end[seq_id] = -1;
+        verify_h[seq_id].clear();
+        verify_h_rows[seq_id] = 0;
+        last_n_drafted[seq_id] = 0;
     }
 
     bool process(const llama_batch & batch_in) override {
@@ -2714,6 +2729,11 @@ struct common_speculative_impl_dflash : public common_speculative_impl {
         }
     }
 
+    void reset_request(llama_seq_id /*seq_id*/, const char * reason) override {
+        LOG_TRC("%s: reason=%s\n", __func__, reason ? reason : "");
+        discard_cross_ring(reason ? reason : "slot reused");
+    }
+
     bool process(const llama_batch & /*batch*/) override {
         return true;
     }
@@ -4300,28 +4320,8 @@ void common_speculative_reset(common_speculative * spec, llama_seq_id seq_id) {
     if (spec == nullptr) {
         return;
     }
-    if (!spec->impls.empty()) {
-        for (auto & impl : spec->impls) {
-            switch (impl->type) {
-                case COMMON_SPECULATIVE_TYPE_DRAFT_MTP: {
-                    auto * mtp = static_cast<common_speculative_impl_draft_mtp *>(impl.get());
-                    mtp->pending_h[seq_id].assign(mtp->n_embd, 0.0f);
-                    mtp->i_batch_beg[seq_id] = -1;
-                    mtp->i_batch_end[seq_id] = -1;
-                    mtp->verify_h[seq_id].clear();
-                    mtp->verify_h_rows[seq_id] = 0;
-                    mtp->last_n_drafted[seq_id] = 0;
-                    break;
-                }
-                case COMMON_SPECULATIVE_TYPE_DFLASH: {
-                    auto * dfl = static_cast<common_speculative_impl_dflash *>(impl.get());
-                    dfl->discard_cross_ring("slot reused with cached prompt");
-                    break;
-                }
-                default:
-                    break;
-            }
-        }
+    for (auto & impl : spec->impls) {
+        impl->reset_request(seq_id, "slot reused with cached prompt");
     }
 }
 
