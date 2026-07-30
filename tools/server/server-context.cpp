@@ -2242,10 +2242,19 @@ private:
 
                 const int64_t t_start = ggml_time_us();
 
-                ret->prompt_save(*prompt_cache);
-
-                if (!ret->prompt_load(*prompt_cache, task.tokens)) {
-                    ret->prompt_clear(false);
+                // For speculative slots, bypass prompt cache entirely to prevent
+                // stale KV state from being restored. The coordinated reset in
+                // launch_slot_with_task will handle clearing target/draft KV.
+                // This forces a full prefill from scratch for speculative modes.
+                if (!ret->can_speculate()) {
+                    ret->prompt_save(*prompt_cache);
+                    if (!ret->prompt_load(*prompt_cache, task.tokens)) {
+                        ret->prompt_clear(true);
+                    }
+                } else {
+                    SRV_TRC("skipping prompt cache for speculative slot %d (forced full prefill)\n", ret->id);
+                    // Clear slot.prompt and n_past to force full prefill
+                    ret->prompt_clear(true);
                 }
 
                 prompt_cache->update();
@@ -2308,15 +2317,32 @@ private:
         // garbage drafts (prompt echo) when prompt tokens are cached from a prior
         // request.
         if (slot.can_speculate()) {
+            // Coordinated cache reset: clear both target and draft KV together
+            // to prevent stale state from leaking between requests.
+            // This implements the "safe no-reuse policy" - correct full prefill
+            // is preferred over fast corrupted reuse.
+            if (slot.prompt.n_tokens() > 0) {
+                // Clear target prompt/KV cache AND reset slot.prompt + n_past
+                // to force a full prefill from scratch. Passing true ensures
+                // slot.prompt is cleared and slot.n_past is reset to 0, preventing
+                // slot.launch() from incorrectly skipping prefill due to stale
+                // prompt tracking variables.
+                slot.prompt_clear(true);
+                // Clear prompt cache to prevent prompt_load from restoring
+                // stale KV state. We clear all entries since we can't identify
+                // which entry corresponds to this slot without modifying the
+                // server_prompt struct.
+                if (prompt_cache) {
+                    prompt_cache->states.clear();
+                }
+            }
             // Clear draft KV cache
             if (slot.ctx_dft) {
                 common_context_seq_rm(slot.ctx_dft, slot.id, -1, -1);
             }
             // Reset MTP pending_h (carries last embedding from previous decode)
             // and DFlash ring state when reusing a slot with cached tokens.
-            if (slot.prompt.n_tokens() > 0) {
-                common_speculative_reset(slot.get_spec(), slot.id);
-            }
+            common_speculative_reset(slot.get_spec(), slot.id);
         }
 
         // process per-request lora adapters
