@@ -273,3 +273,27 @@ BASE median unchanged from Phase 0. Dispersion overlapping. No regression detect
 ### Step 5: Final verification
 
 Tests pass, build passes, six valid cells documented.
+
+## EOS Bug Fix — Complete (2026-07-29)
+
+**Status:** Fixed and committed to `merge_llama_into_beellama_2` branch.
+**Commits:**
+- `ab3de6854` — fix: MTP/DFlash early-EOS and stale state corruption on cached prompts (5 files, 70 lines)
+- `d57efd90d` — docs: add Vulkan Qwen3.6-27B benchmark harness and gap closure results
+
+**Push targets:** `git push gboddaer merge_llama_into_beellama_2` and `git push boditec merge_llama_into_beellama_2`.
+
+### Root causes identified (6 issues, one fix commit)
+
+| # | Issue | File | Fix |
+|---|-------|------|-----|
+| 1 | MTP double-processing | `server-context.cpp` | `s.get_spec()` -> `s.spec` in batch loop |
+| 2 | MTP memory layer filter | `llama-model.cpp` | `n_layer()` -> `n_layer() - n_layer_nextn` |
+| 3 | MTP context isolation | `server-context.cpp` | Removed `ctx_other = ctx_tgt` |
+| 4 | Draft KV not cleared | `server-context.cpp` | `common_context_seq_rm` on draft ctx before new request |
+| 5 | Spec state not reset on slot reuse | `speculative.cpp/h` | `common_speculative_reset()` clears MTP pending_h and DFlash ring |
+| 6 | EOS not handled in acceptance | `sampling.cpp` | Break on EOS in `sample_and_accept_n` |
+
+### Remaining
+
+The warm-up corruption bug is a pre-existing upstream issue in llama.cpp Vulkan embedding synchronization. Affects both main branch and worktree. The benchmark harness workaround (skip warm-up + restart between reps) makes tests pass.
