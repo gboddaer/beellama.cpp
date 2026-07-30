@@ -85,6 +85,10 @@ def extract_measurement(response, prompt_kind="coding"):
             invalid_reasons.append("prompt_echo")
             break
     
+    # Speculative mode checks: MTP and DFlash require draft tokens.
+    if prompt_kind in ("mtp", "dflash") and draft_n == 0:
+        invalid_reasons.append("spec_no_drafts")
+    
     # Coding-specific checks
     if prompt_kind == "coding":
         if finish_reason != "stop":
@@ -96,12 +100,12 @@ def extract_measurement(response, prompt_kind="coding"):
             try:
                 compile(python_code, "<model-output>", "exec")
                 if "def fibonacci" not in python_code:
-                    invalid_reasons.append("coding_missing_fibonacci")
+                    invalid_reasons.append("coding_not_python")
             except SyntaxError:
-                invalid_reasons.append("coding_syntax_error")
+                invalid_reasons.append("coding_not_python")
         else:
-            # No Python code found - might be acceptable for some prompts
-            pass
+            # No Python code block found in coding mode is invalid
+            invalid_reasons.append("coding_not_python")
     
     # Math-specific checks
     if prompt_kind == "math":
@@ -125,8 +129,8 @@ def extract_measurement(response, prompt_kind="coding"):
 
 
 def _extract_python_code(content):
-    """Extract Python code from markdown fenced response."""
-    # Try fenced code blocks first
+    """Extract Python code from markdown fenced or plain response."""
+    # Try fenced python blocks first
     if "```python" in content:
         start = content.index("```python") + 9
         end = content.index("```", start + 1)
@@ -136,17 +140,31 @@ def _extract_python_code(content):
         start = content.index("```") + 3
         end = content.index("```", start + 1)
         return content[start:end].strip()
-    return None
+    # No fenced block: attempt to compile the entire content as Python.
+    # This handles unfenced responses that are pure Python code.
+    try:
+        compile(content, "<model-output>", "exec")
+        return content
+    except SyntaxError:
+        return None
 
 
 def make_provenance_record(server_path, model_path, draft_path=None, 
-                          device_line="", command=None, environment=None):
-    """Create a comprehensive provenance record."""
+                          device_line="", command=None, environment=None,
+                          reference_label=None, external_source_head=None):
+    """Create a comprehensive provenance record.
+    
+    Args:
+        reference_label: Optional label for external reference binaries (e.g., "reference-adb92").
+        external_source_head: Optional explicit source HEAD for external binaries.
+            When provided, overrides git rev-parse of the worktree.
+    """
     record = {
         "server_path": str(server_path),
         "server_version": "",
         "server_sha256": sha256_file(server_path) if os.path.isfile(server_path) else "",
         "source_head": "",
+        "reference_label": reference_label or "",
         "model_path": str(model_path),
         "model_sha256": sha256_file(model_path) if os.path.isfile(model_path) else "",
         "model_size": os.path.getsize(model_path) if os.path.isfile(model_path) else 0,
@@ -162,28 +180,31 @@ def make_provenance_record(server_path, model_path, draft_path=None,
     record["environment"] = environment or {}
     record["timestamp"] = time.time()
     
-    # Try to get server version
+    # Try to get server version (--version writes to stderr in llama-server).
     try:
         ver = subprocess.run(
             [str(server_path), "--version"],
             check=True,
             text=True,
             capture_output=True,
-        ).stdout.strip()
-        record["server_version"] = ver
+        )
+        record["server_version"] = (ver.stdout.strip() or ver.stderr.strip())
     except Exception:
         pass
     
-    # Get source HEAD
-    try:
-        head = subprocess.check_output(
-            ["git", "rev-parse", "HEAD"],
-            cwd=ROOT,
-            text=True
-        ).strip()
-        record["source_head"] = head
-    except Exception:
-        pass
+    # Get source HEAD: use external override if provided, otherwise worktree git HEAD
+    if external_source_head:
+        record["source_head"] = external_source_head
+    else:
+        try:
+            head = subprocess.check_output(
+                ["git", "rev-parse", "HEAD"],
+                cwd=ROOT,
+                text=True
+            ).strip()
+            record["source_head"] = head
+        except Exception:
+            pass
     
     return record
 
@@ -300,6 +321,15 @@ def main():
         "--skip-warmup", action="store_true",
         help="Skip warm-up request (default: false).",
     )
+    # External reference binary options
+    parser.add_argument(
+        "--reference-label", type=str, default=None,
+        help="Label for external reference binary (e.g., 'reference-adb92').",
+    )
+    parser.add_argument(
+        "--external-source-head", type=str, default=None,
+        help="Explicit source HEAD for external reference binary.",
+    )
     args = parser.parse_args()
 
     # --- configuration from environment ---
@@ -327,6 +357,42 @@ def main():
     # --- find device ---
     device_id, device_line = find_device(Path(server_path))
     print(f"selected device: {device_line}", file=sys.stderr)
+
+    # --- preflight: verify binary commit matches worktree HEAD ---
+    server_version = ""
+    try:
+        ver = subprocess.run(
+            [str(server_path), "--version"],
+            check=True,
+            text=True,
+            capture_output=True,
+        )
+        server_version = (ver.stdout.strip() or ver.stderr.strip())
+        # Parse commit from version string (e.g., "llama-server version: 10581 (fe92d8a7f)")
+        import re
+        commit_match = re.search(r'\(([0-9a-f]{7,40})\)', server_version)
+        if commit_match:
+            binary_commit = commit_match.group(1)
+            try:
+                worktree_head = subprocess.check_output(
+                    ["git", "rev-parse", "HEAD"],
+                    cwd=ROOT,
+                    text=True
+                ).strip()
+                if not worktree_head.startswith(binary_commit):
+                    print(
+                        f"PREFLIGHT FAIL: binary commit {binary_commit} does not match "
+                        f"worktree HEAD {worktree_head}",
+                        file=sys.stderr,
+                    )
+                    sys.exit(1)
+                print(f"preflight: binary commit {binary_commit} matches worktree HEAD", file=sys.stderr)
+            except Exception as exc:
+                print(f"preflight: could not verify worktree HEAD: {exc}", file=sys.stderr)
+        else:
+            print(f"preflight: could not parse commit from version: {server_version}", file=sys.stderr)
+    except Exception as exc:
+        print(f"preflight: could not get server version: {exc}", file=sys.stderr)
 
     # --- build command ---
     common = [
@@ -410,87 +476,132 @@ def main():
         command=all_args,
         environment={k: v for k, v in os.environ.items() 
                     if k.startswith("GGML_DFLASH_") or k.startswith("VK_GAP_")},
+        reference_label=args.reference_label,
+        external_source_head=args.external_source_head,
     )
 
     records = []
-    with open(output_path, "a", encoding="utf-8") as out_fh:
-        for rep in range(1, args.repetitions + 1):
-            # Optional server restart between repetitions
-            if args.restart_between_reps and rep > 1:
-                print(f"rep {rep}: restarting server for clean state", file=sys.stderr)
-                server_proc.terminate()
-                server_proc.wait(timeout=5)
-                log_fh.close()
-                server_proc, log_fh = _restart_server(all_args, log_path, port)
-
-            rep_payload = dict(payload)
-            try:
-                response = http_json(
-                    f"http://127.0.0.1:{port}/v1/completions",
-                    rep_payload,
-                    timeout=600,
-                )
-            except (urllib.error.URLError, TimeoutError, json.JSONDecodeError) as exc:
-                print(f"rep {rep}: request failed: {exc}", file=sys.stderr)
-                # Record the error
-                record = {
-                    "valid": False,
-                    "error_type": type(exc).__name__,
-                    "error_message": str(exc),
-                    "rep": rep,
-                    "provenance": provenance,
-                }
-                out_fh.write(json.dumps(record) + "\n")
-                records.append(record)
-                continue
-            except Exception as exc:
-                print(f"rep {rep}: unexpected error: {exc}", file=sys.stderr)
-                # Record the error
-                record = {
-                    "valid": False,
-                    "error_type": type(exc).__name__,
-                    "error_message": str(exc),
-                    "rep": rep,
-                    "provenance": provenance,
-                }
-                out_fh.write(json.dumps(record) + "\n")
-                records.append(record)
-                continue
-
-            measurement = extract_measurement(response, args.prompt)
-            
-            # Always record, even if invalid
-            record = {
-                "mode": args.mode,
-                "prompt": args.prompt,
-                "rep": rep,
-                "request": rep_payload,
-                "measurement": measurement,
-                "log": str(log_path),
-                "provenance": provenance,
-            }
-            records.append(record)
-            out_fh.write(json.dumps(record) + "\n")
-            
-            valid_str = "OK" if measurement["valid"] else f"INVALID ({', '.join(measurement['invalid_reasons'])})"
-            print(f"rep {rep}: t/s={measurement['predicted_per_second']:.2f} "
-                  f"toks={measurement['tokens_predicted']} "
-                  f"finish={measurement['finish_reason']} {valid_str}")
-
-    print(f"wrote {len(records)} records to {output_path}")
-
-    # --- cleanup ---
-    server_proc.terminate()
+    has_invalid = False
     try:
-        server_proc.wait(timeout=5)
-    except subprocess.TimeoutExpired:
-        server_proc.kill()
-        server_proc.wait(timeout=5)
-    log_fh.close()
+        with open(output_path, "a", encoding="utf-8") as out_fh:
+            for rep in range(1, args.repetitions + 1):
+                # Optional server restart between repetitions
+                if args.restart_between_reps and rep > 1:
+                    print(f"rep {rep}: restarting server for clean state", file=sys.stderr)
+                    server_proc.terminate()
+                    server_proc.wait(timeout=5)
+                    log_fh.close()
+                    server_proc, log_fh = _restart_server(all_args, log_path, port)
 
-    # Exit nonzero if we produced no records
-    if not records:
+                rep_payload = dict(payload)
+                try:
+                    response = http_json(
+                        f"http://127.0.0.1:{port}/v1/completions",
+                        rep_payload,
+                        timeout=600,
+                    )
+                except (urllib.error.URLError, TimeoutError, json.JSONDecodeError) as exc:
+                    print(f"rep {rep}: request failed: {exc}", file=sys.stderr)
+                    # Record the error
+                    record = {
+                        "valid": False,
+                        "error_type": type(exc).__name__,
+                        "error_message": str(exc),
+                        "rep": rep,
+                        "provenance": provenance,
+                    }
+                    out_fh.write(json.dumps(record) + "\n")
+                    records.append(record)
+                    has_invalid = True
+                    continue
+                except Exception as exc:
+                    print(f"rep {rep}: unexpected error: {exc}", file=sys.stderr)
+                    # Record the error
+                    record = {
+                        "valid": False,
+                        "error_type": type(exc).__name__,
+                        "error_message": str(exc),
+                        "rep": rep,
+                        "provenance": provenance,
+                    }
+                    out_fh.write(json.dumps(record) + "\n")
+                    records.append(record)
+                    has_invalid = True
+                    continue
+
+                measurement = extract_measurement(response, args.prompt)
+                
+                # Always record, even if invalid
+                record = {
+                    "mode": args.mode,
+                    "prompt": args.prompt,
+                    "rep": rep,
+                    "request": rep_payload,
+                    "measurement": measurement,
+                    "log": str(log_path),
+                    "provenance": provenance,
+                }
+                records.append(record)
+                out_fh.write(json.dumps(record) + "\n")
+                
+                if not measurement["valid"]:
+                    has_invalid = True
+                valid_str = "OK" if measurement["valid"] else f"INVALID ({', '.join(measurement['invalid_reasons'])})"
+                print(f"rep {rep}: t/s={measurement['predicted_per_second']:.2f} "
+                      f"toks={measurement['tokens_predicted']} "
+                      f"finish={measurement['finish_reason']} {valid_str}")
+
+        print(f"wrote {len(records)} records to {output_path}")
+    finally:
+        # Write manifest alongside JSONL (always, even on partial runs)
+        try:
+            _write_manifest(output_path, provenance, args, records)
+        except Exception:
+            pass
+        # --- cleanup: always terminate server and close log ---
+        try:
+            server_proc.terminate()
+            server_proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            server_proc.kill()
+            server_proc.wait(timeout=5)
+        except Exception:
+            pass
+        try:
+            log_fh.close()
+        except Exception:
+            pass
+
+    # Exit nonzero if we produced no records OR any measured row is invalid
+    if not records or has_invalid:
         sys.exit(1)
+
+
+def _write_manifest(output_path, provenance, args, records):
+    """Write a manifest.json alongside the JSONL output."""
+    manifest_path = output_path.with_suffix(".manifest.json")
+    valid_count = sum(1 for r in records if r.get("measurement", {}).get("valid", False))
+    invalid_count = len(records) - valid_count
+    invalid_reasons = {}
+    for r in records:
+        for reason in r.get("measurement", {}).get("invalid_reasons", []):
+            invalid_reasons[reason] = invalid_reasons.get(reason, 0) + 1
+    manifest = {
+        "output_path": str(output_path),
+        "provenance": provenance,
+        "args": {
+            "mode": args.mode,
+            "prompt": args.prompt,
+            "repetitions": args.repetitions,
+            "gen_tokens": args.gen_tokens,
+        },
+        "total_records": len(records),
+        "valid_count": valid_count,
+        "invalid_count": invalid_count,
+        "invalid_reasons": invalid_reasons,
+    }
+    with open(manifest_path, "w", encoding="utf-8") as fh:
+        json.dump(manifest, fh, indent=2, default=str)
 
 
 def _restart_server(all_args, log_path, port):

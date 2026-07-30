@@ -84,15 +84,16 @@ class TestResponseValidation(unittest.TestCase):
         self.assertTrue(got["valid"])
 
     def test_rejects_spec_no_drafts(self):
-        """Speculative mode with draft_n=0 after prompt is invalid."""
+        """Speculative mode (MTP/DFlash) with draft_n=0 is invalid."""
         text = "Some valid code output here."
         response = {
             "choices": [{"text": text, "finish_reason": "stop"}],
             "usage": {"completion_tokens": 20},
             "timings": {"predicted_per_second": 20.0, "draft_n": 0, "draft_n_accepted": 0},
         }
-        got = MOD.extract_measurement(response, "coding")
-        # Note: spec_no_drafts check requires knowing mode; for now test the field is recorded
+        got = MOD.extract_measurement(response, "mtp")
+        self.assertFalse(got["valid"])
+        self.assertIn("spec_no_drafts", got["invalid_reasons"])
         self.assertEqual(got["draft_n"], 0)
 
 

@@ -64,9 +64,12 @@ def main():
     exit_code = 0
 
     for (mode, prompt), group in sorted(groups.items()):
-        # Separate valid and invalid records
-        valid_recs = [r for r in group if r.get("measurement", {}).get("valid", True)]
-        invalid_recs = [r for r in group if not r.get("measurement", {}).get("valid", True)]
+        # Separate valid, invalid, and error rows
+        # Error rows have no "measurement" key (HTTP/JSON/extraction failures)
+        measurement_rows = [r for r in group if "measurement" in r]
+        error_rows = [r for r in group if "measurement" not in r]
+        valid_recs = [r for r in measurement_rows if r["measurement"].get("valid", False)]
+        invalid_recs = [r for r in measurement_rows if not r["measurement"].get("valid", False)]
 
         print(f"\n=== {mode} / {prompt} ({len(valid_recs)} valid / {len(group)} total) ===")
         print(f"  revision:   {group[0].get('provenance', {}).get('source_head', '?')}")
@@ -85,9 +88,19 @@ def main():
                 print(f"    - {reason}: {count}")
             exit_code = 1
 
+        # Error rows summary (HTTP/JSON/extraction failures)
+        if error_rows:
+            print(f"\n  ERROR ROWS: {len(error_rows)}")
+            error_types = defaultdict(int)
+            for rec in error_rows:
+                error_types[rec.get("error_type", "unknown")] += 1
+            for etype, count in sorted(error_types.items()):
+                print(f"    - {etype}: {count}")
+            exit_code = 1
+
         # Throughput stats (only from valid records)
         tps_values = [r["measurement"]["predicted_per_second"]
-                      for r in valid_recs if r["measurement"]["predicted_per_second"] > 0]
+                      for r in valid_recs if r["measurement"].get("predicted_per_second", 0) > 0]
 
         if tps_values:
             stats = summary_stats(tps_values)
@@ -119,7 +132,7 @@ def main():
 
         # Draft token counts
         draft_n_values = [r["measurement"]["draft_n"]
-                          for r in group if "draft_n" in r.get("measurement", {})]
+                          for r in measurement_rows if r["measurement"].get("draft_n") is not None]
         if draft_n_values:
             print(f"  draft_n: {summary_stats(draft_n_values)}")
 
