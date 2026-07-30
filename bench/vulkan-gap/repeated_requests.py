@@ -4,6 +4,7 @@
 Tests MTP/DFlash correctness across repeated and concurrent requests without
 server restarts.
 """
+import sys
 import argparse
 import hashlib
 import json
