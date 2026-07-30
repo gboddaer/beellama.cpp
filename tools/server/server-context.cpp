@@ -2242,10 +2242,20 @@ private:
 
                 const int64_t t_start = ggml_time_us();
 
-                ret->prompt_save(*prompt_cache);
+                // For speculative slots, bypass prompt cache entirely to prevent
+                // stale KV state from being restored. The coordinated reset in
+                // launch_slot_with_task will handle clearing target/draft KV.
+                // This forces a full prefill from scratch for speculative modes.
+                if (ret->can_speculate()) {
+                    SRV_TRC("skipping prompt cache for speculative slot %d (forced full prefill)\n", ret->id);
+                    // Clear slot.prompt and n_past to force full prefill
+                    ret->prompt_clear(true);
+                } else {
+                    ret->prompt_save(*prompt_cache);
 
-                if (!ret->prompt_load(*prompt_cache, task.tokens)) {
-                    ret->prompt_clear(false);
+                    if (!ret->prompt_load(*prompt_cache, task.tokens)) {
+                        ret->prompt_clear(false);
+                    }
                 }
 
                 prompt_cache->update();
