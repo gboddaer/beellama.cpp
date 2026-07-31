@@ -8,6 +8,7 @@
 struct dflash_tape_gpu;
 struct dflash_hidden_gpu;
 
+
 #define LLAMA_MAX_SEQ 256
 
 struct llama_cparams {
@@ -20,6 +21,8 @@ struct llama_cparams {
     uint32_t n_outputs_max;   // max outputs supported by the context
     int32_t  n_threads;       // number of threads to use for generation
     int32_t  n_threads_batch; // number of threads to use for batch processing
+
+    int32_t  nextn_layer_offset = 0;
 
     float rope_freq_base;
     float rope_freq_scale;
@@ -47,6 +50,8 @@ struct llama_cparams {
     bool op_offload;
     bool kv_unified;
     bool pipeline_parallel;
+
+    std::vector<bool> embeddings_layer_inp; // [n_layer()] extract input embeddings for layer
 
     enum llama_context_type ctx_type;
     enum llama_pooling_type pooling_type;
@@ -121,4 +126,6 @@ struct llama_cparams {
 
     ggml_backend_sched_eval_callback cb_eval;
     void * cb_eval_user_data;
+
+    llama_context * ctx_other;
 };

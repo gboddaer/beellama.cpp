@@ -222,7 +222,6 @@ llama_build_and_test(test-jinja.cpp)
 llama_test(test-jinja NAME test-jinja-py ARGS -py LABEL python)
 llama_build_and_test(test-chat-auto-parser.cpp WORKING_DIRECTORY ${PROJECT_SOURCE_DIR})
 llama_build_and_test(test-chat-template.cpp)
-llama_build_and_test(test-json-partial.cpp)
 llama_build_and_test(test-log.cpp)
 llama_build_and_test(
     test-peg-parser.cpp
@@ -235,7 +234,6 @@ llama_build_and_test(
     peg-parser/test-unicode.cpp
     peg-parser/tests.h
 )
-llama_build_and_test(test-regex-partial.cpp)
 
 if (NOT ${CMAKE_SYSTEM_PROCESSOR} MATCHES "s390x")
     set(MODEL_NAME "tinyllamas/stories15M-q4_0.gguf")
@@ -258,15 +256,27 @@ llama_build_and_test(test-thread-safety.cpp ARGS -m "${MODEL_DEST}" -ngl 99 -p "
 set_tests_properties(test-thread-safety PROPERTIES FIXTURES_REQUIRED test-download-model)
 
 llama_build_and_test(test-arg-parser.cpp)
+llama_build_and_test(test-speculative.cpp)
 llama_build_and_test(test-adaptive-dm.cpp)
 llama_build_and_test(test-server-prompt-checkpoint.cpp)
 target_include_directories(test-server-prompt-checkpoint PRIVATE ${PROJECT_SOURCE_DIR}/tools/server ${PROJECT_SOURCE_DIR}/tools/mtmd)
 llama_build_and_test(test-dflash-ring.cpp)
 llama_build_and_test(test-cpu-out-prod.cpp)
 llama_build_and_test(test-cpu-fattn-support.cpp)
-llama_build_and_test(test-dflash-plumbing.cpp ARGS ${PROJECT_SOURCE_DIR})
-target_include_directories(test-dflash-plumbing PRIVATE ${PROJECT_SOURCE_DIR}/src)
-llama_build_and_test(test-mtmd-plumbing.cpp ARGS ${PROJECT_SOURCE_DIR})
+# test-dflash-plumbing calls the internal (non-LLAMA_API) symbol llm_arch_supports_rs_rollback
+# (src/llama-arch.h), which is not exported from llama.dll under WIN32+BUILD_SHARED_LIBS.
+# Upstream gates test-llama-archs the same way for the sibling llm_arch_supports_sm_tensor.
+if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
+    llama_build_and_test(test-dflash-plumbing.cpp ARGS ${PROJECT_SOURCE_DIR})
+    target_include_directories(test-dflash-plumbing PRIVATE ${PROJECT_SOURCE_DIR}/src)
+endif()
+llama_build_and_test(test-dflash-decode.cpp ${PROJECT_SOURCE_DIR}/tools/server/dflash-server-utils.cpp)
+target_include_directories(test-dflash-decode PRIVATE ${PROJECT_SOURCE_DIR}/tools/server ${PROJECT_SOURCE_DIR}/src ${PROJECT_SOURCE_DIR}/tools/mtmd ${PROJECT_SOURCE_DIR})
+# test-mtmd-plumbing.cpp removed: it was entirely 17 fork source-text grep guards
+# for the fork-only mtmd decoder_n_ubatch feature (not ported in this DFlash-scoped
+# merge; upstream mtmd kept). Per GLM review the text-grep guards are an anti-pattern
+# (test text, not behavior; break on every upstream restructure). Deleted outright.
+# The mtmd decoder_n_ubatch feature is deferred — see TASK_PROGRESS.md Phase 5g.
 llama_build_and_test(test-perplexity-plumbing.cpp ARGS ${PROJECT_SOURCE_DIR})
 
 if (NOT LLAMA_SANITIZE_ADDRESS AND NOT GGML_SCHED_NO_REALLOC)
@@ -299,6 +309,7 @@ if (NOT GGML_BACKEND_DL)
     llama_build_and_test(test-quantize-perf.cpp)
     llama_build_and_test(test-turbo-quant.c)
     llama_build_and_test(test-rope.cpp)
+    llama_build_and_test(test-col2im-1d.cpp)
 endif()
 
 # libmtmd
@@ -342,9 +353,9 @@ target_include_directories(test-ggml-op-coverage PRIVATE ${PROJECT_SOURCE_DIR}/g
 target_link_libraries(test-ggml-op-coverage PRIVATE ggml)
 add_test(NAME test-ggml-op-coverage COMMAND test-ggml-op-coverage)
 
-llama_build(export-graph-ops.cpp)
-target_include_directories(export-graph-ops PRIVATE ${PROJECT_SOURCE_DIR}/ggml/src)
+llama_build(test-export-graph-ops.cpp)
+target_include_directories(test-export-graph-ops PRIVATE ${PROJECT_SOURCE_DIR}/ggml/src)
 if (TARGET gguf-model-data)
-    target_link_libraries(export-graph-ops PRIVATE gguf-model-data)
-    target_compile_definitions(export-graph-ops PRIVATE LLAMA_HF_FETCH)
+    target_link_libraries(test-export-graph-ops PRIVATE gguf-model-data)
+    target_compile_definitions(test-export-graph-ops PRIVATE LLAMA_HF_FETCH)
 endif()

@@ -1,0 +1,1 @@
+Solve step by step: A train leaves station A at 60 km/h heading east. Another leaves station B, 240 km east of A, at 40 km/h heading west. After how many hours do they meet? Show the reasoning then the answer.

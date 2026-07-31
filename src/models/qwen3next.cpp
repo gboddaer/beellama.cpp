@@ -1,5 +1,4 @@
 #include "models.h"
-#include "llama-context.h"
 #include "llama-memory-recurrent.h"
 
 void llama_model_qwen3next::load_arch_hparams(llama_model_loader & ml) {
@@ -15,15 +14,15 @@ void llama_model_qwen3next::load_arch_hparams(llama_model_loader & ml) {
     ml.get_key(LLM_KV_SSM_GROUP_COUNT,    hparams.ssm_n_group);
 
     // Mark recurrent layers (linear attention layers)
-    {
+    if (!ml.get_key_or_arr(LLM_KV_ATTENTION_RECURRENT_LAYERS, hparams.is_recr_impl, hparams.n_layer_all, false)) {
         uint32_t full_attn_interval = 4;
         ml.get_key(LLM_KV_FULL_ATTENTION_INTERVAL, full_attn_interval, false);
-        for (uint32_t i = 0; i < hparams.n_layer; ++i) {
-            hparams.recurrent_layer_arr[i] = ((i + 1) % full_attn_interval != 0);
+        for (uint32_t i = 0; i < hparams.n_layer_all; ++i) {
+            hparams.is_recr_impl[i] = (i < hparams.n_layer()) && ((i + 1) % full_attn_interval != 0);
         }
     }
 
-    switch (hparams.n_layer) {
+    switch (hparams.n_layer()) {
         case 48: type = LLM_TYPE_80B_A3B; break;
         default: type = LLM_TYPE_UNKNOWN;
     }
@@ -69,7 +68,7 @@ void llama_model_qwen3next::load_arch_tensors(llama_model_loader &) {
         layer.attn_norm      = create_tensor(tn(LLM_TENSOR_ATTN_NORM,      "weight", i), { n_embd }, 0);
         layer.attn_post_norm = create_tensor(tn(LLM_TENSOR_ATTN_POST_NORM, "weight", i), { n_embd }, 0);
 
-        if (!hparams.is_recurrent(i)) {
+        if (!hparams.is_recr(i)) {
             // Attention layers
             create_tensor_qkv(layer, i, n_embd, n_embd_head_k * n_head * 2, n_embd_k_gqa, n_embd_v_gqa, 0);
             layer.wo = create_tensor(tn(LLM_TENSOR_ATTN_OUT, "weight", i), { n_embd_head_k * n_head, n_embd }, 0);
@@ -121,13 +120,6 @@ llama_model_qwen3next::graph::graph(const llama_model & model, const llm_graph_p
     ggml_tensor * inp_pos     = build_inp_pos();
     ggml_tensor * inp_out_ids = build_inp_out_ids();
 
-    // DFlash GPU hidden-capture window sizing (mirrors qwen35).
-    const int64_t n_seq_tokens = ubatch.n_seq_tokens;
-    const int64_t dflash_capture_n_seqs =
-        ubatch.n_seqs_unq > 1 ? (int64_t) ubatch.n_seqs_unq : 1;
-    const int64_t dflash_capture_n_tokens =
-        ubatch.n_seqs_unq > 1 ? n_seq_tokens : (int64_t) ubatch.n_tokens;
-
     for (int il = 0; il < n_layer; ++il) {
         ggml_tensor * inpSA = inpL;
 
@@ -137,7 +129,7 @@ llama_model_qwen3next::graph::graph(const llama_model & model, const llm_graph_p
         ggml_build_forward_expand(gf, cur);
 
         // Determine layer type and build appropriate attention mechanism
-        if (hparams.is_recurrent(il)) {
+        if (hparams.is_recr(il)) {
             // Linear attention layer (gated delta net)
             cur = build_layer_attn_linear(inp->get_recr(), cur, il);
         } else {
@@ -171,77 +163,6 @@ llama_model_qwen3next::graph::graph(const llama_model & model, const llm_graph_p
 
         cur = build_cvec(cur, il);
         cb(cur, "l_out", il);
-
-        // DFlash GPU hidden capture (ported from qwen35): copy this layer's output into the
-        // per-slot device-resident hidden_gpu tensors so the drafter cross-ring can D2D-copy
-        // them into the ring (no CPU readback). Gated by hidden_gpu_n_seqs; only layers listed
-        // in hgpu->layer_ids are captured. Runs on the target backend (Vulkan/CUDA).
-        if (cparams.hidden_gpu_n_seqs > 0 &&
-            cur->ne[1] == dflash_capture_n_tokens * dflash_capture_n_seqs) {
-            for (int s = 0; s < (int) dflash_capture_n_seqs && s < cparams.hidden_gpu_n_seqs; ++s) {
-                auto * hgpu = cparams.hidden_gpu_seqs[s];
-                if (!hgpu) {
-                    continue;
-                }
-                int hi = -1;
-                for (int i = 0; i < (int) hgpu->layer_ids.size(); ++i) {
-                    if (hgpu->layer_ids[i] == il) {
-                        hi = i;
-                        break;
-                    }
-                }
-                if (hi < 0 || dflash_capture_n_tokens > hgpu->max_tokens) {
-                    continue;
-                }
-                ggml_tensor * h_slice = ggml_view_2d(ctx0, cur,
-                    cur->ne[0], dflash_capture_n_tokens,
-                    cur->nb[1],
-                    (size_t) s * (size_t) dflash_capture_n_tokens * cur->nb[1]);
-                ggml_tensor * h_cont = ggml_cont(ctx0, h_slice);
-                ggml_tensor * h_dst = ggml_view_2d(ctx0, hgpu->layers[hi],
-                    hgpu->layers[hi]->ne[0], (int64_t) dflash_capture_n_tokens,
-                    hgpu->layers[hi]->nb[1], 0);
-                ggml_build_forward_expand(gf, ggml_cpy(ctx0, h_cont, h_dst));
-            }
-        }
-        if (cparams.prefill_gpu_n_seqs > 0 &&
-            cparams.dflash_prefill_capture_active &&
-            cparams.dflash_prefill_n_tokens > 0 &&
-            cur->ne[1] == dflash_capture_n_tokens * dflash_capture_n_seqs) {
-            for (int s = 0; s < (int) dflash_capture_n_seqs && s < cparams.prefill_gpu_n_seqs; ++s) {
-                const int n_copy  = cparams.dflash_prefill_n_tokens_seqs[s];
-                const int src_off = cparams.dflash_prefill_src_offsets[s];
-                const int dst_off = cparams.dflash_prefill_dst_offsets[s];
-                if (n_copy <= 0 || src_off < 0 || src_off + n_copy > dflash_capture_n_tokens) {
-                    continue;
-                }
-                auto * pgpu = cparams.prefill_gpu_seqs[s];
-                if (!pgpu) {
-                    continue;
-                }
-                int hi = -1;
-                for (int i = 0; i < (int) pgpu->layer_ids.size(); ++i) {
-                    if (pgpu->layer_ids[i] == il) {
-                        hi = i;
-                        break;
-                    }
-                }
-                if (hi < 0 || dst_off < 0 || dst_off + n_copy > pgpu->max_tokens) {
-                    continue;
-                }
-                ggml_tensor * h_slice = ggml_view_2d(ctx0, cur,
-                    cur->ne[0], (int64_t) n_copy,
-                    cur->nb[1],
-                    (size_t) s * (size_t) dflash_capture_n_tokens * cur->nb[1] +
-                    (size_t) src_off * cur->nb[1]);
-                ggml_tensor * h_cont = ggml_cont(ctx0, h_slice);
-                ggml_tensor * h_dst = ggml_view_2d(ctx0, pgpu->layers[hi],
-                    pgpu->layers[hi]->ne[0], (int64_t) n_copy,
-                    pgpu->layers[hi]->nb[1],
-                    (size_t) dst_off * pgpu->layers[hi]->nb[1]);
-                ggml_build_forward_expand(gf, ggml_cpy(ctx0, h_cont, h_dst));
-            }
-        }
 
         // Input for next layer
         inpL = cur;
@@ -290,9 +211,6 @@ ggml_tensor * llama_model_qwen3next::graph::build_layer_attn(
     const int64_t n_embd_head = hparams.n_embd_head_v();
     GGML_ASSERT(n_embd_head == hparams.n_embd_head_k());
 
-    // Per-layer n_head_kv (may differ from scalar in RYS models)
-    const int64_t n_head_kv_il = hparams.n_head_kv(il);
-
     // Order: joint QG projection, QG split, Q norm, KV projection, K norm, RoPE, attention
 
     // Qwen3Next uses a single Q projection that outputs query + gate
@@ -310,7 +228,7 @@ ggml_tensor * llama_model_qwen3next::graph::build_layer_attn(
     ggml_tensor * gate =
         ggml_view_4d(ctx0, Qcur_full, n_embd_head, n_head, n_tokens, 1,
                      Qcur_full->nb[1], Qcur_full->nb[2], Qcur_full->nb[3], n_embd_head * ggml_element_size(Qcur_full));
-    cb(gate, "attn_gate", il);
+    cb(gate, "gate", il);
 
     ggml_tensor * Kcur = build_lora_mm(model.layers[il].wk, cur);
     cb(Kcur, "Kcur", il);
@@ -318,8 +236,8 @@ ggml_tensor * llama_model_qwen3next::graph::build_layer_attn(
     ggml_tensor * Vcur = build_lora_mm(model.layers[il].wv, cur);
     cb(Vcur, "Vcur", il);
 
-    Kcur = ggml_reshape_3d(ctx0, Kcur, n_embd_head, n_head_kv_il, n_tokens);
-    Vcur = ggml_reshape_3d(ctx0, Vcur, n_embd_head, n_head_kv_il, n_tokens);
+    Kcur = ggml_reshape_3d(ctx0, Kcur, n_embd_head, n_head_kv, n_tokens);
+    Vcur = ggml_reshape_3d(ctx0, Vcur, n_embd_head, n_head_kv, n_tokens);
 
     Qcur = build_norm(Qcur, model.layers[il].attn_q_norm, nullptr, LLM_NORM_RMS, il);
     cb(Qcur, "Qcur_normed", il);

@@ -390,6 +390,9 @@ llama_context::llama_context(
 
     cparams.fused_gdn_ar = !params.no_fused_gdn;
     cparams.fused_gdn_ch = !params.no_fused_gdn;
+    if (std::getenv("GGML_DFLASH_DISABLE_FGDN_CH")) {
+        cparams.fused_gdn_ch = false;
+    }
     cparams.auto_fgdn    = !params.no_fused_gdn;
 
     // with causal attention, the batch size is limited by the context size
@@ -514,10 +517,12 @@ llama_context::llama_context(
     // init the memory module
     if (!hparams.vocab_only) {
         llama_memory_params params_mem = {
-            /*.type_k   =*/ params.type_k,
-            /*.type_v   =*/ params.type_v,
-            /*.swa_full =*/ params.swa_full,
-            /*.ctx_type =*/ cparams.ctx_type,
+            params.type_k,
+            params.type_v,
+            params.swa_full,
+            cparams.ctx_type,
+            nullptr,
+            nullptr,
         };
 
         memory.reset(model.create_memory(params_mem, cparams));
@@ -555,7 +560,7 @@ llama_context::llama_context(
         // enabling pipeline parallelism in the scheduler increases memory usage, so it is only done when necessary
         bool pipeline_parallel =
             model.n_devices() > 1 &&
-            model.n_gpu_layers() > model.hparams.n_layer &&
+            model.n_gpu_layers() > model.hparams.n_layer() &&
             model.split_mode() == LLAMA_SPLIT_MODE_LAYER &&
             cparams.offload_kqv &&
             !model.has_tensor_overrides();
@@ -1596,7 +1601,7 @@ static bool dflash_eval_callback(struct ggml_tensor * t, bool ask, void * user_d
         }
         if (cap->tape_enabled) {
             if (dflash_diagnostic_debug_enabled()) {
-                const char * nm = t->name ? t->name : "";
+                const char * nm = t->name;
                 if (strstr(nm, "qkv") || strstr(nm, "mixed")) {
                     fprintf(stderr, "[dflash-tape-cb] check name='%s' in_map=%d\n", nm, (int)cap->tape_name_map.count(t->name));
                 }
@@ -2040,7 +2045,7 @@ void llama_context::dflash_ensure_recurrent_setup() {
         return;
     }
     const auto & hparams = model.hparams;
-    for (uint32_t il = 0; il < hparams.n_layer; ++il) {
+    for (uint32_t il = 0; il < hparams.n_layer(); ++il) {
         if (hparams.is_recurrent(il)) {
             int idx = (int) dflash_capture->recurrent_layer_ids.size();
             dflash_capture->recurrent_layer_ids.push_back(il);
@@ -2095,15 +2100,23 @@ void llama_context::set_tape_recording(bool enable) {
 
     // expose to graph builder via cparams — populate all tape pointers so graph
     // reservation accounts for worst-case per-seq copy ops.
+    //
+    // NOTE: When called per-decode (not during sched_reserve), we must NOT
+    // clobber tape_gpu_n_seqs/tape_gpu_seqs — the decode path manages those
+    // based on actual per-sequence usage. Overwriting them here with the
+    // worst-case n_tapes causes seqs_changed=true every decode, preventing
+    // graph reuse. Only populate if not already set; decode manages the rest.
     if (enable && !dflash_capture->tapes.empty()) {
-        const int n_tapes = (int) dflash_capture->tapes.size();
-        cparams.tape_gpu = dflash_capture->tapes[0].get();
-        cparams.tape_gpu_n_seqs = n_tapes;
-        for (int s = 0; s < n_tapes && s < (int) LLAMA_DFLASH_MAX_SLOTS; ++s) {
-            cparams.tape_gpu_seqs[s] = dflash_capture->tapes[s].get();
-        }
-        for (int s = n_tapes; s < (int) LLAMA_DFLASH_MAX_SLOTS; ++s) {
-            cparams.tape_gpu_seqs[s] = nullptr;
+        if (cparams.tape_gpu == nullptr) {
+            const int n_tapes = (int) dflash_capture->tapes.size();
+            cparams.tape_gpu = dflash_capture->tapes[0].get();
+            cparams.tape_gpu_n_seqs = n_tapes;
+            for (int s = 0; s < n_tapes && s < (int) LLAMA_DFLASH_MAX_SLOTS; ++s) {
+                cparams.tape_gpu_seqs[s] = dflash_capture->tapes[s].get();
+            }
+            for (int s = n_tapes; s < (int) LLAMA_DFLASH_MAX_SLOTS; ++s) {
+                cparams.tape_gpu_seqs[s] = nullptr;
+            }
         }
     } else {
         cparams.tape_gpu = nullptr;
@@ -2914,7 +2927,7 @@ int llama_context::tape_replay(llama_seq_id seq_id, int n_accepted) {
                 s_byte_offset);
 
             // GDN op: same kernel as forward pass, bit-identical state update
-            ggml_tensor * result = ggml_gated_delta_net(ctx, q_in, k_in, v_in, g_in, b_sigmoid, s_view);
+            ggml_tensor * result = ggml_gated_delta_net(ctx, q_in, k_in, v_in, g_in, b_sigmoid, s_view, 1);
 
             // extract state from result (layout: [attn_output | new_state])
             size_t attn_bytes = (size_t)(S * H_v * n_accepted) * ggml_element_size(result);
@@ -4118,7 +4131,11 @@ int llama_context::tape_replay_cpu(llama_memory_recurrent * mem_recurrent, int32
     return results.empty() ? n_accepted : 0;
 }
 
+#if defined(_MSC_VER)
+__declspec(noinline)
+#else
 __attribute__((noinline))
+#endif
 int llama_context::dflash_rollback(llama_seq_id seq_id, llama_seq_id seq_backup, int n_past_before, int n_accepted) {
     auto * mem_hybrid = dynamic_cast<llama_memory_hybrid *>(memory.get());
     if (!mem_hybrid) {
@@ -4179,10 +4196,13 @@ int llama_context::dflash_rollback(llama_seq_id seq_id, llama_seq_id seq_backup,
     {
         n_positions_needing_reeval = tape_replay(seq_id, n_accepted);
         if (n_positions_needing_reeval > 0) {
-            // Tape replay was skipped (e.g., Vulkan). The recurrent state is behind
-            // by n_positions_needing_reeval positions. Trim the attention memory
-            // to match the recurrent state, so seq_pos_max is consistent.
             mem_attn->seq_rm(seq_id, n_past_before, -1);
+            // Remove accepted positions from recurrent state so server-side
+            // re-evaluation does not duplicate positions already in the backup.
+            if (!mem_recr->seq_rm(seq_id, n_past_before, n_past_before + n_accepted)) {
+                LLAMA_LOG_WARN("%s: failed to roll back recurrent state for seq %d\n", __func__, (int) seq_id);
+                return -1;
+            }
         }
     }
     profile_lap(tape_launch_us);
@@ -4473,7 +4493,7 @@ bool llama_context::dflash_kv_cache_init(int ctx_size) {
         return false;
     }
 
-    const int n_layers = (int) model.hparams.n_layer;
+    const int n_layers = (int) model.hparams.n_layer();
     const int64_t n_embd_head = model.hparams.n_embd_head_v();
     const int64_t n_head_kv = model.hparams.n_head_kv();
     const int n_elem = (int) (n_embd_head * n_head_kv);
@@ -5423,7 +5443,7 @@ void llama_context::allocate_tree_buffers(int max_tree_tokens) {
 
     // Count recurrent layers
     int n_recurrent = 0;
-    for (uint32_t i = 0; i < hparams.n_layer; ++i) {
+    for (uint32_t i = 0; i < hparams.n_layer(); ++i) {
         if (hparams.is_recurrent(i)) {
             n_recurrent++;
         }
@@ -5530,7 +5550,7 @@ void llama_context::tree_rollback(llama_seq_id seq_id, llama_seq_id seq_backup, 
 
     // Count recurrent layers
     int n_rec = 0;
-    for (uint32_t il = 0; il < hparams.n_layer; ++il) {
+    for (uint32_t il = 0; il < hparams.n_layer(); ++il) {
         if (hparams.is_recurrent(il)) n_rec++;
     }
 
@@ -5544,7 +5564,7 @@ void llama_context::tree_rollback(llama_seq_id seq_id, llama_seq_id seq_backup, 
         struct ggml_cgraph * graph = ggml_new_graph_custom(ctx, n_rec * 4, false);
 
         int recurrent_idx = 0;
-        for (uint32_t il = 0; il < hparams.n_layer; ++il) {
+        for (uint32_t il = 0; il < hparams.n_layer(); ++il) {
             if (!hparams.is_recurrent(il)) continue;
 
             ggml_tensor * inter = tree_bufs.ssm_intermediates[recurrent_idx];
@@ -5930,10 +5950,10 @@ bool llama_context::resize_recurrent_memory(uint32_t new_n_seq_max, bool expand)
         return true;
     }
 
-    synchronize();
-
+    const uint32_t old_size = recr->size;
     const bool ok = expand ? recr->expand(new_n_seq_max) : recr->shrink(new_n_seq_max);
-    if (ok) {
+    if (ok && recr->size != old_size) {
+        synchronize();
         sched_need_reserve = true;
         if (gf_res_prev) {
             gf_res_prev->reset();
@@ -6449,6 +6469,21 @@ int llama_context::decode(const llama_batch & batch_inp) {
         return -1;
     }
 
+    // Save n_outputs for re-eval batches (all logits=false) so the decode
+    // doesn't clobber the output state that subsequent post_decode calls
+    // in the same update_slots iteration rely on.
+    bool has_any_logits = false;
+    if (batch_inp.logits) {
+        for (int32_t i = 0; i < batch_inp.n_tokens; ++i) {
+            if (batch_inp.logits[i]) {
+                has_any_logits = true;
+                break;
+            }
+        }
+    }
+    const uint32_t saved_n_outputs = has_any_logits ? 0 : this->n_outputs;
+    const bool save_n_outputs = !has_any_logits;
+
     const auto & vocab   = model.vocab;
     const auto & hparams = model.hparams;
 
@@ -6942,8 +6977,16 @@ int llama_context::decode(const llama_batch & batch_inp) {
                         dflash_capture_n_tokens <= LLAMA_DFLASH_MAX_VERIFY_TOKENS;
                     const int tape_ns = dflash_graph_tape_ready ? ns : 0;
                     const int prev_tape_ns = cparams.tape_gpu_n_seqs;
+                    const int prev_hidden_ns = cparams.hidden_gpu_n_seqs;
 
                     bool seqs_changed = (tape_ns != prev_tape_ns);
+                    // Invalidate graph when hidden_gpu_n_seqs changes (0→1 transition
+                    // from prefill to generation). Without this, the graph is cached
+                    // from prefill (no hidden_gpu copy in qwen35.cpp graph builder)
+                    // and reused for generation, so hidden_gpu stays empty (HF-039/040).
+                    if (prev_hidden_ns != cparams.hidden_gpu_n_seqs) {
+                        seqs_changed = true;
+                    }
 
                     for (int s = 0; s < ns; ++s) {
                         const llama_seq_id seq = ubatch.seq_id_unq[s];
@@ -6991,14 +7034,34 @@ int llama_context::decode(const llama_batch & batch_inp) {
                     // track active slot for single-seq (used by active_tape() in eval callback)
                     if (ubatch.n_seqs_unq == 1) {
                         const llama_seq_id seq = ubatch.seq_id_unq[0];
-                        if (seq >= 0 && seq < (int) dflash_capture->tapes.size()) {
+                        // Set the active slot unconditionally (the active_tape()/active_hidden_gpu()/
+                        // active_slot_hiddens() accessors all bounds-check against their own
+                        // vectors). Previously this was gated on seq < tapes.size(), but
+                        // `tapes` is the tree-verify buffer (size 0/1 for flat DFlash), so
+                        // for multi-slot non-zero slots active_tape_idx was never updated and
+                        // the eval callback captured into the stale slot's layer_hiddens.
+                        if (seq >= 0) {
                             dflash_capture->active_tape_idx = seq;
                         }
                     }
                     }
 
+                    // Only skip the CPU eval callback when the prefill is actually being
+                    // captured by the GPU prefill-staging path (dflash_use_prefill_staging).
+                    // When staging is not used (short prefill spans, or the prefill plan isn't
+                    // active at decode time), keep the eval callback on so the CPU
+                    // layer_hiddens capture feeds flush_prefill's CPU branch. Previously this
+                    // was gated on dflash_graph_hidden_ready (hidden_gpu presence), which
+                    // disabled the eval callback in multi-slot mode (hidden_gpu allocated via
+                    // allocate_slots) even when the prefill wasn't using staging — leaving
+                    // no capture path at all (eval callback OFF AND staging OFF -> captured=0
+                    // -> prefill flush mismatch -> DFlash disabled). Keeping the eval callback
+                    // on during generation too is harmless (hidden_gpu still captures for the
+                    // ring; layer_hiddens is simply unused then) at the cost of some CPU
+                    // callback overhead.
                     dflash_skip_eval_callback =
-                        dflash_graph_hidden_ready || dflash_suppress_callback_for_view;
+                        dflash_use_prefill_staging || dflash_suppress_callback_for_view ||
+                        dflash_graph_hidden_ready;
 
                     const bool dflash_meta_backend_active =
                         dflash_context_has_meta_backend(backends) ||
@@ -7103,10 +7166,12 @@ int llama_context::decode(const llama_batch & batch_inp) {
             LLAMA_LOG_INFO("%s: dflash crash breadcrumb: after process_ubatch res=%p status=%d tokens=%u outputs=%u\n",
                     __func__, (const void *) res, (int) status, ubatch.n_tokens, n_outputs);
         }
-        // DFlash GPU graph capture writes hidden tensors on GGML's CUDA stream,
-        // while the cross-ring D2D copies run on cudaStreamPerThread. Prefer a
-        // CUDA event dependency between those streams; fall back to the full
-        // scheduler sync for CPU callback capture or backends without the helper.
+        // DFlash GPU graph capture writes hidden tensors on GGML's backend stream.
+        // dflash_wait_for_gpu_capture_stream() establishes a lightweight GPU-side
+        // dependency (CUDA: event-based stream wait; Vulkan: no-op since
+        // ggml_backend_sched_synchronize provides the sync). The scheduler sync
+        // below is the authoritative synchronization point — called unconditionally
+        // for all backends and all capture modes.
         const bool dflash_gpu_capture_stream_ready =
             dflash_capture && dflash_wait_for_gpu_capture_stream();
         if (dflash_capture && dflash_crash_trace_enabled()) {
@@ -7119,16 +7184,13 @@ int llama_context::decode(const llama_batch & batch_inp) {
                     cparams.tape_gpu_n_seqs,
                     (void *) cparams.cb_eval);
         }
-        if (dflash_capture && !dflash_gpu_capture_stream_ready) {
-            const int64_t t_sync_start_us = dflash_capture->profile ? ggml_time_us() : 0;
+        if (dflash_capture) {
+            const int64_t t_sync_start_us =
+                dflash_capture->profile && dflash_profile_sync_split_enabled() ? ggml_time_us() : 0;
             ggml_backend_sched_synchronize(sched.get());
             if (dflash_capture->profile && dflash_profile_sync_split_enabled()) {
                 dflash_capture->profile_verify_sync_split_us += ggml_time_us() - t_sync_start_us;
             }
-        } else if (dflash_capture && dflash_capture->profile && dflash_profile_sync_split_enabled()) {
-            const int64_t t_sync_start_us = ggml_time_us();
-            ggml_backend_sched_synchronize(sched.get());
-            dflash_capture->profile_verify_sync_split_us += ggml_time_us() - t_sync_start_us;
         }
         if (dflash_capture && dflash_crash_trace_enabled()) {
             LLAMA_LOG_INFO("%s: dflash crash breadcrumb: after decode sync capture_stream_ready=%d tokens=%u\n",
@@ -7445,6 +7507,11 @@ int llama_context::decode(const llama_batch & batch_inp) {
         dflash_profile_log(*dflash_capture, __func__, n_vocab);
     }
 
+    // Restore n_outputs for re-eval batches (all logits=false).
+    if (save_n_outputs) {
+        this->n_outputs = saved_n_outputs;
+    }
+
     return 0;
 }
 
@@ -7591,7 +7658,13 @@ uint32_t llama_context::output_reserve(int32_t n_outputs) {
     }
 
     // set all ids as invalid (negative)
-    std::fill(output_ids.begin(), output_ids.end(), -1);
+    // For re-eval batches (n_outputs=0, all logits=false) skip the fill so
+    // output_ids entries from the prior successful decode survive. The
+    // decode() caller saves/restores n_outputs around such calls, so the
+    // output buffer remains correctly sized.
+    if (n_outputs > 0) {
+        std::fill(output_ids.begin(), output_ids.end(), -1);
+    }
 
     this->n_outputs = 0;
 
@@ -7833,7 +7906,7 @@ llm_graph_cb llama_context::graph_get_cb() const {
 
         // norm may be automatically assigned to the backend of the previous layer, increasing data transfer between backends
         // FIXME: fix in ggml_backend_sched
-        const bool full_offload = model.n_gpu_layers() > model.hparams.n_layer;
+        const bool full_offload = model.n_gpu_layers() > model.hparams.n_layer();
         if (ubatch.n_tokens < 32 || full_offload) {
             if (il != -1 && strcmp(name, "norm") == 0) {
                 const auto & dev_layer = model.dev_layer(il);
@@ -8554,6 +8627,7 @@ llama_context_params llama_context_default_params() {
         /*.n_sampler                   =*/ 0,
         /*.dflash_n_slots              =*/ 1,
         /*.dflash_cross_ctx            =*/ 512,
+        /*.ctx_other                 =*/ nullptr,
     };
 
     return result;
@@ -8595,7 +8669,7 @@ llama_context * llama_init_from_model(
 
     if (params.flash_attn_type != LLAMA_FLASH_ATTN_TYPE_DISABLED && ggml_is_quantized(params.type_k)) {
         const uint32_t blck_size = ggml_blck_size(params.type_k);
-        for (uint32_t il = 0; il < model->hparams.n_layer; ++il) {
+        for (uint32_t il = 0; il < model->hparams.n_layer(); ++il) {
             if (model->hparams.n_embd_head_k(il) % blck_size != 0) {
                 LLAMA_LOG_ERROR("%s: K cache type %s with block size %u does not divide n_embd_head_k=%u\n",
                     __func__, ggml_type_name(params.type_k), blck_size, model->hparams.n_embd_head_k(il));
@@ -8606,7 +8680,7 @@ llama_context * llama_init_from_model(
 
     if (params.flash_attn_type != LLAMA_FLASH_ATTN_TYPE_DISABLED && ggml_is_quantized(params.type_v)) {
         const uint32_t blck_size = ggml_blck_size(params.type_v);
-        for (uint32_t il = 0; il < model->hparams.n_layer; ++il) {
+        for (uint32_t il = 0; il < model->hparams.n_layer(); ++il) {
             if (model->hparams.n_embd_head_v(il) % blck_size != 0) {
                 LLAMA_LOG_ERROR("%s: V cache type %s with block size %u does not divide n_embd_head_v=%u\n",
                     __func__, ggml_type_name(params.type_v), blck_size, model->hparams.n_embd_head_v(il));
@@ -8637,11 +8711,7 @@ llama_context * llama_init_from_model(
                        model->hparams.pooling_type, params.pooling_type);
     }
 
-    if (params.ctx_type == LLAMA_CONTEXT_TYPE_MTP &&
-        model->hparams.nextn_predict_layers == 0) {
-        LLAMA_LOG_WARN("%s: context type MTP requested but model doesn't contain MTP layers\n", __func__);
-        return nullptr;
-    }
+
 
     try {
         auto * ctx = new llama_context(*model, params);
@@ -8953,6 +9023,11 @@ struct dflash_cross_ring_handle {
     // Null on CUDA (CUDA uses the raw-ptr variants above); the raw variants are null on Vulkan.
     void   (*fn_set_tensor_tensor)(ggml_tensor *, const void *, size_t, size_t);
     bool   (*fn_write_d2d_tensor)(void *, int, int, ggml_tensor *, int, int, int);
+    // Batch D2D copy: begin/end batching of multiple D2D copies into one submit+wait
+    void   (*fn_begin_batch)(void *);
+    void   (*fn_end_batch)(void *);
+    // Phase 4: wait for a pending deferred interleave
+    void   (*fn_wait_interleave)(void *);
 };
 
 void * llama_context::init_cross_ring_gpu(int n_layers, int n_embd, int ring_size) {
@@ -8981,6 +9056,9 @@ void * llama_context::init_cross_ring_gpu(int n_layers, int n_embd, int ring_siz
     using set_tensor_fn_t = void   (*)(void *, const void *, size_t, size_t);
     using set_tensor_tensor_fn_t = void (*)(ggml_tensor *, const void *, size_t, size_t);
     using write_d2d_tensor_fn_t  = bool (*)(void *, int, int, ggml_tensor *, int, int, int);
+    using begin_batch_fn_t = void (*)(void *);
+    using end_batch_fn_t  = void (*)(void *);
+    using wait_interleave_fn_t = void (*)(void *);
 
     auto fn_alloc_device = (alloc_device_fn_t)
         ggml_backend_reg_get_proc_address(cuda_reg, "dflash_cross_ring_gpu_alloc_device");
@@ -8995,6 +9073,9 @@ void * llama_context::init_cross_ring_gpu(int n_layers, int n_embd, int ring_siz
     // Tensor variants (Vulkan-only). Null on CUDA, which uses the raw variants above.
     auto fn_set_tensor_tensor = (set_tensor_tensor_fn_t) ggml_backend_reg_get_proc_address(cuda_reg, "dflash_cross_ring_gpu_set_tensor_tensor");
     auto fn_write_d2d_tensor  = (write_d2d_tensor_fn_t)  ggml_backend_reg_get_proc_address(cuda_reg, "dflash_cross_ring_gpu_write_d2d_tensor");
+    auto fn_begin_batch = (begin_batch_fn_t) ggml_backend_reg_get_proc_address(cuda_reg, "dflash_cross_ring_gpu_begin_batch");
+    auto fn_end_batch   = (end_batch_fn_t)   ggml_backend_reg_get_proc_address(cuda_reg, "dflash_cross_ring_gpu_end_batch");
+    auto fn_wait_interleave = (wait_interleave_fn_t) ggml_backend_reg_get_proc_address(cuda_reg, "dflash_cross_ring_gpu_wait_interleave");
 
     // Need the 7 shared fns, plus at least one of each {set_tensor, set_tensor_tensor} / {write_d2d, write_d2d_tensor} pair.
     if (!fn_alloc || !fn_free || !fn_write || !fn_sync || !fn_snapshot || !fn_interleave) {
@@ -9024,6 +9105,9 @@ void * llama_context::init_cross_ring_gpu(int n_layers, int n_embd, int ring_siz
     handle->fn_set_tensor = fn_set_tensor;
     handle->fn_set_tensor_tensor = fn_set_tensor_tensor;
     handle->fn_write_d2d_tensor  = fn_write_d2d_tensor;
+    handle->fn_begin_batch = fn_begin_batch;
+    handle->fn_end_batch   = fn_end_batch;
+    handle->fn_wait_interleave = fn_wait_interleave;
     return handle;
 }
 
@@ -9255,6 +9339,24 @@ void llama_dflash_cross_ring_gpu_set_cross(
     ctx->set_cross_data_gpu(seq_id, d_staging, cross_len, n_layers, n_embd, h->fn_set_tensor, h->fn_set_tensor_tensor);
 }
 
+void llama_dflash_cross_ring_gpu_begin_batch(void * handle) {
+    if (!handle) return;
+    auto * h = (dflash_cross_ring_handle *)handle;
+    if (h->fn_begin_batch) h->fn_begin_batch(h->gpu_ring);
+}
+
+void llama_dflash_cross_ring_gpu_end_batch(void * handle) {
+    if (!handle) return;
+    auto * h = (dflash_cross_ring_handle *)handle;
+    if (h->fn_end_batch) h->fn_end_batch(h->gpu_ring);
+}
+
+void llama_dflash_cross_ring_gpu_wait_interleave(void * handle) {
+    if (!handle) return;
+    auto * h = (dflash_cross_ring_handle *)handle;
+    if (h->fn_wait_interleave) h->fn_wait_interleave(h->gpu_ring);
+}
+
 // DFlash: dump captured hidden states to file for drafter training
 int64_t llama_context::dflash_dump_hidden_states(const char * path) {
     auto * cap = dflash_capture.get();
@@ -9292,7 +9394,7 @@ int64_t llama_context::dflash_dump_hidden_states(const char * path) {
             for (int64_t t = 0; t < buf.n_tokens; t++) {
                 const float * row = buf.data.data() + (size_t) t * buf.n_embd;
                 int32_t token_id = (t < (int64_t) buf.token_ids.size()) ? buf.token_ids[t] : -1;
-                fprintf(f, "%d %zu %ld %d ", slot, h, t, token_id);
+                fprintf(f, "%d %zu %lld %d ", slot, h, (long long) t, token_id);
                 for (int64_t e = 0; e < buf.n_embd; e++) {
                     if (e) fprintf(f, " ");
                     fprintf(f, "%.8g", row[e]);

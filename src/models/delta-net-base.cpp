@@ -3,7 +3,6 @@
 #include "llama-impl.h"
 #include "llama-context.h"   // llama_dflash_rs_writeback_slot_for_test (RS snapshot write-back decision)
 #include "llama-memory-recurrent.h"
-#include "ggml.h"
 
 // utility to get one slice from the third dimension
 // input dim:  [x, y, c, b]
@@ -400,7 +399,8 @@ std::pair<ggml_tensor *, ggml_tensor *> llm_build_delta_net_base::build_delta_ne
     GGML_ASSERT(b->ne[0] == 1   && b->ne[1] == H_v && b->ne[2] == n_tokens && b->ne[3] == n_seqs);
     GGML_ASSERT(s->ne[0] == S_v && s->ne[1] == S_v && s->ne[2] == H_v      && s->ne[3] == n_seqs);
 
-    ggml_tensor * result = ggml_gated_delta_net(ctx0, q, k, v, g, b, s);
+    // K=1: output carries the final state only. state s is 4D [S_v, S_v, H_v, n_seqs].
+    ggml_tensor * result = ggml_gated_delta_net(ctx0, q, k, v, g, b, s, /*K=*/1);
     if (n_tokens == 1) {
         cb(result, LLAMA_TENSOR_NAME_FGDN_AR, il);
     } else {
@@ -607,11 +607,17 @@ ggml_tensor * llm_build_delta_net_base::build_recurrent_attn(
     const int64_t D = S_v * S_v * H_v;
     const int64_t K = cparams.n_rs_seq + 1;
 
-    // TODO: remove pad + simplify
+    // Pad the 4D recurrent state [S_v, S_v, H_v, n_seqs] into a 3D (D, K, n_seqs)
+    // layout so ggml_gated_delta_net produces K rollback snapshots (ported from
+    // fork adb92b36a).  Without this, the op sees a 4D state (K_actual=1) and
+    // emits only a single snapshot, causing the downstream view_4d/view_2d
+    // per-slot writebacks to overflow (ggml.c:1807 bounds check).
+    // TODO: remove pad + simplify (fork TODO)
     ggml_tensor * s_3d     = ggml_reshape_3d(ctx0, s, D, 1, n_seqs);
     ggml_tensor * s_3d_pad = ggml_pad       (ctx0, s_3d, 0, K - 1, 0, 0);
 
-    ggml_tensor * gdn_out = ggml_gated_delta_net(ctx0, q, k, v, g, b, s_3d_pad);
+    // state s is 4D [S_v, S_v, H_v, n_seqs]; K snapshot slots are written into the output.
+    ggml_tensor * gdn_out = ggml_gated_delta_net(ctx0, q, k, v, g, b, s_3d_pad, K);
     if (n_seq_tokens > 1) {
         cb(gdn_out, LLAMA_TENSOR_NAME_FGDN_CH, il);
     } else {
@@ -630,28 +636,19 @@ ggml_tensor * llm_build_delta_net_base::build_recurrent_attn(
     cb(output, "attn_output", il);
 
     const size_t row_size = hparams.n_embd_s() * ggml_element_size(ssm_states_all);
-    // The gated_delta_net kernel only writes the last min(n_seq_tokens, K) snapshot
-    // slots of gdn_out; the leading slots are left untouched (caller-owned). For a
-    // full verify batch (n_seq_tokens >= K) every slot is populated, but for a
-    // decode / short batch (n_seq_tokens < K) the leading gdn_out slots are
-    // uninitialised. Writing them into ssm_states_all would clobber the older
-    // snapshot slots with garbage on every decode step. Under DFlash with stochastic
-    // sampling the adaptive controller drives spec depth to 0 once acceptance drops,
-    // so every step becomes a 1-token decode -> slots 1..K-1 stay garbage -> repeated
-    // draft-rejection rollbacks read stale recurrent state -> output degrades to
-    // gibberish (reproduced on Qwen3.6-35B-A3B, qwen35moe, n_rs_seq=4).
+
+    // Per-slot recurrent-state writeback (ported from fork adb92b36a).
     //
-    // Fix: write only the populated gdn_out slots (the newest n_pop states -> state
-    // slots 0..n_pop-1) and rotate the older snapshots down by n_pop slots
-    // (old slot s -> slot s + n_pop) so the recurrent-state history stays correct
-    // for rollback. Iterating k_i ascending reads each old slot before it is
-    // overwritten, so the in-place shift is safe (copies to the same persistent
-    // buffer are serialised by the scheduler).
-    // The write-back slot decision (destination cache_slot + whether to read a
-    // kernel-populated gdn_out slot or rotate an older state snapshot) is centralised
-    // in llama_dflash_rs_writeback_slot_for_test() so the production loop and the unit
-    // test (tests/test-dflash-plumbing.cpp) share one source of truth. See the helper
-    // doc in src/llama-context.h for the full invariant.
+    // The upstream bulk ggml_view_3d(dst=ssm_states_all, ne=[D,n_seqs,n_written],
+    // nb=[nb[1], mem_size*row_size, kv_head*row_size]) overflows when n_written>1
+    // because nb[2]=kv_head*row_size is not the per-snapshot stride.  DFlash keeps K
+    // rollback snapshots in the recurrent cache, each mem_size*row_size apart, and the
+    // fork wrote them one slot at a time with a bounded ggml_view_2d per slot.  Restore
+    // that per-slot loop (it is independent of the tree op, which remains gated).
+    //
+    // llama_dflash_rs_writeback_slot_for_test() decides per k_i whether to write a
+    // freshly-produced gdn_out snapshot or rotate an older state slot, and returns false
+    // for out-of-range / empty cases (so no view is created during degenerate probes).
     for (int64_t k_i = 0; k_i < K; ++k_i) {
         uint32_t cache_slot = 0;
         llama_dflash_rs_slot_src slot_src{};
