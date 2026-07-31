@@ -17,7 +17,7 @@ SPEC.loader.exec_module(MOD)
 
 
 class TestSpecNoDrafts(unittest.TestCase):
-    """speculative modes with draft_n=0 must be invalid."""
+    """speculative modes with draft_n=0 must be invalid (legacy 2-arg API)."""
 
     def test_mtp_rejects_zero_drafts(self):
         """MTP mode with no drafts is invalid."""
@@ -27,7 +27,7 @@ class TestSpecNoDrafts(unittest.TestCase):
             "usage": {"completion_tokens": 20},
             "timings": {"predicted_per_second": 20.0, "draft_n": 0, "draft_n_accepted": 0},
         }
-        got = MOD.extract_measurement(response, "mtp")
+        got = MOD.extract_measurement(response, "coding", "mtp")
         self.assertFalse(got["valid"], "MTP with draft_n=0 must be invalid")
         self.assertIn("spec_no_drafts", got["invalid_reasons"])
 
@@ -39,20 +39,21 @@ class TestSpecNoDrafts(unittest.TestCase):
             "usage": {"completion_tokens": 20},
             "timings": {"predicted_per_second": 20.0, "draft_n": 0, "draft_n_accepted": 0},
         }
-        got = MOD.extract_measurement(response, "dflash")
+        got = MOD.extract_measurement(response, "coding", "dflash")
         self.assertFalse(got["valid"], "DFlash with draft_n=0 must be invalid")
         self.assertIn("spec_no_drafts", got["invalid_reasons"])
 
     def test_base_allows_zero_drafts(self):
         """BASE mode has no drafts; draft_n=0 is fine."""
-        text = "Some valid output."
+        text = "```python\ndef fibonacci(n):\n    return n\n```"
         response = {
             "choices": [{"text": text, "finish_reason": "stop"}],
             "usage": {"completion_tokens": 20},
             "timings": {"predicted_per_second": 20.0, "draft_n": 0, "draft_n_accepted": 0},
         }
-        got = MOD.extract_measurement(response, "base")
+        got = MOD.extract_measurement(response, "coding", "base")
         self.assertTrue(got["valid"], "BASE with draft_n=0 must be valid")
+        self.assertNotIn("spec_no_drafts", got["invalid_reasons"])
 
 
 class TestCodingValidation(unittest.TestCase):
@@ -174,6 +175,138 @@ class TestExternalProvenance(unittest.TestCase):
         self.assertIn("source_head", record)
         self.assertIn("reference_label", record)
         self.assertEqual(record["reference_label"], "")
+
+
+class TestModeAwareValidation(unittest.TestCase):
+    """extract_measurement must accept separate prompt_kind and mode args."""
+
+    def test_dflash_coding_calls_with_mode_arg(self):
+        """DFlash coding response with drafts should be valid."""
+        text = "```python\ndef fibonacci(n):\n    return n\n```"
+        response = {
+            "choices": [{"text": text, "finish_reason": "stop"}],
+            "usage": {"completion_tokens": 20},
+            "timings": {"predicted_per_second": 20.0, "draft_n": 8, "draft_n_accepted": 5},
+            "tokens": [1, 2, 3],
+        }
+        got = MOD.extract_measurement(response, "coding", "dflash")
+        self.assertTrue(got["valid"])
+        self.assertNotIn("spec_no_drafts", got["invalid_reasons"])
+
+    def test_dflash_coding_no_drafts_is_invalid(self):
+        """DFlash coding response with zero drafts must be invalid."""
+        text = "```python\ndef fibonacci(n):\n    return n\n```"
+        response = {
+            "choices": [{"text": text, "finish_reason": "stop"}],
+            "usage": {"completion_tokens": 20},
+            "timings": {"predicted_per_second": 20.0, "draft_n": 0, "draft_n_accepted": 0},
+        }
+        got = MOD.extract_measurement(response, "coding", "dflash")
+        self.assertFalse(got["valid"])
+        self.assertIn("spec_no_drafts", got["invalid_reasons"])
+
+    def test_mtp_coding_no_drafts_is_invalid(self):
+        """MTP coding response with zero drafts must be invalid."""
+        text = "```python\ndef fibonacci(n):\n    return n\n```"
+        response = {
+            "choices": [{"text": text, "finish_reason": "stop"}],
+            "usage": {"completion_tokens": 20},
+            "timings": {"predicted_per_second": 20.0, "draft_n": 0, "draft_n_accepted": 0},
+        }
+        got = MOD.extract_measurement(response, "coding", "mtp")
+        self.assertFalse(got["valid"])
+        self.assertIn("spec_no_drafts", got["invalid_reasons"])
+
+    def test_base_allows_zero_drafts(self):
+        """BASE mode has no drafts; spec_no_drafts must not appear."""
+        text = "```python\ndef fibonacci(n):\n    return n\n```"
+        response = {
+            "choices": [{"text": text, "finish_reason": "stop"}],
+            "usage": {"completion_tokens": 20},
+            "timings": {"predicted_per_second": 20.0, "draft_n": 0, "draft_n_accepted": 0},
+        }
+        got = MOD.extract_measurement(response, "coding", "base")
+        self.assertNotIn("spec_no_drafts", got["invalid_reasons"])
+
+
+class TestUnclosedFence(unittest.TestCase):
+    """Unclosed python fences must return invalid, not raise ValueError."""
+
+    def test_unclosed_python_fence_is_invalid_not_exception(self):
+        """Unclosed ```python block should be invalid, not crash."""
+        response = {
+            "choices": [{"text": "```python\ndef fibonacci(n):\n    if n < 2:\n        return n", "finish_reason": "length"}],
+            "usage": {"completion_tokens": 20},
+            "timings": {"predicted_per_second": 20.0, "draft_n": 8},
+        }
+        # Must not raise ValueError
+        got = MOD.extract_measurement(response, "coding", "dflash")
+        self.assertFalse(got["valid"])
+        self.assertIn("coding_not_stopped", got["invalid_reasons"])
+
+
+class TestServerCommandBuilder(unittest.TestCase):
+    """build_server_command must exist and produce clean command lines."""
+
+    def test_server_command_has_no_removed_z_argument(self):
+        """Command must not contain --z."""
+        got = MOD.build_server_command(
+            server_path="/tmp/llama-server",
+            model_path="/tmp/target.gguf",
+            draft_path="/tmp/draft.gguf",
+            port=8099,
+            n_parallel=1,
+            device_id="Vulkan0",
+            mode="dflash",
+            batch_size=512,
+            ubatch_size=128,
+            ctx_size=2048,
+        )
+        self.assertNotIn("--z", got)
+        self.assertEqual(got[got.index("-b") + 1], "512")
+        self.assertEqual(got[got.index("-ub") + 1], "128")
+        self.assertEqual(got[got.index("--ctx-size") + 1], "2048")
+
+
+class TestExternalHeadHelper(unittest.TestCase):
+    """expected_source_head helper must select correct HEAD."""
+
+    def test_external_head_is_the_preflight_expected_head(self):
+        """External override takes precedence."""
+        self.assertEqual(MOD.expected_source_head("abc123", "def456"), "abc123")
+
+    def test_worktree_head_is_used_without_external_override(self):
+        """Worktree HEAD is used when no external override."""
+        self.assertEqual(MOD.expected_source_head(None, "def456"), "def456")
+
+
+class TestTokenRecording(unittest.TestCase):
+    """Token IDs must be recorded from response tokens field."""
+
+    def test_token_ids_are_recorded(self):
+        """extract_measurement must include token_ids from response."""
+        response = {
+            "choices": [{"text": "```python\ndef fibonacci(n):\n    return n\n```", "finish_reason": "stop"}],
+            "usage": {"completion_tokens": 20},
+            "timings": {"predicted_per_second": 20.0},
+            "tokens": [10, 20, 30],
+        }
+        got = MOD.extract_measurement(response, "coding", "base")
+        self.assertEqual(got["token_ids"], [10, 20, 30])
+
+
+class TestExclusiveOutput(unittest.TestCase):
+    """Output file must be opened exclusively, not appended."""
+
+    def test_existing_output_is_rejected(self):
+        """open_output_exclusive must raise FileExistsError on existing path."""
+        import tempfile
+        with tempfile.TemporaryDirectory() as td:
+            path = Path(td) / "rows.jsonl"
+            path.write_text("old\n")
+            with self.assertRaises(FileExistsError):
+                with MOD.open_output_exclusive(path):
+                    pass
 
 
 if __name__ == "__main__":

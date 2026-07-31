@@ -1,6 +1,7 @@
 """Model-free tests for response validation, provenance, and persistent-server correctness."""
 import importlib.util
 import json
+import sys
 import unittest
 from pathlib import Path
 
@@ -91,7 +92,7 @@ class TestResponseValidation(unittest.TestCase):
             "usage": {"completion_tokens": 20},
             "timings": {"predicted_per_second": 20.0, "draft_n": 0, "draft_n_accepted": 0},
         }
-        got = MOD.extract_measurement(response, "mtp")
+        got = MOD.extract_measurement(response, "coding", "mtp")
         self.assertFalse(got["valid"])
         self.assertIn("spec_no_drafts", got["invalid_reasons"])
         self.assertEqual(got["draft_n"], 0)
@@ -116,6 +117,43 @@ class TestProvenance(unittest.TestCase):
         self.assertIn("model_sha256", record)
         self.assertIn("device", record)
         self.assertIn("command", record)
+
+
+class TestRepeatedRequestsOutputArg(unittest.TestCase):
+    """repeated_requests.py must accept --output argument."""
+
+    def test_repeated_requests_accepts_output_arg(self):
+        """--output must be a valid argument."""
+        import subprocess
+        result = subprocess.run(
+            [sys.executable, str(HERE / "repeated_requests.py"), "--help"],
+            capture_output=True, text=True,
+        )
+        self.assertIn("--output", result.stdout)
+
+
+class TestConcurrentRequestSpecs(unittest.TestCase):
+    """concurrent_request_specs must return one coding and one math request."""
+
+    def test_concurrent_always_submits_both_prompt_types(self):
+        """Even with prompt=coding, concurrent must return coding+math."""
+        # Import repeated_requests to access the helper
+        import importlib.util as iu
+        rr_spec = iu.spec_from_file_location("repeated_requests", HERE / "repeated_requests.py")
+        rr_mod = iu.module_from_spec(rr_spec)
+        rr_spec.loader.exec_module(rr_mod)
+
+        specs = rr_mod.concurrent_request_specs(
+            {"coding": "code prompt", "math": "math prompt"},
+            512,
+        )
+        self.assertEqual(len(specs), 2)
+        prompt_types = [s[0] for s in specs]
+        self.assertIn("coding", prompt_types)
+        self.assertIn("math", prompt_types)
+        # Both use the same gen_tokens
+        for spec in specs:
+            self.assertEqual(spec[2], 512)
 
 
 if __name__ == "__main__":

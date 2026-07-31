@@ -348,6 +348,11 @@ struct server_slot : server_adaptive_dm_state {
             spec_i_batch.clear();
             spec_pad_i_batch.clear();
             spec_ckpt.clear();
+            // Clear prompt and target context to prevent stale state from leaking
+            // between requests. Speculative decoding leaves the recurrent state
+            // and KV cache in positions that corrupt the next request's prompt
+            // evaluation.
+            prompt_clear(false);
         }
         generated_tokens.clear();
         generated_token_probs.clear();

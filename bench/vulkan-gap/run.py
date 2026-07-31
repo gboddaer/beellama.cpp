@@ -21,13 +21,14 @@ MIN_VALID_TOKENS = 2       # fewer tokens is not useful
 MAX_PROMPT_ECHO_COUNT = 2  # more occurrences of instruction phrase = echo
 
 
-def extract_measurement(response, prompt_kind="coding"):
+def extract_measurement(response, prompt_kind="coding", mode="base"):
     """Extract measurement from response with validity checking.
-    
+
     Args:
         response: API response JSON
         prompt_kind: "coding" or "math" for prompt-specific validation
-    
+        mode: "base", "mtp", or "dflash" for speculative-mode draft checks
+
     Returns dict with measurement fields including validity.
     """
     timings = response.get("timings") or {}
@@ -40,40 +41,47 @@ def extract_measurement(response, prompt_kind="coding"):
     tokens_predicted = 0
 
     if "choices" in response:
+        # oaicompat format: /v1/completions, /v1/chat/completions
         choices = response.get("choices", [])
         if choices:
             choice = choices[0]
             content = choice.get("text", "") or choice.get("message", {}).get("content", "")
             finish_reason = choice.get("finish_reason")
             tokens_predicted = response.get("usage", {}).get("completion_tokens", 0) or choice.get("tokens_predicted", 0)
-    elif "content" in response:
+    else:
+        # non-oaicompat format: /completion
         content = response.get("content", "")
         tokens_predicted = int(response.get("tokens_predicted") or 0)
+        stop_type = response.get("stop", False)
+        finish_reason = "stop" if stop_type else "length"
 
     predicted_per_second = float(timings.get("predicted_per_second") or 0.0)
-    
+
     # Calculate draft acceptance
     draft_accept_pct = (100.0 * draft_n_accepted / draft_n) if draft_n else None
 
+    # Raw token IDs from response
+    token_ids = [int(t) for t in response.get("tokens", [])] if response.get("tokens") else []
+
     # Validity checking
     invalid_reasons = []
-    
+
     # Check for empty content
     if not content.strip():
         invalid_reasons.append("empty_content")
-    
+
     # Check for too few tokens
     if tokens_predicted <= MIN_VALID_TOKENS:
         invalid_reasons.append("too_few_tokens")
-    
+
     # Check for invalid throughput
     if predicted_per_second <= 0:
         invalid_reasons.append("invalid_tps")
-    
+
     # Check for implausibly high throughput (sentinel values)
     if predicted_per_second >= MAX_TPS_SENTINEL:
         invalid_reasons.append("implausible_tps")
-    
+
     # Check for prompt echo
     instruction_phrases = {
         "coding": ["Only output the code", "def fibonacci"],
@@ -84,16 +92,16 @@ def extract_measurement(response, prompt_kind="coding"):
         if content.count(phrase) > MAX_PROMPT_ECHO_COUNT:
             invalid_reasons.append("prompt_echo")
             break
-    
+
     # Speculative mode checks: MTP and DFlash require draft tokens.
-    if prompt_kind in ("mtp", "dflash") and draft_n == 0:
+    if mode in ("mtp", "dflash") and draft_n == 0:
         invalid_reasons.append("spec_no_drafts")
-    
+
     # Coding-specific checks
     if prompt_kind == "coding":
         if finish_reason != "stop":
             invalid_reasons.append("coding_not_stopped")
-        
+
         # Try to extract and compile Python code
         python_code = _extract_python_code(content)
         if python_code:
@@ -106,12 +114,12 @@ def extract_measurement(response, prompt_kind="coding"):
         else:
             # No Python code block found in coding mode is invalid
             invalid_reasons.append("coding_not_python")
-    
+
     # Math-specific checks
     if prompt_kind == "math":
         if "2.4" not in content.lower():
             invalid_reasons.append("math_wrong_answer")
-    
+
     return {
         "tokens_predicted": tokens_predicted,
         "predicted_per_second": predicted_per_second,
@@ -123,25 +131,38 @@ def extract_measurement(response, prompt_kind="coding"):
             content.encode("utf-8")
         ).hexdigest(),
         "content": content,
+        "token_ids": token_ids,
+        "tokens_sha256": hashlib.sha256(
+            json.dumps(token_ids, separators=(",", ":")).encode("utf-8")
+        ).hexdigest() if token_ids else "",
         "valid": len(invalid_reasons) == 0,
         "invalid_reasons": invalid_reasons,
     }
 
 
 def _extract_python_code(content):
-    """Extract Python code from markdown fenced or plain response."""
+    """Extract Python code from markdown fenced or plain response.
+
+    Never raises for model output; returns remaining text when closing
+    fence is absent.
+    """
     # Try fenced python blocks first
-    if "```python" in content:
-        start = content.index("```python") + 9
-        end = content.index("```", start + 1)
+    start_marker = content.find("```python")
+    if start_marker >= 0:
+        start = start_marker + 9
+        end = content.find("```", start + 1)
+        if end < 0:
+            return content[start:].strip()
         return content[start:end].strip()
     # Try generic code blocks
-    if "```" in content:
-        start = content.index("```") + 3
-        end = content.index("```", start + 1)
+    start_marker = content.find("```")
+    if start_marker >= 0:
+        start = start_marker + 3
+        end = content.find("```", start + 1)
+        if end < 0:
+            return content[start:].strip()
         return content[start:end].strip()
     # No fenced block: attempt to compile the entire content as Python.
-    # This handles unfenced responses that are pure Python code.
     try:
         compile(content, "<model-output>", "exec")
         return content
@@ -289,6 +310,49 @@ def mode_args(mode, draft):
     raise ValueError(f"Unknown mode: {mode}")
 
 
+def build_server_command(server_path, model_path, draft_path, port, n_parallel,
+                         device_id, mode, batch_size, ubatch_size, ctx_size):
+    """Build the server command line list."""
+    common = [
+        str(server_path), "-m", str(model_path),
+        "--port", str(port), "-np", str(n_parallel),
+        "--kv-unified", "-ngl", "all",
+        "-b", str(batch_size),
+        "-ub", str(ubatch_size),
+        "--ctx-size", str(ctx_size),
+        "--cache-type-k", "q4_0",
+        "--cache-type-v", "q4_0",
+        "--cache-ram", "0",
+        "--flash-attn", "on",
+        "--device", str(device_id),
+        "--reasoning", "off",
+        "--no-mmap", "--no-host", "--host", "127.0.0.1",
+    ]
+    if mode == "base":
+        spec = ["--spec-type", "none"]
+    elif mode == "mtp":
+        spec = ["--spec-type", "draft-mtp", "--spec-draft-n-max", "8"]
+    elif mode == "dflash":
+        spec = [
+            "--spec-type", "dflash",
+            "--spec-draft-model", str(draft_path),
+            "--spec-draft-n-max", "8",
+        ]
+    else:
+        raise ValueError(f"Unknown mode: {mode}")
+    return common + spec
+
+
+def expected_source_head(external_source_head, worktree_head):
+    """Return the expected source HEAD: external override or worktree."""
+    return external_source_head or worktree_head
+
+
+def open_output_exclusive(path):
+    """Open file for exclusive creation; raises FileExistsError if it exists."""
+    return open(path, "x", encoding="utf-8")
+
+
 def main():
     """Main entry point for the benchmark runner."""
     parser = argparse.ArgumentParser(
@@ -379,34 +443,42 @@ def main():
                     cwd=ROOT,
                     text=True
                 ).strip()
-                if not worktree_head.startswith(binary_commit):
+                expected_head = expected_source_head(
+                    args.external_source_head, worktree_head
+                )
+                if not expected_head.startswith(binary_commit):
                     print(
                         f"PREFLIGHT FAIL: binary commit {binary_commit} does not match "
-                        f"worktree HEAD {worktree_head}",
+                        f"expected HEAD {expected_head}",
                         file=sys.stderr,
                     )
                     sys.exit(1)
-                print(f"preflight: binary commit {binary_commit} matches worktree HEAD", file=sys.stderr)
+                print(f"preflight: binary commit {binary_commit} matches expected HEAD", file=sys.stderr)
             except Exception as exc:
-                print(f"preflight: could not verify worktree HEAD: {exc}", file=sys.stderr)
+                print(f"preflight: could not verify HEAD: {exc}", file=sys.stderr)
         else:
             print(f"preflight: could not parse commit from version: {server_version}", file=sys.stderr)
     except Exception as exc:
         print(f"preflight: could not get server version: {exc}", file=sys.stderr)
 
+    # --- batch settings from environment ---
+    batch_size = int(os.environ.get("VK_GAP_BATCH", "512"))
+    ubatch_size = int(os.environ.get("VK_GAP_UBATCH", "128"))
+    ctx_size = int(os.environ.get("VK_GAP_CTX_SIZE", "2048"))
+
     # --- build command ---
-    common = [
-        str(server_path), "-m", str(model_path),
-        "--port", str(port), "-np", np,
-        "--kv-unified", "-ngl", "all", "-b", "2048", "-ub", "512",
-        "--ctx-size", "8192", "--cache-type-k", "q4_0",
-        "--cache-type-v", "q4_0",
-        "--cache-ram", "0",
-        "--flash-attn", "on",
-        "--device", device_id, "--z", "--reasoning", "off",
-        "--no-mmap", "--no-host", "--host", "127.0.0.1",
-    ]
-    all_args = common + mode_args(args.mode, Path(draft_path) if draft_path else None)
+    all_args = build_server_command(
+        server_path=server_path,
+        model_path=model_path,
+        draft_path=draft_path,
+        port=port,
+        n_parallel=np,
+        device_id=device_id,
+        mode=args.mode,
+        batch_size=batch_size,
+        ubatch_size=ubatch_size,
+        ctx_size=ctx_size,
+    )
 
     # --- output directory ---
     log_dir = ROOT / "bench" / "vulkan-gap" / "logs"
@@ -418,6 +490,9 @@ def main():
     if output_path is None:
         output_path = ROOT / "bench" / "vulkan-gap" / "records" / f"{args.mode}-{args.prompt}-{ts}.jsonl"
     output_path.parent.mkdir(parents=True, exist_ok=True)
+    # Reject existing output to prevent stale-data contamination
+    if output_path.exists():
+        raise FileExistsError(f"output already exists: {output_path}")
 
     # --- launch server ---
     log_fh = open(log_path, "w", encoding="utf-8")
@@ -444,6 +519,7 @@ def main():
         "seed": 7,
         "stream": False,
         "cache_prompt": False,
+        "return_tokens": True,
     }
 
     prompts = {
@@ -456,7 +532,7 @@ def main():
     if not args.skip_warmup:
         warmup_payload = dict(payload, prompt=prompt_text, n_predict=args.warmup_tokens)
         try:
-            http_json(f"http://127.0.0.1:{port}/v1/completions", warmup_payload, timeout=600)
+            http_json(f"http://127.0.0.1:{port}/completion", warmup_payload, timeout=600)
         except Exception as exc:
             print(f"warm-up request failed: {exc}", file=sys.stderr)
             server_proc.terminate()
@@ -483,7 +559,7 @@ def main():
     records = []
     has_invalid = False
     try:
-        with open(output_path, "a", encoding="utf-8") as out_fh:
+        with open_output_exclusive(output_path) as out_fh:
             for rep in range(1, args.repetitions + 1):
                 # Optional server restart between repetitions
                 if args.restart_between_reps and rep > 1:
@@ -496,7 +572,7 @@ def main():
                 rep_payload = dict(payload)
                 try:
                     response = http_json(
-                        f"http://127.0.0.1:{port}/v1/completions",
+                        f"http://127.0.0.1:{port}/completion",
                         rep_payload,
                         timeout=600,
                     )
@@ -529,7 +605,7 @@ def main():
                     has_invalid = True
                     continue
 
-                measurement = extract_measurement(response, args.prompt)
+                measurement = extract_measurement(response, args.prompt, args.mode)
                 
                 # Always record, even if invalid
                 record = {

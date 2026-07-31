@@ -116,26 +116,33 @@ def run_single_request(port, prompt_type, prompt_text, n_tokens, mode, rep_id):
         "top_k": 20,
         "seed": 7,
         "stream": False,
+        "return_tokens": True,
     }
     try:
         response = http_json(
-            f"http://127.0.0.1:{port}/v1/completions",
+            f"http://127.0.0.1:{port}/completion",
             payload,
             timeout=600,
         )
-        choice = response["choices"][0]
         timing = response.get("timings", {})
+        # non-oaicompat format: flat content, tokens, stop
+        content = response.get("content", "")
+        stop_type = response.get("stop", False)
+        finish_reason = "stop" if stop_type else "length"
+        token_ids = [int(t) for t in response.get("tokens", [])] if response.get("tokens") else []
+        tokens = response.get("tokens_predicted", 0)
         result = {
             "prompt_type": prompt_type,
             "rep_id": rep_id,
             "mode": mode,
             "valid": True,
             "reasons": [],
-            "finish_reason": choice.get("finish_reason"),
-            "tokens": response.get("usage", {}).get("completion_tokens", 0),
+            "finish_reason": finish_reason,
+            "tokens": tokens,
+            "token_ids": token_ids,
             "tps": timing.get("predicted_per_second", 0),
             "draft_n": timing.get("draft_n", 0),
-            "content": choice.get("text", ""),
+            "content": content,
         }
         
         # Validate
@@ -159,6 +166,12 @@ def run_single_request(port, prompt_type, prompt_text, n_tokens, mode, rep_id):
             "valid": False,
             "reasons": [f"Request failed: {exc}"],
             "error": str(exc),
+            "finish_reason": None,
+            "tokens": 0,
+            "token_ids": [],
+            "tps": 0,
+            "draft_n": 0,
+            "content": "",
         }
 
 
@@ -174,12 +187,19 @@ def run_persistent(args):
     # Find device
     device_id, device_line = find_device(server_path)
 
+    # Batch settings from environment
+    batch_size = int(os.environ.get("VK_GAP_BATCH", "512"))
+    ubatch_size = int(os.environ.get("VK_GAP_UBATCH", "128"))
+    ctx_size = int(os.environ.get("VK_GAP_CTX_SIZE", "2048"))
+
     # Build command
     common = [
         str(server_path), "-m", str(model_path),
         "--port", str(port), "-np", str(np),
-        "--kv-unified", "-ngl", "all", "-b", "2048", "-ub", "512",
-        "--ctx-size", "8192", "--cache-type-k", "q4_0", "--cache-type-v", "q4_0",
+        "--kv-unified", "-ngl", "all",
+        "-b", str(batch_size), "-ub", str(ubatch_size),
+        "--ctx-size", str(ctx_size),
+        "--cache-type-k", "q4_0", "--cache-type-v", "q4_0",
         "--cache-ram", "0", "--flash-attn", "on", "--device", device_id,
         "--reasoning", "off", "--no-mmap", "--no-host", "--host", "127.0.0.1",
     ]
@@ -243,6 +263,14 @@ def run_persistent(args):
         log_fh.close()
 
 
+def concurrent_request_specs(prompts, gen_tokens):
+    """Return one coding and one math request spec for concurrent testing."""
+    return [
+        ("coding", prompts["coding"], gen_tokens),
+        ("math", prompts["math"], gen_tokens),
+    ]
+
+
 def run_concurrent(args):
     """Run concurrent server correctness tests."""
     # Get configuration
@@ -255,12 +283,19 @@ def run_concurrent(args):
     # Find device
     device_id, device_line = find_device(server_path)
 
+    # Batch settings from environment
+    batch_size = int(os.environ.get("VK_GAP_BATCH", "512"))
+    ubatch_size = int(os.environ.get("VK_GAP_UBATCH", "128"))
+    ctx_size = int(os.environ.get("VK_GAP_CTX_SIZE", "2048"))
+
     # Build command
     common = [
         str(server_path), "-m", str(model_path),
         "--port", str(port), "-np", str(np),
-        "--kv-unified", "-ngl", "all", "-b", "2048", "-ub", "512",
-        "--ctx-size", "8192", "--cache-type-k", "q4_0", "--cache-type-v", "q4_0",
+        "--kv-unified", "-ngl", "all",
+        "-b", str(batch_size), "-ub", str(ubatch_size),
+        "--ctx-size", str(ctx_size),
+        "--cache-type-k", "q4_0", "--cache-type-v", "q4_0",
         "--cache-ram", "0", "--flash-attn", "on", "--device", device_id,
         "--reasoning", "off", "--no-mmap", "--no-host", "--host", "127.0.0.1",
     ]
@@ -297,15 +332,17 @@ def run_concurrent(args):
             round_results = []
             
             # Send both requests concurrently
+            specs = concurrent_request_specs(prompts, args.gen_tokens)
             with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
-                coding_future = executor.submit(
-                    run_single_request, port, "coding", prompts["coding"], 512, 
-                    args.mode, f"r{round_num}_c"
-                )
-                math_future = executor.submit(
-                    run_single_request, port, "math", prompts["math"], 512,
-                    args.mode, f"r{round_num}_m"
-                )
+                futures = {}
+                for i, (pt, pt_text, n_tok) in enumerate(specs):
+                    tag = "c" if pt == "coding" else "m"
+                    futures[pt] = executor.submit(
+                        run_single_request, port, pt, pt_text, n_tok,
+                        args.mode, f"r{round_num}_{tag}"
+                    )
+                coding_result = futures["coding"].result(timeout=120)
+                math_result = futures["math"].result(timeout=120)
                 
                 coding_result = coding_future.result(timeout=120)
                 math_result = math_future.result(timeout=120)
@@ -355,6 +392,7 @@ def main():
     parser.add_argument("--prompt", choices=["coding", "math"], default="coding")
     parser.add_argument("--gen-tokens", type=int, default=512)
     parser.add_argument("--concurrent", action="store_true", help="Test concurrent requests")
+    parser.add_argument("--output", type=str, default=None, help="Output JSONL file path")
     args = parser.parse_args()
 
     # Set environment variables for server configuration
@@ -366,17 +404,27 @@ def main():
         results, all_valid = run_persistent(args)
 
     # Save results
-    output_dir = ROOT / "bench" / "vulkan-gap" / "records"
-    output_dir.mkdir(parents=True, exist_ok=True)
-    ts = time.strftime("%Y%m%d-%H%M%S")
-    output_path = output_dir / f"correctness-{args.mode}-{'conc' if args.concurrent else 'pers'}-{ts}.json"
-    
-    with open(output_path, "w", encoding="utf-8") as fh:
+    if args.output:
+        output_path = Path(args.output)
+    else:
+        output_dir = ROOT / "bench" / "vulkan-gap" / "records"
+        output_dir.mkdir(parents=True, exist_ok=True)
+        ts = time.strftime("%Y%m%d-%H%M%S")
+        output_path = output_dir / f"correctness-{args.mode}-{'conc' if args.concurrent else 'pers'}-{ts}.json"
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    if output_path.exists():
+        raise FileExistsError(f"output already exists: {output_path}")
+
+    # Record launched command for provenance
+    provenance_cmd = (all_args if 'all_args' in dir() else [])
+
+    with open(output_path, "x", encoding="utf-8") as fh:
         json.dump({
             "mode": args.mode,
             "np": args.np,
             "rounds": args.rounds,
             "concurrent": args.concurrent,
+            "command": provenance_cmd,
             "results": results,
             "all_valid": all_valid,
             "valid_count": sum(1 for r in results if r.get("valid")),
