@@ -4197,6 +4197,12 @@ int llama_context::dflash_rollback(llama_seq_id seq_id, llama_seq_id seq_backup,
         n_positions_needing_reeval = tape_replay(seq_id, n_accepted);
         if (n_positions_needing_reeval > 0) {
             mem_attn->seq_rm(seq_id, n_past_before, -1);
+            // Remove accepted positions from recurrent state so server-side
+            // re-evaluation does not duplicate positions already in the backup.
+            if (!mem_recr->seq_rm(seq_id, n_past_before, n_past_before + n_accepted)) {
+                LLAMA_LOG_WARN("%s: failed to roll back recurrent state for seq %d\n", __func__, (int) seq_id);
+                return -1;
+            }
         }
     }
     profile_lap(tape_launch_us);

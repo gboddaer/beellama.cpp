@@ -2317,6 +2317,15 @@ private:
         return output;
     }
 
+    bool any_slot_processing() const {
+        for (auto & slot : slots) {
+            if (slot.is_processing()) {
+                return true;
+            }
+        }
+        return false;
+    }
+
     bool launch_slot_with_task(server_slot & slot, server_task && task) {
         // Reset speculative state before starting a new request. This prevents stale
         // embeddings and ring state from leaking between requests, which causes
@@ -3015,6 +3024,14 @@ private:
                         break;
                     }
 
+                    // A speculative launch clears the shared target memory, so it
+                    // must wait until every active slot has finished.
+                    if (slot->can_speculate() && any_slot_processing()) {
+                        SRV_DBG("target context is busy - defer speculative task, id_task = %d\n", id_task);
+                        queue_tasks.defer(std::move(task));
+                        break;
+                    }
+
                     if (task.is_parent()) {
                         // try getting free slots for all child tasks
                         size_t n_child_tasks = task.child_tasks.size();
@@ -3024,13 +3041,21 @@ private:
                             queue_tasks.defer(std::move(task));
                             break;
                         }
+                        if (slot->can_speculate()) {
+                            llama_memory_clear(llama_get_memory(ctx_tgt), true);
+                        }
                         if (!launch_slots_with_parent_task(*slot, child_slots, std::move(task))) {
                             SRV_ERR("failed to launch slot with parent task, id_task = %d\n", id_task);
                             break; // drop the task
                         }
-                    } else if (!launch_slot_with_task(*slot, std::move(task))) {
-                        SRV_ERR("failed to launch slot with task, id_task = %d\n", id_task);
-                        break; // drop the task
+                    } else {
+                        if (slot->can_speculate()) {
+                            llama_memory_clear(llama_get_memory(ctx_tgt), true);
+                        }
+                        if (!launch_slot_with_task(*slot, std::move(task))) {
+                            SRV_ERR("failed to launch slot with task, id_task = %d\n", id_task);
+                            break; // drop the task
+                        }
                     }
 
                     if (params_base.cache_idle_slots) {
@@ -4839,13 +4864,21 @@ private:
                             slot.dflash_n_pos_before_draft, n_hidden_keep);
                         // Note: llama_dflash_rollback() already handles memory cleanup
                         // of the rolled-back positions. Do NOT add a redundant
-                        // llama_memory_seq_rm() here — it was causing an extra
+                        // llama_memory_seq_rm() here - it was causing an extra
                         // memory operation per cycle and potential state corruption.
                         // Only sync tape replay for multi-slot safety
                         if ((int) slots.size() > 1) {
                             llama_tape_replay_sync(ctx_tgt);
                         }
-                        if (n_reeval > 0) {
+                        if (n_reeval < 0) {
+                            auto * mem = llama_get_memory(ctx_tgt);
+                            llama_memory_seq_rm(mem, slot.id, 0, -1);
+                            llama_memory_seq_rm(mem, slot.dflash_seq_backup, -1, -1);
+                            SLT_ERR(slot, "dflash rollback failed for slot %d\n", slot.id);
+                            send_error(slot, "dflash rollback failed", ERROR_TYPE_SERVER);
+                            slot.release();
+                            return;
+                        } else if (n_reeval > 0) {
                             // Reeval with exact batch size (no padding) and logits=false
                             // (only state advance, no output). Matches the fork's approach.
                             // logits=false avoids unnecessary output computation; no padding

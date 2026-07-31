@@ -10,6 +10,10 @@ SPEC = importlib.util.spec_from_file_location("vk_gap", HERE / "run.py")
 MOD = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(MOD)
 
+SLOT_SPEC = importlib.util.spec_from_file_location("vk_gap_slot_isolation", HERE / "slot_isolation.py")
+SLOT_MOD = importlib.util.module_from_spec(SLOT_SPEC)
+SLOT_SPEC.loader.exec_module(SLOT_MOD)
+
 
 class TestResponseValidation(unittest.TestCase):
     """Tests for response classification — these fail until extract_measurement is updated."""
@@ -154,6 +158,18 @@ class TestConcurrentRequestSpecs(unittest.TestCase):
         # Both use the same gen_tokens
         for spec in specs:
             self.assertEqual(spec[2], 512)
+
+
+class TestSlotIsolationHelpers(unittest.TestCase):
+    """Tests for slot_schedule and first_divergence helpers."""
+
+    def test_slot_schedule_two_slots_two_rounds(self):
+        self.assertEqual(SLOT_MOD.slot_schedule(2, 2), [0, 1, 0, 1])
+
+    def test_first_divergence(self):
+        self.assertEqual(SLOT_MOD.first_divergence([1, 2, 3], [1, 9, 3]), 1)
+        self.assertIsNone(SLOT_MOD.first_divergence([1, 2], [1, 2]))
+        self.assertEqual(SLOT_MOD.first_divergence([1, 2], [1, 2, 3]), 2)
 
 
 if __name__ == "__main__":
