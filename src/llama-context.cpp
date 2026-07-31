@@ -6463,6 +6463,21 @@ int llama_context::decode(const llama_batch & batch_inp) {
         return -1;
     }
 
+    // Save n_outputs for re-eval batches (all logits=false) so the decode
+    // doesn't clobber the output state that subsequent post_decode calls
+    // in the same update_slots iteration rely on.
+    bool has_any_logits = false;
+    if (batch_inp.logits) {
+        for (int32_t i = 0; i < batch_inp.n_tokens; ++i) {
+            if (batch_inp.logits[i]) {
+                has_any_logits = true;
+                break;
+            }
+        }
+    }
+    const uint32_t saved_n_outputs = has_any_logits ? 0 : this->n_outputs;
+    const bool save_n_outputs = !has_any_logits;
+
     const auto & vocab   = model.vocab;
     const auto & hparams = model.hparams;
 
@@ -7486,6 +7501,11 @@ int llama_context::decode(const llama_batch & batch_inp) {
         dflash_profile_log(*dflash_capture, __func__, n_vocab);
     }
 
+    // Restore n_outputs for re-eval batches (all logits=false).
+    if (save_n_outputs) {
+        this->n_outputs = saved_n_outputs;
+    }
+
     return 0;
 }
 
@@ -7632,7 +7652,13 @@ uint32_t llama_context::output_reserve(int32_t n_outputs) {
     }
 
     // set all ids as invalid (negative)
-    std::fill(output_ids.begin(), output_ids.end(), -1);
+    // For re-eval batches (n_outputs=0, all logits=false) skip the fill so
+    // output_ids entries from the prior successful decode survive. The
+    // decode() caller saves/restores n_outputs around such calls, so the
+    // output buffer remains correctly sized.
+    if (n_outputs > 0) {
+        std::fill(output_ids.begin(), output_ids.end(), -1);
+    }
 
     this->n_outputs = 0;
 
