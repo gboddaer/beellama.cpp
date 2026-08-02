@@ -881,6 +881,7 @@ struct server_slot : server_adaptive_dm_state {
             spec_i_batch.clear();
             spec_pad_i_batch.clear();
             spec_ckpt.clear();
+            prompt_clear(false);
         }
         drafted.clear();
         draft_tree = common_speculative_tree();
@@ -3117,13 +3118,17 @@ private:
 
                 const int64_t t_start = ggml_time_us();
 
-                // don't save the slot's state if its context is empty
-                if (tokens.size() > 0) {
-                    ret->prompt_save(*prompt_cache);
-                }
+                if (ret->can_speculate()) {
+                    ret->prompt_clear(true);
+                } else {
+                    // don't save the slot's state if its context is empty
+                    if (tokens.size() > 0) {
+                        ret->prompt_save(*prompt_cache);
+                    }
 
-                if (!ret->prompt_load(*prompt_cache, task.tokens)) {
-                    ret->prompt_clear(false);
+                    if (!ret->prompt_load(*prompt_cache, task.tokens)) {
+                        ret->prompt_clear(false);
+                    }
                 }
 
                 prompt_cache->update();
@@ -3181,7 +3186,23 @@ private:
         return output;
     }
 
+    bool any_slot_processing() const {
+        for (const auto & slot : slots) {
+            if (slot.is_processing()) {
+                return true;
+            }
+        }
+        return false;
+    }
+
     bool launch_slot_with_task(server_slot & slot, server_task && task) {
+        if (slot.can_speculate()) {
+            if (slot.ctx_dft) {
+                common_context_seq_rm(slot.ctx_dft, slot.id, -1, -1);
+            }
+            common_speculative_reset(slot.get_spec(), slot.id);
+        }
+
         // process per-request lora adapters
         if (!task.params.lora.empty()) {
             auto task_loras = construct_lora_list(task.params.lora);
@@ -3991,6 +4012,14 @@ private:
                         break;
                     }
 
+                    // The task queue checks and launches serially. Wait until every slot is idle
+                    // before clearing shared target memory for a speculative request.
+                    if (slot->can_speculate() && any_slot_processing()) {
+                        SRV_DBG("target context is busy - defer speculative task, id_task = %d\n", id_task);
+                        queue_tasks.defer(std::move(task));
+                        break;
+                    }
+
                     if (task.is_parent()) {
                         // try getting free slots for all child tasks
                         size_t n_child_tasks = task.child_tasks.size();
@@ -3999,6 +4028,9 @@ private:
                             SRV_DBG("not enough free slots for child tasks, n_free = %zu, n_children = %zu, defer task, id_task = %d\n", child_slots.size(), n_child_tasks, id_task);
                             queue_tasks.defer(std::move(task));
                             break;
+                        }
+                        if (slot->can_speculate()) {
+                            llama_memory_clear(llama_get_memory(ctx_tgt), true);
                         }
                         if (!launch_slots_with_parent_task(*slot, child_slots, std::move(task))) {
                             SRV_ERR("failed to launch slot with parent task, id_task = %d\n", id_task);
@@ -4023,6 +4055,9 @@ private:
                             }
                         }
 
+                        if (slot->can_speculate()) {
+                            llama_memory_clear(llama_get_memory(ctx_tgt), true);
+                        }
                         if (!launch_slot_with_task(*slot, std::move(task))) {
                             SRV_ERR("failed to launch slot with task, id_task = %d\n", id_task);
                             break; // drop the task

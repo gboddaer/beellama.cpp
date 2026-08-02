@@ -4167,6 +4167,32 @@ common_speculative_draft_params & common_speculative_get_draft_params(
     return spec->dparams[seq_id];
 }
 
+void common_speculative_reset(common_speculative * spec, llama_seq_id seq_id) {
+    if (spec == nullptr) {
+        return;
+    }
+
+    for (auto & impl : spec->impls) {
+        switch (impl->type) {
+            case COMMON_SPECULATIVE_TYPE_DRAFT_MTP: {
+                auto * mtp = static_cast<common_speculative_impl_draft_mtp *>(impl.get());
+                mtp->pending_h[seq_id].assign(mtp->n_embd, 0.0f);
+                mtp->i_batch_beg[seq_id] = -1;
+                mtp->i_batch_end[seq_id] = -1;
+                mtp->verify_h[seq_id].clear();
+                mtp->verify_h_rows[seq_id] = 0;
+                mtp->last_n_drafted[seq_id] = 0;
+            } break;
+            case COMMON_SPECULATIVE_TYPE_DFLASH: {
+                auto * dflash = static_cast<common_speculative_impl_dflash *>(impl.get());
+                dflash->discard_cross_ring("new request");
+            } break;
+            default:
+                break;
+        }
+    }
+}
+
 void common_speculative_begin(common_speculative * spec, llama_seq_id seq_id, const llama_tokens & prompt) {
     if (spec == nullptr) {
         return;
